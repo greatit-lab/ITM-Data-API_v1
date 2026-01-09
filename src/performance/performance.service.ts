@@ -21,10 +21,21 @@ export class PerformanceService {
       where.eqpid = { in: eqpIdList };
     }
 
-    return this.prisma.eqpPerf.findMany({
+    // [수정] DB 조회 결과를 프론트엔드 DTO 형식에 맞춰 매핑
+    const results = await this.prisma.eqpPerf.findMany({
       where,
       orderBy: { servTs: 'asc' },
     });
+
+    return results.map((row) => ({
+      eqpId: row.eqpid,
+      timestamp: row.servTs,      // [중요] servTs -> timestamp (X축 해결)
+      cpuUsage: row.cpuUsage,     // cpuUsage -> cpuUsage
+      memoryUsage: row.memUsage,  // [중요] memUsage -> memoryUsage (메모리 차트 해결)
+      cpuTemp: row.cpuTemp,
+      gpuTemp: row.gpuTemp,
+      fanSpeed: row.fanSpeed,
+    }));
   }
 
   // 2. 프로세스별 메모리 이력 조회 (Process Memory View)
