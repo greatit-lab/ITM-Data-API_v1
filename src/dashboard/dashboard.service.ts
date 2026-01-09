@@ -3,7 +3,7 @@ import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 
-// Raw Query 결과 타입 정의
+// Raw Query 결과 인터페이스
 interface AgentStatusRawResult {
   eqpid: string;
   is_online: boolean;
@@ -27,7 +27,7 @@ interface AgentStatusRawResult {
 export class DashboardService {
   constructor(private prisma: PrismaService) {}
 
-  // 버전 비교 헬퍼
+  // 버전 문자열 비교 헬퍼 함수
   private compareVersions(v1: string, v2: string) {
     const p1 = v1.replace(/[^0-9.]/g, '').split('.').map(Number);
     const p2 = v2.replace(/[^0-9.]/g, '').split('.').map(Number);
@@ -49,51 +49,53 @@ export class DashboardService {
         select: { appVer: true },
         where: { appVer: { not: null } },
       });
+
       const versions = distinctVersions
         .map((v) => v.appVer)
         .filter((v) => v) as string[];
+
       versions.sort((a, b) => this.compareVersions(a, b));
-      const latestAgentVersion = versions.length > 0 ? versions[versions.length - 1] : '';
+      const latestAgentVersion =
+        versions.length > 0 ? versions[versions.length - 1] : '';
 
-      // (2) 필터 조건 구성
-      // Prisma 스키마의 Relation 필드명(sdwtRel)을 확인하여 맞춰야 함
-      // 기존 스키마에 sdwtRel이 있다면 그대로 사용, 없다면 수정 필요
-      const equipmentWhere: any = {};
-      if (sdwt) equipmentWhere.sdwt = sdwt;
-      if (site) {
-        // Relation 필드명이 sdwtRel이라고 가정 (스키마 확인 필요)
-        equipmentWhere.sdwtRel = {
-          site: site,
-          isUse: 'Y'
-        };
-      } else {
-        equipmentWhere.sdwtRel = { isUse: 'Y' };
-      }
+      // (2) 장비 필터 조건 생성
+      const equipmentWhere: Prisma.RefEquipmentWhereInput = {
+        sdwtRel: {
+          isUse: 'Y',
+          ...(site ? { site } : {}),
+        },
+        ...(sdwt ? { sdwt } : {}),
+      };
 
+      // 시간 기준점 설정
       const now = new Date();
       const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
       const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
 
-      // (3) 주요 카운트 집계
-      const totalEqp = await this.prisma.refEquipment.count({
-        where: {
+      // (3) 주요 카운트 조회 (순차 실행으로 안정성 확보)
+      // 전체 장비 수 (Agent 정보가 있는 장비 대상)
+      const totalEqp = await this.prisma.refEquipment.count({ 
+        where: { 
           ...equipmentWhere,
-          agentInfo: { isNot: null }
-        }
+          agentInfo: { isNot: null } 
+        } 
       });
 
+      // 전체 서버 설정 수
       const totalServers = await this.prisma.cfgServer.count();
 
+      // 활성 서버 수 (최근 10분 내 업데이트)
       const activeServers = await this.prisma.cfgServer.count({
         where: { update: { gte: tenMinutesAgo } }
       });
 
+      // 전체 SDWT 수
       const totalSdwts = await this.prisma.refSdwt.count({
         where: { isUse: 'Y', ...(site ? { site } : {}) }
       });
 
-      // (4) 에러 통계
+      // (4) 에러 통계 조회
       let todayErrorCount = 0;
       let todayErrorTotalCount = 0;
       let newAlarmCount = 0;
@@ -107,39 +109,46 @@ export class DashboardService {
             },
           }),
           this.prisma.plgError.count({
-            where: { timeStamp: { gte: oneHourAgo }, equipment: equipmentWhere },
+            where: { 
+              timeStamp: { gte: oneHourAgo }, 
+              equipment: equipmentWhere 
+            },
           }),
         ]);
+
         todayErrorTotalCount = totalError;
         newAlarmCount = recentError;
 
+        // 에러 발생 장비 수 (Distinct Count)
         if (todayErrorTotalCount > 0) {
-          const errorEqps = await this.prisma.plgError.findMany({
-            where: {
-              timeStamp: { gte: startOfToday },
-              equipment: equipmentWhere,
-            },
-            distinct: ['eqpid'],
-            select: { eqpid: true },
-          });
-          todayErrorCount = errorEqps.length;
+           const errorEqps = await this.prisma.plgError.findMany({
+             where: {
+               timeStamp: { gte: startOfToday },
+               equipment: equipmentWhere,
+             },
+             distinct: ['eqpid'],
+             select: { eqpid: true },
+           });
+           todayErrorCount = errorEqps.length;
         }
+
       } catch (err) {
         console.warn("[Dashboard] Error stats query failed:", err);
       }
 
+      // 비활성 에이전트 수 계산
       const inactiveAgentCount = Math.max(0, totalEqp - activeServers);
 
       return {
         totalEqpCount: totalEqp,
-        totalServers,
+        totalServers: totalServers,
         onlineAgentCount: activeServers,
-        inactiveAgentCount,
+        inactiveAgentCount: inactiveAgentCount,
         todayErrorCount,
         todayErrorTotalCount,
         newAlarmCount,
         latestAgentVersion,
-        totalSdwts,
+        totalSdwts, 
         serverHealth: totalServers > 0 ? Math.round((activeServers / totalServers) * 100) : 0
       };
 
@@ -151,7 +160,7 @@ export class DashboardService {
 
   // 2. Agent 상태 목록 조회 (Raw Query)
   async getAgentStatus(site?: string, sdwt?: string) {
-    // Prisma.sql을 사용하여 조건절 동적 생성
+    // 동적 WHERE 절 구성
     let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
 
     if (sdwt) {
@@ -160,7 +169,7 @@ export class DashboardService {
       whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
     }
 
-    // 테이블명(public.agent_info 등)은 실제 DB 테이블명과 일치해야 함
+    // 복잡한 조인을 위한 Raw Query 실행
     const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
       SELECT 
           a.eqpid, 
@@ -193,6 +202,7 @@ export class DashboardService {
       ORDER BY a.eqpid ASC;
     `;
 
+    // 결과 매핑 및 Time Drift 계산
     return results.map((r) => {
       let clockDrift: number | null = null;
       if (r.last_perf_serv_ts && r.last_perf_eqp_ts) {
@@ -200,6 +210,7 @@ export class DashboardService {
         const eqpTs = new Date(r.last_perf_eqp_ts).getTime();
         clockDrift = (servTs - eqpTs) / 1000;
       }
+
       return {
         eqpId: r.eqpid,
         isOnline: r.is_online,
