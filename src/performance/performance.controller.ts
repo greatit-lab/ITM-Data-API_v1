@@ -6,25 +6,28 @@ import { PerformanceService } from './performance.service';
 export class PerformanceController {
   constructor(private readonly performanceService: PerformanceService) {}
 
+  // 1. 장비 성능 이력
   @Get('history')
   async getHistory(
-    @Query('eqpids') eqpids: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('eqpids') eqpids?: string,
   ) {
-    const eqpIdList = eqpids.split(',');
-    return this.performanceService.getSystemPerformance(eqpIdList, startDate, endDate);
+    return this.performanceService.getPerformanceHistory(startDate, endDate, eqpids);
   }
 
+  // 2. 프로세스 이력
   @Get('process-history')
   async getProcessHistory(
-    @Query('eqpId') eqpId: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('eqpId') eqpId: string,
+    @Query('interval') interval?: number,
   ) {
-    return this.performanceService.getProcessPerformance(eqpId, startDate, endDate);
+    return this.performanceService.getProcessHistory(startDate, endDate, eqpId, Number(interval));
   }
 
+  // 3. ITM Agent 트렌드
   @Get('itm-agent-trend')
   async getItmAgentTrend(
     @Query('site') site: string,
