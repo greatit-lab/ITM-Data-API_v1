@@ -4,28 +4,28 @@ import { PrismaService } from './prisma.service';
 
 // 1. 기존 데이터 API 모듈
 import { WaferModule } from './wafer/wafer.module';
-import { PrealignModule } from './prealign/prealign.module';
+import { PreAlignModule } from './prealign/prealign.module'; // [수정] PrealignModule -> PreAlignModule
 import { PerformanceModule } from './performance/performance.module';
 import { LampLifeModule } from './lamplife/lamplife.module';
 import { ErrorModule } from './error/error.module';
 
 // 2. 인증 및 공통 모듈
 import { AuthModule } from './auth/auth.module';
-import { MenuModule } from './menu/menu.module';     // 메뉴 관리 (DB 연동)
-import { FiltersModule } from './filters/filters.module'; // 필터 (Site/SDWT)
+import { MenuModule } from './menu/menu.module';     
+import { FiltersModule } from './filters/filters.module'; 
 
-// 3. 비즈니스 로직 이관 모듈 (기존 5432 -> 8081)
+// 3. 비즈니스 로직 이관 모듈
 import { DashboardModule } from './dashboard/dashboard.module';
 import { HealthModule } from './health/health.module';
 import { InfraModule } from './infra/infra.module';
 import { AdminModule } from './admin/admin.module';
-import { EquipmentModule } from './equipment/equipment.module'; // [중요] 장비 모듈 추가
+import { EquipmentModule } from './equipment/equipment.module'; 
 
 @Module({
   imports: [
     // Data Modules
     WaferModule,
-    PrealignModule,
+    PreAlignModule, // [수정] 클래스명 일치시킴
     PerformanceModule,
     LampLifeModule,
     ErrorModule,
@@ -40,7 +40,7 @@ import { EquipmentModule } from './equipment/equipment.module'; // [중요] 장�
     HealthModule,
     InfraModule,
     AdminModule,
-    EquipmentModule, // AppModule에 등록
+    EquipmentModule, 
   ],
   controllers: [],
   providers: [PrismaService],
