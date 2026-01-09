@@ -1213,8 +1213,8 @@ export class WaferService {
 
       // 단일 측정 조회 시에는 eqpId, servTs, waferId 만으로 충분히 유니크하므로
       // LotId 등을 제외한 나머지 조건은 생략하여 데이터 매칭 확률을 높임
-      if (p.lotId) sql =+ ` AND lotid = '${string(p.lotId)}'`;
-      if (p.waferId) sql =+ ` AND waferid = '${Number(p.waferId)}'`;
+      if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
+      if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
     } 
     // servTs가 없고 날짜 범위만 있는 경우 (일반 조회용)
     else {
