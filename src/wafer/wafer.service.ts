@@ -4,8 +4,8 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import { PrismaService } from '../prisma.service'; //
-import { Prisma } from '@prisma/client'; //
+import { PrismaService } from '../prisma.service';
+import { Prisma } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -13,7 +13,7 @@ import * as poppler from 'pdf-poppler';
 import axios from 'axios';
 import { Readable } from 'stream';
 
-export class WaferQueryParams { //
+export class WaferQueryParams {
   eqpId?: string;
   lotId?: string;
   waferId?: string | number;
@@ -37,22 +37,22 @@ export class WaferQueryParams { //
   targetEqps?: string;
 }
 
-interface StatsRawResult { //
+interface StatsRawResult {
   [key: string]: number | null;
 }
 
-interface PdfResult { //
+interface PdfResult {
   file_uri: string;
 }
 
-interface SpectrumRawResult { //
+interface SpectrumRawResult {
   class: string;
   wavelengths: number[];
   values: number[];
   ts?: Date;
 }
 
-interface SpectrumTrendJoinedResult { //
+interface SpectrumTrendJoinedResult {
   waferid: string;
   eqpid: string;
   wavelengths: number[];
@@ -62,7 +62,7 @@ interface SpectrumTrendJoinedResult { //
   [key: string]: any;
 }
 
-export interface ResidualRawResult { //
+export interface ResidualRawResult {
   point: number;
   x: number | null;
   y: number | null;
@@ -70,12 +70,12 @@ export interface ResidualRawResult { //
   values: number[];
 }
 
-export interface GoldenRawResult { //
+export interface GoldenRawResult {
   wavelengths: number[];
   values: number[];
 }
 
-interface LotTrendRawResult { //
+interface LotTrendRawResult {
   waferid: number;
   point: number;
   x: number;
@@ -85,14 +85,14 @@ interface LotTrendRawResult { //
   value: number;
 }
 
-export interface ResidualMapItem { //
+export interface ResidualMapItem {
   point: number;
   x: number;
   y: number;
   residual: number;
 }
 
-export interface ComparisonRawResult { //
+export interface ComparisonRawResult {
   eqpid: string;
   lotid: string;
   waferid: number;
@@ -100,7 +100,7 @@ export interface ComparisonRawResult { //
   [key: string]: string | number | null;
 }
 
-interface OpticalTrendRawResult { //
+interface OpticalTrendRawResult {
   ts: Date;
   lotid: string;
   waferid: string;
@@ -109,13 +109,13 @@ interface OpticalTrendRawResult { //
   values: number[];
 }
 
-interface PopplerModule { //
+interface PopplerModule {
   convert: (file: string, options: any) => Promise<any>;
 }
 
 @Injectable()
 export class WaferService {
-  constructor(private prisma: PrismaService) {} //
+  constructor(private prisma: PrismaService) {}
 
   // 1. Distinct Values 조회
   async getDistinctValues(
@@ -288,7 +288,7 @@ export class WaferService {
         ${selectColumns}
       FROM public.plg_onto_spectrum s
       JOIN public.plg_wf_flat f 
-        ON s."lotid" = f."lotid" 
+        ON s."lotid" = f."lotid 
         AND s."waferid" = f."waferid"::varchar 
         AND s."point" = f."point"
       WHERE s."lotid" = $1
@@ -438,7 +438,7 @@ export class WaferService {
     }
   }
 
-  async getFlatData(params: WaferQueryParams) { //
+  async getFlatData(params: WaferQueryParams) {
     const {
       eqpId,
       lotId,
@@ -538,7 +538,7 @@ export class WaferService {
     };
   }
 
-  async getPdfImage(params: WaferQueryParams): Promise<string> { //
+  async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
     if (!eqpId || !dateTime || pointNumber === undefined) {
@@ -573,7 +573,7 @@ export class WaferService {
     }
 
     let downloadUrl = pdfCheckResult.url;
-    const baseUrl = process.env.PDF_SERVER_BASE_URL; //
+    const baseUrl = process.env.PDF_SERVER_BASE_URL;
 
     if (baseUrl && !downloadUrl.startsWith('http')) {
       let normalizedPath = downloadUrl.replace(/\\/g, '/');
@@ -641,7 +641,7 @@ export class WaferService {
         throw checkErr;
       }
 
-      // [수정] 지적하신 하드코딩 경로 제거 및 환경 변수 우선 사용
+      // [수정] 하드코딩 경로 제거 및 환경 변수 우선 사용
       const popplerBinPath = process.env.POPPLER_BIN_PATH; 
       
       if (!popplerBinPath) {
@@ -709,7 +709,7 @@ export class WaferService {
     }
   }
 
-  async getSpectrum(params: WaferQueryParams) { //
+  async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
 
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) {
@@ -752,7 +752,7 @@ export class WaferService {
     }
   }
 
-  async getStatistics(params: WaferQueryParams) { //
+  async getStatistics(params: WaferQueryParams) {
     const whereSql = this.buildUniqueWhere(params);
     if (!whereSql) return this.getEmptyStatistics();
 
@@ -800,7 +800,7 @@ export class WaferService {
     }
   }
 
-  async getPointData( //
+  async getPointData(
     params: WaferQueryParams,
   ): Promise<{ headers: string[]; data: unknown[][] }> {
     const whereSql = this.buildUniqueWhere(params);
@@ -868,7 +868,7 @@ export class WaferService {
     }
   }
 
-  async checkPdf( //
+  async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
     const { eqpId, lotId, waferId, servTs } = params;
@@ -922,7 +922,7 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
-  async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> { //
+  async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
     const { eqpId, lotId, waferId, ts } = params;
     if (!eqpId || !lotId || !waferId || !ts) return [];
 
@@ -989,7 +989,7 @@ export class WaferService {
     return result;
   }
 
-  async getGoldenSpectrum(params: WaferQueryParams) { //
+  async getGoldenSpectrum(params: WaferQueryParams) {
     const { eqpId, cassetteRcp, stageGroup, film, pointId } = params;
 
     let sql = `
@@ -1058,7 +1058,7 @@ export class WaferService {
     }
   }
 
-  async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> { //
+  async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
     const { lotId, cassetteRcp, stageGroup, film } = params;
 
     if (!lotId || !cassetteRcp || !stageGroup || !film) {
@@ -1116,7 +1116,7 @@ export class WaferService {
     }
   }
 
-  async getLotUniformityTrend(params: WaferQueryParams & { metric: string }) { //
+  async getLotUniformityTrend(params: WaferQueryParams & { metric: string }) {
     const { lotId, cassetteRcp, stageGroup, film, metric } = params;
 
     if (!lotId || !cassetteRcp || !stageGroup || !film || !metric) {
@@ -1195,7 +1195,7 @@ export class WaferService {
     }
   }
 
-  private buildUniqueWhere(p: WaferQueryParams): string | null { //
+  private buildUniqueWhere(p: WaferQueryParams): string | null {
     if (!p.eqpId) return null;
     let sql = `WHERE eqpid = '${String(p.eqpId)}'`;
 
@@ -1228,7 +1228,7 @@ export class WaferService {
     return sql;
   }
 
-  private getEmptyStatistics() { //
+  private getEmptyStatistics() {
     const emptyItem = {
       max: 0,
       min: 0,
@@ -1241,7 +1241,7 @@ export class WaferService {
     return { t1: emptyItem, gof: emptyItem, z: emptyItem, srvisz: emptyItem };
   }
 
-  async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> { //
+  async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> {
     const { site, sdwt, startDate, endDate, cassetteRcp, stageGroup, film } =
       params;
 
@@ -1294,7 +1294,7 @@ export class WaferService {
     }
   }
 
-  async getComparisonData( //
+  async getComparisonData(
     params: WaferQueryParams,
   ): Promise<ComparisonRawResult[]> {
     const { startDate, endDate, cassetteRcp, stageGroup, film, targetEqps } =
@@ -1352,7 +1352,7 @@ export class WaferService {
     }
   }
 
-  async getOpticalTrend(params: WaferQueryParams) { //
+  async getOpticalTrend(params: WaferQueryParams) {
     const { eqpId, startDate, endDate, cassetteRcp, stageGroup, film } = params;
 
     if (!eqpId || !startDate || !endDate) return [];
