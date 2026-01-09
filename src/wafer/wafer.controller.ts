@@ -2,7 +2,8 @@
 import { Controller, Get, Query } from '@nestjs/common';
 import { WaferService, WaferQueryParams } from './wafer.service';
 
-@Controller('api/wafer')
+// [수정] 'api/wafer' -> 'wafer' (Global Prefix 'api'와 결합되어 /api/wafer 가 됨)
+@Controller('wafer')
 export class WaferController {
   constructor(private readonly waferService: WaferService) {}
 
