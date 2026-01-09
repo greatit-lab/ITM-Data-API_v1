@@ -117,10 +117,10 @@ interface PopplerModule {
 export class WaferService {
   constructor(private prisma: PrismaService) {}
 
-  // 1. Distinct Values 조회
+  // 1. Distinct Values 조회 (필터 목록)
   async getDistinctValues(
     column: string,
-    params: WaferQueryParams,
+    params: WaferQueryParams
   ): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageGroup, startDate, endDate } =
       params;
@@ -128,9 +128,9 @@ export class WaferService {
     const table = 'public.plg_wf_flat';
     let colName = column;
 
+    // 프론트엔드 요청 파라미터 매핑
     if (column === 'lotids') colName = 'lotid';
     if (column === 'cassettercps') colName = 'cassettercp';
-    // [수정] Stage RCP 필터 매핑 추가
     if (column === 'stagercps' || column === 'stageRcps') colName = 'stagercp';
     if (column === 'stagegroups') colName = 'stagegroup';
     if (column === 'films') colName = 'film';
@@ -139,19 +139,23 @@ export class WaferService {
     let whereClause = `WHERE 1=1`;
     const queryParams: (string | number | Date)[] = [];
 
+    // [수정 1] 필터 목록 조회 시, 자기 자신(colName)에 대한 조건은 제외해야
+    // 선택 후에도 다른 전체 목록이 조회됨.
+
     if (eqpId) {
       whereClause += ` AND eqpid = $${queryParams.length + 1}`;
       queryParams.push(eqpId);
     }
-    if (lotId) {
+    // 예: Lot ID 목록을 조회할 때는, 현재 선택된 lotId 조건은 무시해야 함
+    if (lotId && colName !== 'lotid') {
       whereClause += ` AND lotid = $${queryParams.length + 1}`;
       queryParams.push(lotId);
     }
-    if (cassetteRcp) {
+    if (cassetteRcp  && colName !== 'cassettercp') {
       whereClause += ` AND cassettercp = $${queryParams.length + 1}`;
       queryParams.push(cassetteRcp);
     }
-    if (stageGroup) {
+    if (stageGroup && colName !== 'stagegroup') {
       whereClause += ` AND stagegroup = $${queryParams.length + 1}`;
       queryParams.push(stageGroup);
     }
@@ -166,7 +170,7 @@ export class WaferService {
     try {
       const result = await this.prisma.$queryRawUnsafe<{ val: unknown }[]>(
         sql,
-        ...queryParams,
+        ...queryParams
       );
       return result
         .map((r) => {
@@ -226,7 +230,7 @@ export class WaferService {
     try {
       const results = await this.prisma.$queryRawUnsafe<{ point: number }[]>(
         sql,
-        ...queryParams,
+        ...queryParams
       );
       return results.map((r) => String(r.point));
     } catch (e) {
@@ -1206,6 +1210,11 @@ export class WaferService {
       const tsIso = ts.toISOString();
       sql += ` AND serv_ts >= '${tsIso}'::timestamp - interval '2 second'`;
       sql += ` AND serv_ts <= '${tsIso}'::timestamp + interval '2 second'`;
+
+      // 단일 측정 조회 시에는 eqpId, servTs, waferId 만으로 충분히 유니크하므로
+      // LotId 등을 제외한 나머지 조건은 생략하여 데이터 매칭 확률을 높임
+      if (p.lotId) sql =+ ` AND lotid = '${string(p.lotId)}'`;
+      if (p.waferId) sql =+ ` AND waferid = '${Number(p.waferId)}'`;
     } 
     // servTs가 없고 날짜 범위만 있는 경우 (일반 조회용)
     else {
@@ -1221,14 +1230,13 @@ export class WaferService {
           typeof p.endDate === 'string' ? p.endDate : p.endDate.toISOString();
         sql += ` AND serv_ts <= '${e}'`;
       }
+      if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
+      if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
+      if (p.cassetteRcp) sql += ` AND cassettercp = '${String(p.cassetteRcp)}'`;
+      if (p.stageRcp) sql += ` AND stagercp = '${String(p.stageRcp)}'`;
+      if (p.stageGroup) sql += ` AND stagegroup = '${String(p.stageGroup)}'`;
+      if (p.film) sql += ` AND film = '${String(p.film)}'`;
     }
-
-    if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
-    if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
-    if (p.cassetteRcp) sql += ` AND cassettercp = '${String(p.cassetteRcp)}'`;
-    if (p.stageRcp) sql += ` AND stagercp = '${String(p.stageRcp)}'`;
-    if (p.stageGroup) sql += ` AND stagegroup = '${String(p.stageGroup)}'`;
-    if (p.film) sql += ` AND film = '${String(p.film)}'`;
     return sql;
   }
 
