@@ -2,7 +2,7 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma.service';
-import { LoginDto } from './auth.interface';
+import { LoginDto } from './auth.interface'; // [확인] 경로 일치
 
 @Injectable()
 export class AuthService {
@@ -11,31 +11,27 @@ export class AuthService {
     private jwtService: JwtService,
   ) {}
 
-  // 1. 로그인 (AD 연동 전 임시 로직 또는 DB 기반 로그인)
+  // 1. 로그인 로직
   async login(loginDto: LoginDto) {
     const { username, password } = loginDto;
 
-    // [TODO] 실제 AD 인증 로직으로 교체 필요
-    // 현재는 DB의 sys_user 테이블이나 하드코딩된 로직을 사용할 수 있음
-    // 여기서는 간단히 사용자 존재 여부만 체크하고 토큰 발급 (개발용)
-    
-    // 예시: 관리자 계정 하드코딩
+    // [개발용] 관리자 프리패스 (실제 운영 시에는 삭제하거나 AD 연동)
     if (username === 'admin' && password === 'admin') {
       return this.generateToken(username, 'ADMIN');
     }
 
-    // DB 사용자 조회 (비밀번호 검증 로직 추가 필요)
+    // DB 사용자 조회
     const user = await this.prisma.sysUser.findUnique({
       where: { loginId: username },
     });
 
     if (!user) {
+      // 사용자가 없으면 인증 실패 처리 (또는 AD 인증 후 자동 생성 로직 필요)
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // [TODO] 비밀번호 해시 비교 로직 추가
-    // if (!bcrypt.compare(password, user.password)) ...
-
+    // [TODO] 비밀번호 검증 로직 추가 (bcrypt 등)
+    
     // 권한 조회 (Admin 테이블 확인)
     const adminUser = await this.prisma.cfgAdminUser.findUnique({
       where: { loginId: username },
@@ -46,19 +42,7 @@ export class AuthService {
     return this.generateToken(username, role);
   }
 
-  // 2. 토큰 생성
-  private generateToken(username: string, role: string) {
-    const payload = { username, role };
-    return {
-      accessToken: this.jwtService.sign(payload),
-      user: {
-        username,
-        role,
-      },
-    };
-  }
-
-  // 3. 게스트 로그인 (요청 승인 여부 확인)
+  // 2. 게스트 로그인
   async guestLogin(loginDto: LoginDto) {
     const { username } = loginDto;
 
@@ -67,7 +51,7 @@ export class AuthService {
     });
 
     if (!guestAccess) {
-      throw new UnauthorizedException('Guest access not granted or expired');
+      throw new UnauthorizedException('Guest access not granted');
     }
 
     if (guestAccess.validUntil < new Date()) {
@@ -75,5 +59,17 @@ export class AuthService {
     }
 
     return this.generateToken(username, 'GUEST');
+  }
+
+  // 3. 토큰 생성 헬퍼
+  private generateToken(username: string, role: string) {
+    const payload = { username, role, sub: username };
+    return {
+      accessToken: this.jwtService.sign(payload),
+      user: {
+        username,
+        role,
+      },
+    };
   }
 }
