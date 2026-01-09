@@ -1,7 +1,7 @@
 // ITM-Data-API/src/auth/auth.controller.ts
 import { Controller, Post, Body } from '@nestjs/common';
 import { AuthService } from './auth.service';
-import { LoginDto } from './auth.interface';
+import { LoginDto } from './auth.interface'; // [확인] 경로 일치
 
 @Controller('auth')
 export class AuthController {
