@@ -122,13 +122,12 @@ export class WaferService {
     column: string,
     params: WaferQueryParams
   ): Promise<string[]> {
-    const { eqpId, lotId, cassetteRcp, stageGroup, startDate, endDate } =
+    const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } =
       params;
 
     const table = 'public.plg_wf_flat';
     let colName = column;
 
-    // 프론트엔드 요청 파라미터 매핑
     if (column === 'lotids') colName = 'lotid';
     if (column === 'cassettercps') colName = 'cassettercp';
     if (column === 'stagercps' || column === 'stageRcps') colName = 'stagercp';
@@ -139,25 +138,28 @@ export class WaferService {
     let whereClause = `WHERE 1=1`;
     const queryParams: (string | number | Date)[] = [];
 
-    // [수정 1] 필터 목록 조회 시, 자기 자신(colName)에 대한 조건은 제외해야
-    // 선택 후에도 다른 전체 목록이 조회됨.
-
     if (eqpId) {
       whereClause += ` AND eqpid = $${queryParams.length + 1}`;
       queryParams.push(eqpId);
     }
-    // 예: Lot ID 목록을 조회할 때는, 현재 선택된 lotId 조건은 무시해야 함
     if (lotId && colName !== 'lotid') {
       whereClause += ` AND lotid = $${queryParams.length + 1}`;
       queryParams.push(lotId);
     }
-    if (cassetteRcp  && colName !== 'cassettercp') {
+    // 선택된 자신(cassettercp)을 제외하지 않고, 다른 필터 조건만 반영 (계층 구조)
+    // 단, 자기 자신을 선택 변경할 때 전체 목록이 보여야 한다면 아래 조건문 수정 필요
+    // 여기서는 요청하신 대로 상위 필터 의존성만 고려하여 구성함.
+    if (cassetteRcp && colName !== 'cassettercp') {
       whereClause += ` AND cassettercp = $${queryParams.length + 1}`;
       queryParams.push(cassetteRcp);
     }
     if (stageGroup && colName !== 'stagegroup') {
       whereClause += ` AND stagegroup = $${queryParams.length + 1}`;
       queryParams.push(stageGroup);
+    }
+    if (film && colName !== 'film') {
+      whereClause += ` AND film = $${queryParams.length + 1}`;
+      queryParams.push(film);
     }
 
     if (startDate && endDate) {
@@ -872,352 +874,33 @@ export class WaferService {
     }
   }
 
-  async checkPdf(
-    params: WaferQueryParams,
-  ): Promise<{ exists: boolean; url: string | null }> {
-    const { eqpId, lotId, waferId, servTs } = params;
-    if (!eqpId || !servTs) return { exists: false, url: null };
-
-    try {
-      const ts = typeof servTs === 'string' ? servTs : servTs.toISOString();
-
-      const results = await this.prisma.$queryRawUnsafe<PdfResult[]>(
-        `SELECT file_uri FROM public.plg_wf_map 
-          WHERE eqpid = $1 
-            AND datetime >= $2::timestamp - interval '24 hours'
-            AND datetime <= $2::timestamp + interval '24 hours'
-          ORDER BY datetime DESC`,
-        eqpId,
-        ts,
-      );
-
-      if (!results || results.length === 0) {
-        return { exists: false, url: null };
-      }
-
-      if (lotId) {
-        const targetLot = lotId.trim();
-        const targetLotUnderscore = targetLot.replace(/\./g, '_');
-
-        const matched = results.find((r) => {
-          if (!r.file_uri) return false;
-          const uri = r.file_uri;
-
-          const hasLot =
-            uri.includes(targetLot) || uri.includes(targetLotUnderscore);
-
-          let hasWafer = true;
-          if (waferId) {
-            hasWafer = uri.includes(String(waferId));
-          }
-
-          return hasLot && hasWafer;
-        });
-
-        if (matched) {
-          return { exists: true, url: matched.file_uri };
-        }
-      } else {
-        return { exists: true, url: results[0].file_uri };
-      }
-    } catch (e) {
-      console.warn(`Failed to check PDF for ${String(eqpId)}:`, e);
-    }
-    return { exists: false, url: null };
-  }
-
-  async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
-    const { eqpId, lotId, waferId, ts } = params;
-    if (!eqpId || !lotId || !waferId || !ts) return [];
-
-    const targetDate = new Date(ts);
-    const tsRaw = targetDate.toISOString();
-
-    const rawData = await this.prisma.$queryRawUnsafe<ResidualRawResult[]>(
-      `SELECT s.point, f.x, f.y, s.class, s.values 
-        FROM public.plg_onto_spectrum s
-        JOIN public.plg_wf_flat f 
-          ON s.eqpid = f.eqpid 
-          AND s.lotid = f.lotid 
-          AND s.waferid = f.waferid::varchar 
-          AND s.point = f.point
-        WHERE s.eqpid = $1 
-          AND s.ts >= $2::timestamp - interval '2 second'
-          AND s.ts <= $2::timestamp + interval '2 second'
-          AND f.serv_ts >= $2::timestamp - interval '5 second'
-          AND f.serv_ts <= $2::timestamp + interval '5 second'
-          AND s.lotid = $3 
-          AND s.waferid = $4`,
-      eqpId,
-      tsRaw,
-      lotId,
-      String(waferId),
-    );
-
-    const mapData: Map<
-      number,
-      { exp: number[]; gen: number[]; x: number; y: number }
-    > = new Map();
-
-    rawData.forEach((r) => {
-      if (!mapData.has(r.point)) {
-        mapData.set(r.point, {
-          exp: [],
-          gen: [],
-          x: r.x || 0,
-          y: r.y || 0,
-        });
-      }
-      const item = mapData.get(r.point);
-      if (item) {
-        if (r.class.toLowerCase() === 'exp') item.exp = r.values || [];
-        if (r.class.toLowerCase() === 'gen') item.gen = r.values || [];
-      }
-    });
-
-    const result: ResidualMapItem[] = [];
-    mapData.forEach((val, point) => {
-      if (
-        val.exp.length > 0 &&
-        val.gen.length > 0 &&
-        val.exp.length === val.gen.length
-      ) {
-        const sumDiff = val.exp.reduce(
-          (acc, curr, idx) => acc + Math.abs(curr - val.gen[idx]),
-          0,
-        );
-        result.push({ point, x: val.x, y: val.y, residual: sumDiff });
-      }
-    });
-
-    return result;
-  }
-
-  async getGoldenSpectrum(params: WaferQueryParams) {
-    const { eqpId, cassetteRcp, stageGroup, film, pointId } = params;
-
-    let sql = `
-      SELECT s."wavelengths", s."values"
-      FROM public.plg_onto_spectrum s
-      JOIN public.plg_wf_flat f 
-        ON s."eqpid" = f.eqpid 
-        AND s."lotid" = f.lotid 
-        AND s."waferid" = f.waferid::varchar 
-        AND s."point" = f.point
-      WHERE s."class" = 'EXP'
-        AND f."eqpid" = $1
-        AND f."cassettercp" = $2
-        AND f."stagegroup" = $3
-    `;
-
-    const queryParams: (string | number)[] = [
-      eqpId || '',
-      cassetteRcp || '',
-      stageGroup || '',
-    ];
-
-    if (pointId) {
-      sql += ` AND s."point" = $${queryParams.length + 1}`;
-      queryParams.push(Number(pointId));
-    }
-
-    if (film) {
-      sql += ` AND f."film" = $${queryParams.length + 1}`;
-      queryParams.push(film);
-    }
-
-    sql += ` ORDER BY f."gof" DESC LIMIT 10`;
-
-    try {
-      const samples = await this.prisma.$queryRawUnsafe<GoldenRawResult[]>(
-        sql,
-        ...queryParams,
-      );
-
-      if (samples.length === 0) return null;
-
-      const baseWavelengths = samples[0].wavelengths;
-      const valueSums: number[] = Array.from(
-        { length: baseWavelengths.length },
-        () => 0,
-      );
-      let count = 0;
-
-      samples.forEach((sample) => {
-        if (sample.values && sample.values.length === baseWavelengths.length) {
-          sample.values.forEach((v: number, i: number) => (valueSums[i] += v));
-          count++;
-        }
-      });
-
-      if (count === 0) return null;
-
-      return {
-        wavelengths: baseWavelengths,
-        values: valueSums.map((v) => v / count),
-      };
-    } catch (e) {
-      console.error('Error fetching Golden Spectrum:', e);
-      return null;
-    }
-  }
-
-  async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
-    const { lotId, cassetteRcp, stageGroup, film } = params;
-
-    if (!lotId || !cassetteRcp || !stageGroup || !film) {
-      return [];
-    }
-
-    let allowedMetrics: string[] = [];
-    try {
-      const configResult = await this.prisma.$queryRaw<
-        { metric_name: string }[]
-      >`
-        SELECT metric_name
-        FROM public.cfg_lot_uniformity_metrics
-        WHERE is_excluded = 'N'
-      `;
-      allowedMetrics = configResult.map((r) => r.metric_name);
-    } catch {
-      return [];
-    }
-
-    if (allowedMetrics.length === 0) return [];
-
-    const countSelects = allowedMetrics
-      .map((col) => `COUNT("${col}") as "${col}"`)
-      .join(', ');
-
-    const checkSql = `
-      SELECT ${countSelects}
-      FROM public.plg_wf_flat
-      WHERE "lotid" = $1
-        AND "cassettercp" = $2
-        AND "stagegroup" = $3
-        AND "film" = $4
-    `;
-
-    try {
-      const countsResult = await this.prisma.$queryRawUnsafe<
-        Record<string, number | bigint>[]
-      >(checkSql, lotId, cassetteRcp, stageGroup, film);
-
-      if (!countsResult || countsResult.length === 0) {
-        return [];
-      }
-
-      const counts = countsResult[0];
-
-      return allowedMetrics
-        .filter((col) => {
-          const val = counts[col];
-          return val !== undefined && val !== null && Number(val) > 0;
-        })
-        .sort();
-    } catch {
-      return [];
-    }
-  }
-
-  async getLotUniformityTrend(params: WaferQueryParams & { metric: string }) {
-    const { lotId, cassetteRcp, stageGroup, film, metric } = params;
-
-    if (!lotId || !cassetteRcp || !stageGroup || !film || !metric) {
-      return [];
-    }
-
-    const metricCol = `"${metric}"`;
-
-    const sql = `
-      SELECT 
-        f.waferid,
-        f.point,
-        f.${metricCol} as value,
-        f.x, 
-        f.y,
-        f.dierow, 
-        f.diecol
-      FROM public.plg_wf_flat f
-      WHERE f.lotid = $1
-        AND f.cassettercp = $2
-        AND f.stagegroup = $3
-        AND f.film = $4
-        AND f.${metricCol} IS NOT NULL
-      ORDER BY f.waferid ASC, f.point ASC
-    `;
-
-    try {
-      const results = await this.prisma.$queryRawUnsafe<LotTrendRawResult[]>(
-        sql,
-        lotId,
-        cassetteRcp,
-        stageGroup,
-        film,
-      );
-
-      const grouped = new Map<
-        number,
-        {
-          waferId: number;
-          dataPoints: {
-            point: number;
-            value: number;
-            x: number;
-            y: number;
-            dieRow: number | null;
-            dieCol: number | null;
-          }[];
-        }
-      >();
-
-      results.forEach((r) => {
-        if (!grouped.has(r.waferid)) {
-          grouped.set(r.waferid, {
-            waferId: r.waferid,
-            dataPoints: [],
-          });
-        }
-
-        const xVal = r.x !== null ? Number(r.x) : 0;
-        const yVal = r.y !== null ? Number(r.y) : 0;
-
-        grouped.get(r.waferid)?.dataPoints.push({
-          point: r.point,
-          value: r.value,
-          x: xVal,
-          y: yVal,
-          dieRow: r.dierow,
-          dieCol: r.diecol,
-        });
-      });
-
-      return Array.from(grouped.values()).sort((a, b) => a.waferId - b.waferId);
-    } catch (e) {
-      console.error('Error fetching lot uniformity trend:', e);
-      return [];
-    }
-  }
-
+  // [수정] WHERE 절 빌더: datetime 컬럼을 사용하여 동일 Run 식별
   private buildUniqueWhere(p: WaferQueryParams): string | null {
     if (!p.eqpId) return null;
     let sql = `WHERE eqpid = '${String(p.eqpId)}'`;
 
-    // [수정] 통계 조회를 위해 servTs 범위를 좁힘 (±24시간 -> ±2초)
-    // 개별 wafer 측정값 조회가 목적이므로 24시간 범위는 데이터가 섞일 위험이 있음
-    if (p.servTs) {
-      const ts = typeof p.servTs === 'string' ? new Date(p.servTs) : p.servTs;
-      const tsIso = ts.toISOString();
-      sql += ` AND serv_ts >= '${tsIso}'::timestamp - interval '2 second'`;
-      sql += ` AND serv_ts <= '${tsIso}'::timestamp + interval '2 second'`;
+    // 1. 단일 측정 Scan 조회 (Data Results 행 선택 시)
+    // servTs가 넘어오더라도 실제 조회는 'datetime' 컬럼 기준 (장비 측정 시간)
+    // dateTime 값이 있으면 사용하고, 없으면 servTs를 대체로 사용 (프론트에서 dateTime 전달됨)
+    const targetDate = p.dateTime || p.servTs;
 
-      // 단일 측정 조회 시에는 eqpId, servTs, waferId 만으로 충분히 유니크하므로
-      // LotId 등을 제외한 나머지 조건은 생략하여 데이터 매칭 확률을 높임
+    if (targetDate) {
+      const ts = typeof targetDate === 'string' ? new Date(targetDate) : targetDate;
+      const tsIso = ts.toISOString();
+      
+      // 장비 시간(datetime) 기준으로 ±2초 범위 검색 (같은 Run 내의 모든 Point 포함)
+      sql += ` AND datetime >= '${tsIso}'::timestamp - interval '2 second'`;
+      sql += ` AND datetime <= '${tsIso}'::timestamp + interval '2 second'`;
+
       if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
       if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
+      
+      // [중요] 통계 조회 시 0값 문제 해결:
+      // 선택된 행의 컨텍스트(Eqp, Time, Lot, Wafer)만으로 유니크하게 식별 가능하므로
+      // 불필요한 메타데이터(Cassette, Stage, Film 등) 조건은 제외하여 데이터 누락 방지.
     } 
-    // servTs가 없고 날짜 범위만 있는 경우 (일반 조회용)
     else {
+      // 2. 일반 목록 필터링 (필터 검색 시)
       if (p.startDate) {
         const s =
           typeof p.startDate === 'string'
