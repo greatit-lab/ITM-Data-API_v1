@@ -809,32 +809,84 @@ export class WaferService {
     }
   }
 
+  // [수정] 통계 로직 개선: T1 의존성 제거 및 존재하지 않는 컬럼 조회 방지
   async getStatistics(params: WaferQueryParams) {
     const whereSql = this.buildUniqueWhere(params);
-    if (!whereSql) return this.getEmptyStatistics();
+    if (!whereSql) return {};
 
     try {
-      const result = await this.prisma.$queryRawUnsafe<StatsRawResult[]>(`
-        SELECT
-          MAX(t1) as t1_max, MIN(t1) as t1_min, AVG(t1) as t1_mean, STDDEV_SAMP(t1) as t1_std,
-          MAX(gof) as gof_max, MIN(gof) as gof_min, AVG(gof) as gof_mean, STDDEV_SAMP(gof) as gof_std,
-          MAX(z) as z_max, MIN(z) as z_min, AVG(z) as z_mean, STDDEV_SAMP(z) as z_std,
-          MAX(srvisz) as s_max, MIN(srvisz) as s_min, AVG(srvisz) as s_mean, STDDEV_SAMP(srvisz) as s_std
+      // 1. 실제 DB에 존재하는 컬럼 목록 조회 (42703 에러 방지)
+      const validColumnsResult = await this.prisma.$queryRawUnsafe<{ column_name: string }[]>(
+        `SELECT column_name 
+         FROM information_schema.columns 
+         WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
+      );
+      
+      const validColumnSet = new Set(validColumnsResult.map(r => r.column_name.toLowerCase()));
+
+      // 2. 기본 컬럼 정의 (thickness 등 오류 유발 가능성 있는 컬럼 포함)
+      let targetColumns = ['t1', 'gof', 'z', 'srvisz', 'mse', 'thickness'];
+
+      // 3. DB 설정에서 추가 메트릭 가져오기
+      try {
+        const configMetrics = await this.prisma.$queryRaw<{ metric_name: string }[]>`
+          SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'
+        `;
+        if (configMetrics.length > 0) {
+          const configNames = configMetrics.map(c => c.metric_name.toLowerCase());
+          targetColumns = [...new Set([...targetColumns, ...configNames])];
+        }
+      } catch (e) {
+        console.warn('Failed to fetch metric config, using defaults.');
+      }
+
+      // 4. 제외 목록 필터링 + 실제 DB 존재 여부 확인
+      const excludeCols = ['x', 'y', 'diex', 'diey', 'dierow', 'diecol', 'dienum', 'diepointtag', 'point', 'lotid', 'waferid', 'eqpid', 'serv_ts', 'datetime'];
+      
+      targetColumns = targetColumns.filter(col => {
+        const lowerCol = col.toLowerCase();
+        // 제외 목록에 없으면서 && 실제 DB에 존재하는 컬럼만 선택
+        return !excludeCols.includes(lowerCol) && validColumnSet.has(lowerCol);
+      });
+
+      if (targetColumns.length === 0) {
+        return {}; // 조회할 컬럼이 하나도 없으면 빈 객체 반환
+      }
+
+      // 5. 동적 SQL 생성
+      const selectParts = targetColumns.map(col => `
+        MAX("${col}") as "${col}_max", 
+        MIN("${col}") as "${col}_min", 
+        AVG("${col}") as "${col}_mean", 
+        STDDEV_SAMP("${col}") as "${col}_std"
+      `).join(', ');
+
+      const sql = `
+        SELECT ${selectParts}
         FROM public.plg_wf_flat
         ${whereSql}
         LIMIT 1
-      `);
+      `;
 
-      const row = result[0] || ({} as StatsRawResult);
-      if (row.t1_max === null) return this.getEmptyStatistics();
+      const result = await this.prisma.$queryRawUnsafe<StatsRawResult[]>(sql);
+      const row = result[0] || {};
 
-      const createStatItem = (prefix: string) => {
-        const max = Number(row[`${prefix}_max`] || 0);
-        const min = Number(row[`${prefix}_min`] || 0);
-        const mean = Number(row[`${prefix}_mean`] || 0);
-        const std = Number(row[`${prefix}_std`] || 0);
+      // 6. 결과 매핑
+      const statsResult: Record<string, any> = {};
+
+      for (const col of targetColumns) {
+        // 데이터가 없으면(null) 건너뜀
+        if (row[`${col}_max`] === null || row[`${col}_max`] === undefined) {
+          continue;
+        }
+
+        const max = Number(row[`${col}_max`] || 0);
+        const min = Number(row[`${col}_min`] || 0);
+        const mean = Number(row[`${col}_mean`] || 0);
+        const std = Number(row[`${col}_std`] || 0);
         const range = max - min;
-        return {
+
+        statsResult[col] = {
           max,
           min,
           range,
@@ -843,17 +895,13 @@ export class WaferService {
           percentStdDev: mean !== 0 ? (std / mean) * 100 : 0,
           percentNonU: mean !== 0 ? (range / (2 * mean)) * 100 : 0,
         };
-      };
+      }
 
-      return {
-        t1: createStatItem('t1'),
-        gof: createStatItem('gof'),
-        z: createStatItem('z'),
-        srvisz: createStatItem('s'),
-      };
+      return statsResult;
+
     } catch (e) {
       console.error('Error in getStatistics:', e);
-      return this.getEmptyStatistics();
+      return {};
     }
   }
 
@@ -925,42 +973,30 @@ export class WaferService {
     }
   }
 
-  // [수정] WHERE 절 빌더: datetime 컬럼을 사용하여 동일 Run 식별
   private buildUniqueWhere(p: WaferQueryParams): string | null {
     if (!p.eqpId) return null;
     let sql = `WHERE eqpid = '${String(p.eqpId)}'`;
 
-    // 1. 단일 측정 Scan 조회 (Data Results 행 선택 시)
     const targetDate = p.dateTime || p.servTs;
 
     if (targetDate) {
-      // Date 객체일 경우 toISOString()을 쓰면 UTC로 변환되어 DB 값(KST)과 달라질 수 있음.
-      // 따라서 Date 객체라면 문자열로 변환하거나, 이미 문자열이라면 T, Z를 제거하고 사용.
       let dateStr = "";
       if (typeof targetDate === 'string') {
         dateStr = targetDate;
       } else {
-        // Date 객체인 경우 ISO 문자열로 변환
         dateStr = targetDate.toISOString();
       }
       
-      // 문자열에서 시간 부분만 추출 (예: '2026-01-12T08:51:04.000Z' -> '2026-01-12 08:51:04')
-      // T와 Z를 제거하고 소수점 이하 초 단위를 날려버리거나 포함해서 비교
       const cleanDateStr = dateStr.replace('T', ' ').replace('Z', '').split('.')[0];
       
-      // timestamp 캐스팅을 명시하여 문자열 그대로 DB의 datetime과 비교
       sql += ` AND datetime >= '${cleanDateStr}'::timestamp - interval '2 second'`;
       sql += ` AND datetime <= '${cleanDateStr}'::timestamp + interval '2 second'`;
 
       if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
       if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
       
-      // [중요] 통계 0값 문제 해결: 
-      // 선택된 행의 컨텍스트(Eqp, Time, Lot, Wafer)만으로 유니크하게 식별 가능하므로
-      // 불필요한 메타데이터(Cassette, Stage, Film 등) 조건은 제외하여 데이터 누락 방지.
     } 
     else {
-      // 2. 일반 목록 필터링 (필터 검색 시)
       if (p.startDate) {
         const s =
           typeof p.startDate === 'string'
@@ -981,19 +1017,6 @@ export class WaferService {
       if (p.film) sql += ` AND film = '${String(p.film)}'`;
     }
     return sql;
-  }
-
-  private getEmptyStatistics() {
-    const emptyItem = {
-      max: 0,
-      min: 0,
-      range: 0,
-      mean: 0,
-      stdDev: 0,
-      percentStdDev: 0,
-      percentNonU: 0,
-    };
-    return { t1: emptyItem, gof: emptyItem, z: emptyItem, srvisz: emptyItem };
   }
 
   async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> {
@@ -1196,6 +1219,125 @@ export class WaferService {
     } catch (e) {
       console.error('Error in getOpticalTrend:', e);
       return [];
+    }
+  }
+
+  // [추가] 누락된 메서드 구현 1: getResidualMap
+  async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
+    const whereSql = this.buildUniqueWhere(params);
+    if (!whereSql) return [];
+    
+    // 기본적으로 't1'을 사용하되 params.metric이 있으면 그것을 사용
+    const metric = params.metric || 't1'; 
+    
+    try {
+      const data = await this.prisma.$queryRawUnsafe<{ point: number, x: number, y: number, val: number }[]>(
+        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${whereSql}`
+      );
+      
+      if (!data.length) return [];
+      
+      const validData = data.filter(d => d.val !== null);
+      if (!validData.length) return [];
+
+      const mean = validData.reduce((acc, cur) => acc + cur.val, 0) / validData.length;
+      
+      return validData.map(d => ({
+        point: d.point,
+        x: d.x,
+        y: d.y,
+        residual: d.val - mean
+      }));
+    } catch (e) {
+      console.error('Error in getResidualMap:', e);
+      return [];
+    }
+  }
+
+  // [추가] 누락된 메서드 구현 2: getGoldenSpectrum
+  async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenRawResult | null> {
+    const { eqpId, lotId, waferId, pointId, ts } = params;
+    if (!eqpId || !ts) return null;
+    
+    try {
+        const targetDate = typeof ts === 'string' ? new Date(ts) : ts;
+        const tsRaw = targetDate.toISOString();
+        // 'GOLDEN' 클래스를 찾거나 없으면 'GEN'을 반환하는 로직 (예시)
+        const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
+          `SELECT "wavelengths", "values" FROM public.plg_onto_spectrum 
+           WHERE "eqpid" = $1 
+             AND "ts" >= $2::timestamp - interval '2 second'
+             AND "ts" <= $2::timestamp + interval '2 second'
+             AND "class" = 'GOLDEN'
+           LIMIT 1`,
+           eqpId, tsRaw
+        );
+        
+        if (!results || results.length === 0) return null;
+        
+        return {
+            wavelengths: results[0].wavelengths,
+            values: results[0].values
+        };
+    } catch(e) { 
+        console.error('Error in getGoldenSpectrum:', e);
+        return null; 
+    }
+  }
+
+  // [추가] 누락된 메서드 구현 3: getAvailableMetrics
+  async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
+    try {
+        const results = await this.prisma.$queryRaw<{metric_name: string}[]>`
+            SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name
+        `;
+        return results.map(r => r.metric_name);
+    } catch (e) { 
+        console.warn('Failed to fetch available metrics', e);
+        return ['t1', 'gof', 'mse', 'thickness']; 
+    }
+  }
+
+  // [추가] 누락된 메서드 구현 4: getLotUniformityTrend
+  async getLotUniformityTrend(params: WaferQueryParams & { metric: string }): Promise<any[]> {
+    const { metric, ...rest } = params;
+    const targetMetric = metric || 't1';
+    
+    // lot 단위 조회를 위해 waferId 조건 제거
+    const whereSql = this.buildUniqueWhere({ ...rest, waferId: undefined }); 
+    if (!whereSql) return [];
+    
+    try {
+        const results = await this.prisma.$queryRawUnsafe<any[]>(
+            `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
+             FROM public.plg_wf_flat ${whereSql} 
+             ORDER BY waferid, point`
+        );
+        
+        // WaferID 별로 그룹화
+        const grouped: Record<string, any[]> = {};
+        results.forEach(row => {
+            const wid = String(row.waferid);
+            if (!grouped[wid]) grouped[wid] = [];
+            grouped[wid].push(row);
+        });
+        
+        const series = Object.keys(grouped).map(wid => ({
+            waferId: Number(wid),
+            dataPoints: grouped[wid].map(p => ({
+                point: p.point,
+                value: p.value,
+                x: p.x,
+                y: p.y,
+                dieRow: p.dierow,
+                dieCol: p.diecol
+            }))
+        }));
+        
+        return series;
+    } catch(e) { 
+        console.error('Error in getLotUniformityTrend:', e);
+        return []; 
     }
   }
 }
