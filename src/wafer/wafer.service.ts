@@ -1316,7 +1316,7 @@ export class WaferService {
     }
   }
 
-  // [수정] Metric 목록 조회 로직: DB 컬럼 존재 + 실제 데이터 존재(Count > 0) 체크
+  // [수정] Metric 목록 조회 로직 개선: 기본값 강제 할당 제거 및 실제 데이터 존재 여부 필수로 확인
   async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
     try {
         // 1. 설정 테이블에서 Metric 목록 조회
@@ -1324,9 +1324,15 @@ export class WaferService {
             SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name
         `;
         
-        if (configMetrics.length === 0) return [];
+        // [수정] 설정 테이블이 비어있을 경우 임의의 기본값(t1 등)을 반환하지 않고 빈 배열 처리
+        // "없는 메트릭"이 조회되는 오동작 방지
+        let candidates = configMetrics.map(m => m.metric_name);
+        
+        if (candidates.length === 0) {
+            return []; 
+        }
 
-        // 2. 실제 테이블(plg_wf_flat) 컬럼 목록 조회 (스키마 확인)
+        // 2. 실제 테이블(plg_wf_flat) 스키마의 컬럼 목록 조회 (SQL Injection 방지 및 유효성 검증)
         const tableColumns = await this.prisma.$queryRawUnsafe<{ column_name: string }[]>(
             `SELECT column_name 
              FROM information_schema.columns 
@@ -1335,15 +1341,13 @@ export class WaferService {
 
         const validColumnSet = new Set(tableColumns.map(c => c.column_name.toLowerCase()));
 
-        // 3. 교집합 필터링
-        const candidates = configMetrics
-            .map(m => m.metric_name)
-            .filter(metric => validColumnSet.has(metric.toLowerCase()));
+        // 3. 설정된 메트릭 중 실제 테이블 스키마에 존재하는 것만 필터링 (교집합)
+        candidates = candidates.filter(metric => validColumnSet.has(metric.toLowerCase()));
 
         if (candidates.length === 0) return [];
 
-        // 4. [핵심] 실제 데이터 존재 여부 확인 (Count > 0)
-        // waferId 조건은 제외하고 Lot 단위로 체크
+        // 4. [핵심] 선택된 조건(Lot, RCP, Stage, Film)에 맞는 실제 데이터 존재 여부 확인 (Count > 0)
+        // waferId 조건은 제외하고 Lot 전체 범위로 체크
         const whereSql = this.buildUniqueWhere({ 
             ...params, 
             waferId: undefined 
@@ -1351,7 +1355,7 @@ export class WaferService {
         
         if (!whereSql) return candidates; 
 
-        // 동적 Count 쿼리 생성
+        // 동적 Count 쿼리 생성: 각 메트릭 컬럼에 데이터가 몇 개나 있는지 확인
         const countSelects = candidates.map(col => `COUNT("${col}") as "${col}"`).join(', ');
         const countQuery = `SELECT ${countSelects} FROM public.plg_wf_flat ${whereSql}`;
         
@@ -1361,12 +1365,13 @@ export class WaferService {
         
         const counts = countResults[0];
         
-        // 데이터가 있는 컬럼만 최종 반환
+        // 실제 데이터 개수(Count)가 0보다 큰 메트릭만 최종 반환
         return candidates.filter(metric => Number(counts[metric]) > 0);
 
     } catch (e) { 
-        console.warn('Failed to fetch available metrics with check', e);
-        return ['t1', 'gof', 'mse', 'thickness']; 
+        console.error('Failed to fetch available metrics:', e);
+        // 에러 발생 시에도 임의의 값을 반환하지 않고 빈 배열 반환하여 오동작 방지
+        return []; 
     }
   }
 
