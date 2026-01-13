@@ -45,7 +45,12 @@ interface PdfResult {
   file_uri: string;
 }
 
-interface SpectrumRawResult {
+export interface GoldenSpectrumResponse {
+  wavelengths: number[];
+  values: number[];
+}
+
+export interface SpectrumRawResult {
   class: string;
   wavelengths: number[];
   values: number[];
@@ -73,16 +78,6 @@ export interface ResidualRawResult {
 export interface GoldenRawResult {
   wavelengths: number[];
   values: number[];
-}
-
-interface LotTrendRawResult {
-  waferid: number;
-  point: number;
-  x: number;
-  y: number;
-  dierow: number | null;
-  diecol: number | null;
-  value: number;
 }
 
 export interface ResidualMapItem {
@@ -1254,30 +1249,66 @@ export class WaferService {
     }
   }
 
-  // [추가] 누락된 메서드 구현 2: getGoldenSpectrum
-  async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenRawResult | null> {
-    const { eqpId, lotId, waferId, pointId, ts } = params;
-    if (!eqpId || !ts) return null;
+  // [수정] Golden Ref 조회 로직: 'GOLDEN' 클래스가 아닌 '최고 GOF(Best Known)' 데이터 조회
+  async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenSpectrumResponse | null> {
+    const { eqpId, lotId, pointId, cassetteRcp, stageGroup } = params;
+    
+    // 조건 필수값 체크
+    if (!eqpId || !lotId || !pointId) return null;
     
     try {
-        const targetDate = typeof ts === 'string' ? new Date(ts) : ts;
-        const tsRaw = targetDate.toISOString();
-        // 'GOLDEN' 클래스를 찾거나 없으면 'GEN'을 반환하는 로직 (예시)
-        const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
-          `SELECT "wavelengths", "values" FROM public.plg_onto_spectrum 
-           WHERE "eqpid" = $1 
-             AND "ts" >= $2::timestamp - interval '2 second'
-             AND "ts" <= $2::timestamp + interval '2 second'
-             AND "class" = 'GOLDEN'
-           LIMIT 1`,
-           eqpId, tsRaw
+        // 1. 해당 조건(Lot, RCP, Stage, Point)에서 GOF가 가장 높은(Best) 웨이퍼 조회
+        const bestGofSql = `
+            SELECT waferid
+            FROM public.plg_wf_flat
+            WHERE eqpid = $1
+              AND lotid = $2
+              AND point = $3
+              ${cassetteRcp ? "AND cassettercp = $4" : ""}
+              ${stageGroup ? "AND stagegroup = $5" : ""}
+              AND gof IS NOT NULL
+            ORDER BY gof DESC
+            LIMIT 1
+        `;
+        
+        const queryParams: any[] = [eqpId, lotId, Number(pointId)];
+        if (cassetteRcp) queryParams.push(cassetteRcp);
+        if (stageGroup) queryParams.push(stageGroup);
+
+        const bestData = await this.prisma.$queryRawUnsafe<{ waferid: unknown }[]>(bestGofSql, ...queryParams);
+        
+        if (!bestData || bestData.length === 0) return null; // 조건에 맞는 데이터가 없음
+
+        const targetWaferId = String(bestData[0].waferid);
+
+        // 2. 찾은 Best Wafer의 스펙트럼 데이터 조회 (EXP 클래스 기준)
+        // plg_onto_spectrum 테이블에서 해당 웨이퍼/포인트의 스펙트럼 가져오기
+        const spectrumSql = `
+            SELECT wavelengths, "values"
+            FROM public.plg_onto_spectrum
+            WHERE eqpid = $1
+              AND lotid = $2
+              -- [중요] WaferID 타입 이슈 방지를 위해 ::varchar 캐스팅 제거하고 파라미터 바인딩 사용
+              AND waferid = $3 
+              AND point = $4
+              AND class = 'EXP' 
+            ORDER BY ts DESC
+            LIMIT 1
+        `;
+
+        const spectrum = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
+            spectrumSql, 
+            eqpId, 
+            lotId, 
+            targetWaferId, 
+            Number(pointId)
         );
         
-        if (!results || results.length === 0) return null;
+        if (!spectrum || spectrum.length === 0) return null;
         
         return {
-            wavelengths: results[0].wavelengths,
-            values: results[0].values
+            wavelengths: spectrum[0].wavelengths,
+            values: spectrum[0].values
         };
     } catch(e) { 
         console.error('Error in getGoldenSpectrum:', e);
@@ -1285,15 +1316,56 @@ export class WaferService {
     }
   }
 
-  // [추가] 누락된 메서드 구현 3: getAvailableMetrics
+  // [수정] Metric 목록 조회 로직: DB 컬럼 존재 + 실제 데이터 존재(Count > 0) 체크
   async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
     try {
-        const results = await this.prisma.$queryRaw<{metric_name: string}[]>`
+        // 1. 설정 테이블에서 Metric 목록 조회
+        const configMetrics = await this.prisma.$queryRaw<{metric_name: string}[]>`
             SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name
         `;
-        return results.map(r => r.metric_name);
+        
+        if (configMetrics.length === 0) return [];
+
+        // 2. 실제 테이블(plg_wf_flat) 컬럼 목록 조회 (스키마 확인)
+        const tableColumns = await this.prisma.$queryRawUnsafe<{ column_name: string }[]>(
+            `SELECT column_name 
+             FROM information_schema.columns 
+             WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
+        );
+
+        const validColumnSet = new Set(tableColumns.map(c => c.column_name.toLowerCase()));
+
+        // 3. 교집합 필터링
+        const candidates = configMetrics
+            .map(m => m.metric_name)
+            .filter(metric => validColumnSet.has(metric.toLowerCase()));
+
+        if (candidates.length === 0) return [];
+
+        // 4. [핵심] 실제 데이터 존재 여부 확인 (Count > 0)
+        // waferId 조건은 제외하고 Lot 단위로 체크
+        const whereSql = this.buildUniqueWhere({ 
+            ...params, 
+            waferId: undefined 
+        }); 
+        
+        if (!whereSql) return candidates; 
+
+        // 동적 Count 쿼리 생성
+        const countSelects = candidates.map(col => `COUNT("${col}") as "${col}"`).join(', ');
+        const countQuery = `SELECT ${countSelects} FROM public.plg_wf_flat ${whereSql}`;
+        
+        const countResults = await this.prisma.$queryRawUnsafe<Record<string, number | bigint>[]>(countQuery);
+        
+        if (!countResults || countResults.length === 0) return [];
+        
+        const counts = countResults[0];
+        
+        // 데이터가 있는 컬럼만 최종 반환
+        return candidates.filter(metric => Number(counts[metric]) > 0);
+
     } catch (e) { 
-        console.warn('Failed to fetch available metrics', e);
+        console.warn('Failed to fetch available metrics with check', e);
         return ['t1', 'gof', 'mse', 'thickness']; 
     }
   }
