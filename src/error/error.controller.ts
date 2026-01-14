@@ -12,8 +12,15 @@ export class ErrorController {
     @Query('sdwt') sdwt: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('eqpId') eqpId: string, // [추가] 장비 ID 필터
   ) {
-    return this.errorService.getErrorSummary(site, sdwt, startDate, endDate);
+    return this.errorService.getErrorSummary(
+      site,
+      sdwt,
+      startDate,
+      endDate,
+      eqpId,
+    );
   }
 
   @Get('trend')
@@ -22,8 +29,15 @@ export class ErrorController {
     @Query('sdwt') sdwt: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('eqpId') eqpId: string, // [추가] 장비 ID 필터
   ) {
-    return this.errorService.getErrorTrend(site, sdwt, startDate, endDate);
+    return this.errorService.getErrorTrend(
+      site,
+      sdwt,
+      startDate,
+      endDate,
+      eqpId,
+    );
   }
 
   @Get('logs')
@@ -34,7 +48,16 @@ export class ErrorController {
     @Query('sdwt') sdwt: string,
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
+    @Query('eqpId') eqpId: string, // [추가] 장비 ID 필터
   ) {
-    return this.errorService.getErrorLogs(Number(page), Number(limit), site, sdwt, startDate, endDate);
+    return this.errorService.getErrorLogs(
+      Number(page),
+      Number(limit),
+      site,
+      sdwt,
+      startDate,
+      endDate,
+      eqpId,
+    );
   }
 }
