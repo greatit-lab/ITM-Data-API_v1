@@ -1,9 +1,12 @@
-// ITM-Data-API/src/dashboard/dashboard.service.ts
-import { Injectable, InternalServerErrorException } from '@nestjs/common';
+// [전체 코드 교체]
+// 프로젝트: ITM-Data-API
+// 파일 경로: src/dashboard/dashboard.service.ts
+
+import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 
-// Raw Query 결과 인터페이스
+// Raw Query 결과 매핑을 위한 인터페이스
 interface AgentStatusRawResult {
   eqpid: string;
   is_online: boolean;
@@ -25,6 +28,8 @@ interface AgentStatusRawResult {
 
 @Injectable()
 export class DashboardService {
+  private readonly logger = new Logger(DashboardService.name);
+
   constructor(private prisma: PrismaService) {}
 
   // 버전 문자열 비교 헬퍼 함수
@@ -58,7 +63,7 @@ export class DashboardService {
       const latestAgentVersion =
         versions.length > 0 ? versions[versions.length - 1] : '';
 
-      // (2) 장비 필터 조건 생성
+      // (2) 장비 필터 조건 생성 (RefEquipmentWhereInput 구조 가정)
       const equipmentWhere: Prisma.RefEquipmentWhereInput = {
         sdwtRel: {
           isUse: 'Y',
@@ -73,7 +78,8 @@ export class DashboardService {
       const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
       const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
 
-      // (3) 주요 카운트 조회 (순차 실행으로 안정성 확보)
+      // (3) 주요 카운트 조회
+      
       // 전체 장비 수 (Agent 정보가 있는 장비 대상)
       const totalEqp = await this.prisma.refEquipment.count({ 
         where: { 
@@ -133,7 +139,7 @@ export class DashboardService {
         }
 
       } catch (err) {
-        console.warn("[Dashboard] Error stats query failed:", err);
+        this.logger.warn("Error stats query failed:", err);
       }
 
       // 비활성 에이전트 수 계산
@@ -153,81 +159,86 @@ export class DashboardService {
       };
 
     } catch (error) {
-      console.error("[DashboardService] getSummary Error:", error);
+      this.logger.error("getSummary Error:", error);
       throw new InternalServerErrorException("Failed to fetch dashboard summary");
     }
   }
 
   // 2. Agent 상태 목록 조회 (Raw Query)
   async getAgentStatus(site?: string, sdwt?: string) {
-    // 동적 WHERE 절 구성
-    let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
+    try {
+      // 동적 WHERE 절 구성
+      let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
 
-    if (sdwt) {
-      whereCondition = Prisma.sql`${whereCondition} AND r.sdwt = ${sdwt}`;
-    } else if (site) {
-      whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
-    }
-
-    // 복잡한 조인을 위한 Raw Query 실행
-    const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
-      SELECT 
-          a.eqpid, 
-          CASE WHEN COALESCE(s.status, 'OFFLINE') = 'ONLINE' THEN true ELSE false END AS is_online, 
-          s.last_perf_update AS last_contact,
-          a.pc_name, 
-          COALESCE(p.cpu_usage, 0) AS cpu_usage, 
-          COALESCE(p.mem_usage, 0) AS mem_usage, 
-          a.app_ver,
-          a.type, a.ip_address, a.os, a.system_type, a.locale, a.timezone,
-          COALESCE(e.alarm_count, 0)::int AS today_alarm_count,
-          p.serv_ts AS last_perf_serv_ts,
-          p.ts AS last_perf_eqp_ts
-      FROM public.agent_info a
-      JOIN public.ref_equipment r ON a.eqpid = r.eqpid
-      LEFT JOIN public.agent_status s ON a.eqpid = s.eqpid
-      LEFT JOIN (
-          SELECT eqpid, cpu_usage, mem_usage, serv_ts, ts, 
-                 ROW_NUMBER() OVER(PARTITION BY eqpid ORDER BY serv_ts DESC) as rn
-          FROM public.eqp_perf
-          WHERE serv_ts >= NOW() - INTERVAL '1 day' 
-      ) p ON a.eqpid = p.eqpid AND p.rn = 1
-      LEFT JOIN (
-          SELECT eqpid, COUNT(*) AS alarm_count 
-          FROM public.plg_error 
-          WHERE time_stamp >= CURRENT_DATE
-          GROUP BY eqpid
-      ) e ON a.eqpid = e.eqpid
-      ${whereCondition}
-      ORDER BY a.eqpid ASC;
-    `;
-
-    // 결과 매핑 및 Time Drift 계산
-    return results.map((r) => {
-      let clockDrift: number | null = null;
-      if (r.last_perf_serv_ts && r.last_perf_eqp_ts) {
-        const servTs = new Date(r.last_perf_serv_ts).getTime();
-        const eqpTs = new Date(r.last_perf_eqp_ts).getTime();
-        clockDrift = (servTs - eqpTs) / 1000;
+      if (sdwt) {
+        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt = ${sdwt}`;
+      } else if (site) {
+        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
       }
 
-      return {
-        eqpId: r.eqpid,
-        isOnline: r.is_online,
-        lastContact: r.last_contact,
-        pcName: r.pc_name,
-        cpuUsage: r.cpu_usage,
-        memoryUsage: r.mem_usage,
-        appVersion: r.app_ver || '',
-        type: r.type || '',
-        ipAddress: r.ip_address || '',
-        os: r.os || '',
-        systemType: r.system_type || '',
-        locale: r.locale || '',
-        timezone: r.timezone || '',
-        todayAlarmCount: r.today_alarm_count,
-        clockDrift: clockDrift,
-      };
-    });
+      // 복잡한 조인을 위한 Raw Query 실행
+      const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
+        SELECT 
+            a.eqpid, 
+            CASE WHEN COALESCE(s.status, 'OFFLINE') = 'ONLINE' THEN true ELSE false END AS is_online, 
+            s.last_perf_update AS last_contact,
+            a.pc_name, 
+            COALESCE(p.cpu_usage, 0) AS cpu_usage, 
+            COALESCE(p.mem_usage, 0) AS mem_usage, 
+            a.app_ver,
+            a.type, a.ip_address, a.os, a.system_type, a.locale, a.timezone,
+            COALESCE(e.alarm_count, 0)::int AS today_alarm_count,
+            p.serv_ts AS last_perf_serv_ts,
+            p.ts AS last_perf_eqp_ts
+        FROM public.agent_info a
+        JOIN public.ref_equipment r ON a.eqpid = r.eqpid
+        LEFT JOIN public.agent_status s ON a.eqpid = s.eqpid
+        LEFT JOIN (
+            SELECT eqpid, cpu_usage, mem_usage, serv_ts, ts, 
+                  ROW_NUMBER() OVER(PARTITION BY eqpid ORDER BY serv_ts DESC) as rn
+            FROM public.eqp_perf
+            WHERE serv_ts >= NOW() - INTERVAL '1 day' 
+        ) p ON a.eqpid = p.eqpid AND p.rn = 1
+        LEFT JOIN (
+            SELECT eqpid, COUNT(*) AS alarm_count 
+            FROM public.plg_error 
+            WHERE time_stamp >= CURRENT_DATE
+            GROUP BY eqpid
+        ) e ON a.eqpid = e.eqpid
+        ${whereCondition}
+        ORDER BY a.eqpid ASC;
+      `;
+
+      // 결과 매핑 및 Time Drift 계산
+      return results.map((r) => {
+        let clockDrift: number | null = null;
+        if (r.last_perf_serv_ts && r.last_perf_eqp_ts) {
+          const servTs = new Date(r.last_perf_serv_ts).getTime();
+          const eqpTs = new Date(r.last_perf_eqp_ts).getTime();
+          clockDrift = (servTs - eqpTs) / 1000;
+        }
+
+        return {
+          eqpId: r.eqpid,
+          isOnline: r.is_online,
+          lastContact: r.last_contact,
+          pcName: r.pc_name,
+          cpuUsage: r.cpu_usage,
+          memoryUsage: r.mem_usage,
+          appVersion: r.app_ver || '',
+          type: r.type || '',
+          ipAddress: r.ip_address || '',
+          os: r.os || '',
+          systemType: r.system_type || '',
+          locale: r.locale || '',
+          timezone: r.timezone || '',
+          todayAlarmCount: r.today_alarm_count,
+          clockDrift: clockDrift,
+        };
+      });
+    } catch (error) {
+      this.logger.error("getAgentStatus Error:", error);
+      throw new InternalServerErrorException("Failed to fetch agent status");
+    }
   }
 }
