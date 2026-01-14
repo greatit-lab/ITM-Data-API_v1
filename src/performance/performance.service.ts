@@ -7,8 +7,12 @@ import { Prisma } from '@prisma/client';
 export class PerformanceService {
   constructor(private prisma: PrismaService) {}
 
-  // 1. 장비 성능 이력 조회 (CPU, Memory, Temp 등)
-  async getPerformanceHistory(startDate: string, endDate: string, eqpids?: string) {
+  // 1. 장비 성능 이력 조회
+  async getPerformanceHistory(
+    startDate: string,
+    endDate: string,
+    eqpids?: string,
+  ) {
     const where: Prisma.EqpPerfWhereInput = {
       servTs: {
         gte: new Date(startDate),
@@ -37,7 +41,7 @@ export class PerformanceService {
     }));
   }
 
-  // 2. 프로세스별 메모리 이력 조회 (Process Memory View)
+  // 2. 프로세스별 메모리 이력 조회
   async getProcessHistory(
     startDate: string,
     endDate: string,
@@ -55,19 +59,22 @@ export class PerformanceService {
       orderBy: { servTs: 'asc' },
     });
 
-    // [핵심 수정] DB 필드명(Prisma)을 Frontend DTO 형식으로 매핑
-    // servTs -> timestamp
-    // memoryUsageMb -> memoryUsageMB
     return results.map((row: any) => ({
       timestamp: row.servTs,
       processName: row.processName,
-      // Prisma는 스네이크케이스(memory_usage_mb)를 주로 카멜케이스(memoryUsageMb)로 매핑함
-      memoryUsageMB: row.memoryUsageMb ?? row.memoryUsageMB ?? 0, 
+      memoryUsageMB: row.memoryUsageMb ?? row.memoryUsageMB ?? 0,
     }));
   }
 
-  // 3. ITM Agent 프로세스 트렌드 조회 (전체 장비 비교)
-  async getItmAgentTrend(site: string, sdwt: string, startDate: string, endDate: string) {
+  // 3. ITM Agent 프로세스 트렌드 조회
+  async getItmAgentTrend(
+    site: string,
+    sdwt: string,
+    startDate: string,
+    endDate: string,
+    eqpid?: string,
+    interval: number = 60,
+  ) {
     const start = new Date(startDate);
     const end = new Date(endDate);
 
@@ -77,21 +84,29 @@ export class PerformanceService {
         AND p.serv_ts <= ${end}
     `;
 
+    if (eqpid) {
+      filterSql = Prisma.sql`${filterSql} AND p.eqpid = ${eqpid}`;
+    }
+
     if (sdwt) {
       filterSql = Prisma.sql`${filterSql} AND r.sdwt = ${sdwt}`;
     } else if (site) {
       filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
     }
 
+    // [수정] public.agent_info 테이블의 app_ver 컬럼 조회
     const results = await this.prisma.$queryRaw`
       SELECT 
-        p.serv_ts as timestamp,
-        p.eqpid as "processName",
-        p.memory_usage_mb as "memoryUsageMB"
+        to_timestamp(floor(extract(epoch from p.serv_ts) / ${interval}) * ${interval}) as timestamp,
+        p.eqpid as "eqpId",
+        MAX(p.memory_usage_mb) as "memoryUsageMB",
+        MAX(i.app_ver) as "agentVersion"
       FROM public.eqp_proc_perf p
       JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+      LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
       ${filterSql}
-      ORDER BY p.serv_ts ASC
+      GROUP BY 1, 2
+      ORDER BY 1 ASC
     `;
 
     return results;
