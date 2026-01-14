@@ -1,4 +1,7 @@
-// ITM-Data-API/src/dashboard/dashboard.controller.ts
+// [전체 코드 교체]
+// 프로젝트: ITM-Data-API
+// 파일 경로: src/dashboard/dashboard.controller.ts
+
 import { Controller, Get, Query } from '@nestjs/common';
 import { DashboardService } from './dashboard.service';
 
