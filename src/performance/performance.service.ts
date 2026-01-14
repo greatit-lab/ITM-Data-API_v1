@@ -1,98 +1,114 @@
-// ITM-Data-API/src/performance/performance.service.ts
+// backend/src/performance/performance.service.ts
 import { Injectable } from '@nestjs/common';
-import { PrismaService } from '../prisma.service';
-import { Prisma } from '@prisma/client';
+import { DataApiService } from '../common/data-api.service';
+
+export interface PerformanceTrendResponse {
+  eqpId: string;
+  timestamp: string | Date;
+  cpuUsage: number;
+  memoryUsage: number;
+  cpuTemp: number;
+  gpuTemp: number;
+  fanSpeed: number;
+}
+
+export interface ProcessMemoryResponse {
+  timestamp: string | Date;
+  processName: string;
+  memoryUsageMB: number;
+}
+
+export interface ItmAgentTrendResponse {
+  timestamp: string | Date;
+  eqpId: string;
+  memoryUsageMB: number;
+}
 
 @Injectable()
 export class PerformanceService {
-  constructor(private prisma: PrismaService) {}
+  // [중요] Data API의 Controller 경로와 일치해야 함 ('performance')
+  private readonly DOMAIN = 'performance';
 
-  // 1. 장비 성능 이력 조회 (CPU, Memory, Temp 등)
-  async getPerformanceHistory(startDate: string, endDate: string, eqpids?: string) {
-    const where: Prisma.EqpPerfWhereInput = {
-      servTs: {
-        gte: new Date(startDate),
-        lte: new Date(endDate),
-      },
+  constructor(private readonly dataApiService: DataApiService) {}
+
+  // 1. 성능 트렌드 이력 (PerformanceTrendView용)
+  async getHistory(
+    startDate: string,
+    endDate: string,
+    eqpids: string,
+    intervalSeconds: number = 300,
+  ): Promise<PerformanceTrendResponse[]> {
+    const params = {
+      startDate,
+      endDate,
+      eqpids,
+      intervalSeconds,
     };
-
-    if (eqpids) {
-      const eqpIdList = eqpids.split(',');
-      where.eqpid = { in: eqpIdList };
-    }
-
-    // [수정] DB 조회 결과를 프론트엔드 DTO 형식에 맞춰 매핑
-    const results = await this.prisma.eqpPerf.findMany({
-      where,
-      orderBy: { servTs: 'asc' },
-    });
-
-    return results.map((row) => ({
-      eqpId: row.eqpid,
-      timestamp: row.servTs,      // [중요] servTs -> timestamp (X축 해결)
-      cpuUsage: row.cpuUsage,     // cpuUsage -> cpuUsage
-      memoryUsage: row.memUsage,  // [중요] memUsage -> memoryUsage (메모리 차트 해결)
-      cpuTemp: row.cpuTemp,
-      gpuTemp: row.gpuTemp,
-      fanSpeed: row.fanSpeed,
-    }));
+    
+    const result = await this.dataApiService.request<PerformanceTrendResponse[]>(
+      this.DOMAIN,
+      'get',
+      'history',
+      undefined,
+      params,
+    );
+    return result || [];
   }
 
-  // 2. 프로세스별 메모리 이력 조회 (Process Memory View)
+  // 2. 프로세스 메모리 이력 (ProcessMemoryView용)
   async getProcessHistory(
     startDate: string,
     endDate: string,
     eqpId: string,
-    interval: number = 60, // 기본 1분 간격
-  ) {
-    // 데이터량이 많을 수 있으므로 Raw Query로 시간 간격(Grouping) 처리 권장
-    // 여기서는 Prisma로 단순 조회 후 애플리케이션 레벨에서 처리하거나,
-    // 데이터가 아주 많다면 아래와 같이 date_trunc 등을 사용하는 Raw Query로 최적화 가능
-    
-    // 단순 조회 방식 (데이터가 적을 때)
-    return this.prisma.eqpProcPerf.findMany({
-      where: {
-        eqpid: eqpId,
-        servTs: {
-          gte: new Date(startDate),
-          lte: new Date(endDate),
-        },
-      },
-      orderBy: { servTs: 'asc' },
-    });
+    intervalSeconds?: number,
+  ): Promise<ProcessMemoryResponse[]> {
+    const params = {
+      startDate,
+      endDate,
+      eqpId,
+      // [수정] Data API는 'interval'이라는 파라미터명을 사용하므로 매핑 필요
+      interval: intervalSeconds, 
+    };
+
+    // [중요] Data API 엔드포인트: /performance/process-history
+    const result = await this.dataApiService.request<ProcessMemoryResponse[]>(
+      this.DOMAIN,
+      'get',
+      'process-history',
+      undefined,
+      params,
+    );
+    return result || [];
   }
 
-  // 3. ITM Agent 프로세스 트렌드 조회 (전체 장비 비교)
-  async getItmAgentTrend(site: string, sdwt: string, startDate: string, endDate: string) {
-    // 특정 프로세스('ITM Agent' 등)의 메모리 사용량을 장비별로 비교
-    // Raw Query로 JOIN 및 필터링 수행
-    
-    const start = new Date(startDate);
-    const end = new Date(endDate);
+  // 3. ITM Agent 메모리 트렌드 (ItmAgentMemoryView용)
+  async getItmAgentTrend(
+    site: string,
+    sdwt: string,
+    eqpid: string,
+    startDate: string,
+    endDate: string,
+    intervalSeconds?: number,
+  ): Promise<ItmAgentTrendResponse[]> {
+    const params = {
+      site,
+      sdwt,
+      // [수정] Data API 파라미터명 확인 (보통 eqpId 사용)
+      eqpId: eqpid, 
+      startDate,
+      endDate,
+      // [수정] Data API 파라미터명 확인 (보통 interval 사용 가능성 있음, 여기선 intervalSeconds 유지 가정)
+      // 만약 Data API가 interval을 쓴다면 interval: intervalSeconds 로 수정 필요
+      interval: intervalSeconds, 
+    };
 
-    let filterSql = Prisma.sql`
-      WHERE p.process_name LIKE '%Agent%' 
-        AND p.serv_ts >= ${start} 
-        AND p.serv_ts <= ${end}
-    `;
-
-    if (sdwt) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt = ${sdwt}`;
-    } else if (site) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
-    }
-
-    const results = await this.prisma.$queryRaw`
-      SELECT 
-        p.serv_ts as timestamp,
-        p.eqpid as "processName", -- 차트에서 Series Key로 장비ID 사용
-        p.memory_usage_mb as "memoryUsageMB"
-      FROM public.eqp_proc_perf p
-      JOIN public.ref_equipment r ON p.eqpid = r.eqpid
-      ${filterSql}
-      ORDER BY p.serv_ts ASC
-    `;
-
-    return results;
+    const result = await this.dataApiService.request<ItmAgentTrendResponse[]>(
+      this.DOMAIN,
+      'get',
+      'itm-agent-trend',
+      undefined,
+      params,
+    );
+    return result || [];
   }
 }
