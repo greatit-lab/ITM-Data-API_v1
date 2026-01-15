@@ -1,5 +1,5 @@
 // ITM-Data-API/src/menu/menu.service.ts
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { RefMenu, Prisma } from '@prisma/client';
 
@@ -16,7 +16,7 @@ export interface MenuNode {
   roles?: string[];
 }
 
-export interface CreateMenuDto {
+export class CreateMenuDto {
   label: string;
   routerPath?: string;
   parentId?: number | null;
@@ -27,7 +27,7 @@ export interface CreateMenuDto {
   roles?: string[];
 }
 
-export interface UpdateMenuDto {
+export class UpdateMenuDto {
   label?: string;
   routerPath?: string;
   parentId?: number | null;
@@ -40,32 +40,67 @@ export interface UpdateMenuDto {
 
 @Injectable()
 export class MenuService {
+  private readonly logger = new Logger(MenuService.name);
+
   constructor(private prisma: PrismaService) {}
 
-  // [핵심] 사용자용 메뉴 트리 조회 (권한 기반 필터링)
+  // [핵심] 사용자용 메뉴 트리 조회
   async getMyMenus(role: string): Promise<MenuNode[]> {
-    // 1. 활성화된(isVisible='Y') 전체 메뉴 조회
-    const allMenus = await this.prisma.refMenu.findMany({
-      where: { isVisible: 'Y' },
-      orderBy: { sortOrder: 'asc' },
-    });
+    try {
+      const safeRole = role ? role.toUpperCase() : 'USER';
+      
+      // [디버깅 로그] 4단계: 서비스 로직 진입
+      this.logger.warn(`[DEBUG-DATA-4] MenuService.getMyMenus() processing...`);
+      this.logger.warn(`[DEBUG-DATA-4] Raw Role: "${role}" -> Normalized: "${safeRole}"`);
 
-    // 2. 관리자(ADMIN)이거나 데모 모드일 경우 전체 메뉴 반환
-    if (process.env.ENABLE_DEMO_MODE === 'true' || role === 'ADMIN') {
-      return this.buildMenuTree(allMenus);
+      // 1. 활성화된 전체 메뉴 조회
+      const allMenus = await this.prisma.refMenu.findMany({
+        where: { isVisible: 'Y' },
+        orderBy: { sortOrder: 'asc' },
+      });
+      
+      this.logger.warn(`[DEBUG-DATA-4] DB Total Active Menus: ${allMenus.length}`);
+      
+      if (allMenus.length === 0) {
+        this.logger.error('[DEBUG-DATA-4] ERROR: No active menus found in DB (ref_menu table is empty or all hidden)');
+        return [];
+      }
+
+      // 2. 관리자(ADMIN) 권한 확인 (슈퍼패스)
+      if (process.env.ENABLE_DEMO_MODE === 'true' || safeRole === 'ADMIN') {
+        this.logger.warn('[DEBUG-DATA-4] !!! ADMIN ACCESS GRANTED !!! Returning Full Tree.');
+        return this.buildMenuTree(allMenus);
+      }
+
+      // 3. 일반 사용자: 권한 테이블 조회
+      const rolesToCheck = [role, safeRole, role.toLowerCase()];
+      const uniqueRoles = [...new Set(rolesToCheck)].filter(r => r); 
+      
+      this.logger.warn(`[DEBUG-DATA-4] Checking DB permissions for roles: [${uniqueRoles.join(', ')}]`);
+
+      const accessible = await this.prisma.cfgMenuRole.findMany({
+        where: { role: { in: uniqueRoles } },
+        select: { menuId: true, role: true },
+      });
+      
+      this.logger.warn(`[DEBUG-DATA-4] Found ${accessible.length} permission entries in cfg_menu_role`);
+
+      if (accessible.length === 0) {
+        this.logger.warn(`[DEBUG-DATA-4] Warning: No menu permissions found for this user.`);
+        return [];
+      }
+
+      const allowedIds = new Set(accessible.map((a) => a.menuId));
+      const validMenus = this.filterMenusRecursive(allMenus, allowedIds);
+
+      this.logger.warn(`[DEBUG-DATA-4] Final Filtered Menus Count: ${validMenus.length}`);
+
+      return this.buildMenuTree(validMenus);
+
+    } catch (error) {
+      this.logger.error('[DEBUG-DATA-ERROR] Failed to get user menus', error);
+      return [];
     }
-
-    // 3. 해당 Role이 접근 가능한 메뉴 ID 목록 조회
-    const accessible = await this.prisma.cfgMenuRole.findMany({
-      where: { role: role },
-      select: { menuId: true },
-    });
-    const allowedIds = new Set(accessible.map((a) => a.menuId));
-
-    // 4. 재귀적 필터링 (자식 메뉴 권한이 있으면 부모 메뉴도 자동 포함)
-    const validMenus = this.filterMenusRecursive(allMenus, allowedIds);
-
-    return this.buildMenuTree(validMenus);
   }
 
   // [관리자용] 전체 메뉴 및 권한 매핑 조회
@@ -73,16 +108,11 @@ export class MenuService {
     const menus = await this.prisma.refMenu.findMany({
       orderBy: { sortOrder: 'asc' },
     });
-
-    // 모든 권한 매핑 정보 조회
     const roleMappings = await this.prisma.cfgMenuRole.findMany();
     
-    // 메뉴 ID별 권한 목록 Map 생성
     const roleMap = new Map<number, string[]>();
     roleMappings.forEach(mapping => {
-      if (!roleMap.has(mapping.menuId)) {
-        roleMap.set(mapping.menuId, []);
-      }
+      if (!roleMap.has(mapping.menuId)) roleMap.set(mapping.menuId, []);
       roleMap.get(mapping.menuId)?.push(mapping.role);
     });
 
@@ -90,11 +120,8 @@ export class MenuService {
   }
 
   // --- CRUD Operations ---
-
   async createMenu(data: CreateMenuDto) {
     const { label, routerPath, parentId, icon, sortOrder, statusTag, roles, isVisible } = data;
-
-    // Prisma Transaction 불필요 (Create는 단일) -> Role 매핑은 별도 처리
     const newMenu = await this.prisma.refMenu.create({
       data: {
         label,
@@ -103,17 +130,12 @@ export class MenuService {
         icon: icon || null,
         sortOrder: sortOrder || 0,
         statusTag: statusTag || null,
-        isVisible: isVisible === false ? 'N' : 'Y', // boolean -> 'Y'/'N' 변환
+        isVisible: isVisible === false ? 'N' : 'Y',
       },
     });
-
-    // 권한 매핑 추가
     if (roles && roles.length > 0) {
       await this.prisma.cfgMenuRole.createMany({
-        data: roles.map((role) => ({
-          menuId: newMenu.menuId,
-          role,
-        })),
+        data: roles.map((role) => ({ menuId: newMenu.menuId, role })),
       });
     }
     return newMenu;
@@ -121,7 +143,6 @@ export class MenuService {
 
   async updateMenu(id: number, data: UpdateMenuDto) {
     const { label, routerPath, parentId, icon, sortOrder, statusTag, roles, isVisible } = data;
-
     const updateData: Prisma.RefMenuUpdateInput = {
       ...(label !== undefined && { label }),
       ...(routerPath !== undefined && { routerPath: routerPath || null }),
@@ -131,23 +152,16 @@ export class MenuService {
       ...(statusTag !== undefined && { statusTag: statusTag || null }),
       ...(isVisible !== undefined && { isVisible: isVisible ? 'Y' : 'N' }),
     };
-
-    // 메뉴 업데이트
     const updatedMenu = await this.prisma.refMenu.update({
       where: { menuId: id },
       data: updateData,
     });
-
-    // 권한 정보가 전달된 경우에만 매핑 업데이트 (기존 권한 삭제 후 재생성)
     if (roles && Array.isArray(roles)) {
       await this.prisma.$transaction(async (tx) => {
         await tx.cfgMenuRole.deleteMany({ where: { menuId: id } });
         if (roles.length > 0) {
           await tx.cfgMenuRole.createMany({
-            data: roles.map((role) => ({
-              menuId: id,
-              role,
-            })),
+            data: roles.map((role) => ({ menuId: id, role })),
           });
         }
       });
@@ -156,12 +170,10 @@ export class MenuService {
   }
 
   async deleteMenu(id: number) {
-    // 권한 매핑 먼저 삭제 후 메뉴 삭제 (FK 제약 조건 고려)
     await this.prisma.cfgMenuRole.deleteMany({ where: { menuId: id } });
     return this.prisma.refMenu.delete({ where: { menuId: id } });
   }
 
-  // 특정 Role에 대한 권한 일괄 업데이트
   async updateRolePermissions(role: string, menuIds: number[]): Promise<void> {
     await this.prisma.$transaction(async (tx) => {
       await tx.cfgMenuRole.deleteMany({ where: { role } });
@@ -178,16 +190,10 @@ export class MenuService {
   }
 
   // --- Helper Methods ---
-
-  // 권한 있는 메뉴 및 그 부모 메뉴들을 재귀적으로 필터링
   private filterMenusRecursive(allMenus: RefMenu[], allowedIds: Set<number>): RefMenu[] {
     const menuMap = new Map<number, RefMenu>(allMenus.map(m => [m.menuId, m]));
     const resultIds = new Set<number>();
-
-    // 1. 권한이 있는 메뉴 ID 추가
     allowedIds.forEach(id => resultIds.add(id));
-
-    // 2. 권한 있는 메뉴의 상위(부모) 메뉴들을 찾아 결과에 추가
     allowedIds.forEach(id => {
       let current = menuMap.get(id);
       while (current && current.parentId) {
@@ -200,17 +206,12 @@ export class MenuService {
         }
       }
     });
-
-    // 3. 결과 ID 집합에 포함된 메뉴만 반환
     return allMenus.filter(m => resultIds.has(m.menuId));
   }
 
-  // Flat List -> Tree Structure 변환
   private buildMenuTree(menus: RefMenu[], roleMap?: Map<number, string[]>): MenuNode[] {
     const map = new Map<number, MenuNode>();
     const roots: MenuNode[] = [];
-
-    // 노드 생성
     menus.forEach((menu) => {
       map.set(menu.menuId, {
         menuId: menu.menuId,
@@ -225,8 +226,6 @@ export class MenuService {
         roles: roleMap ? (roleMap.get(menu.menuId) || []) : undefined,
       });
     });
-
-    // 트리 연결
     menus.forEach((menu) => {
       if (menu.parentId && map.has(menu.parentId)) {
         const parent = map.get(menu.parentId);
@@ -235,8 +234,6 @@ export class MenuService {
         roots.push(map.get(menu.menuId)!);
       }
     });
-
-    // 정렬 (sortOrder 기준)
     const sortNodes = (nodes: MenuNode[]) => {
       nodes.sort((a, b) => (a.sortOrder || 0) - (b.sortOrder || 0));
       nodes.forEach(node => {
@@ -244,7 +241,6 @@ export class MenuService {
       });
     };
     sortNodes(roots);
-
     return roots;
   }
 }
