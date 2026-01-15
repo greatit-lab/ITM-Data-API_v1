@@ -1,187 +1,259 @@
 // ITM-Data-API/src/error/error.service.ts
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 
+export class ErrorQueryParams {
+  site?: string;
+  sdwt?: string;
+  eqpId?: string;
+  start?: string | Date;
+  end?: string | Date;
+}
+
 @Injectable()
 export class ErrorService {
+  private readonly logger = new Logger(ErrorService.name);
+
   constructor(private prisma: PrismaService) {}
 
-  // [유지] 필터 조건 생성 로직
-  private getWhereInput(
-    site: string,
-    sdwt: string,
-    start: string,
-    end: string,
-    eqpId?: string,
-  ): Prisma.PlgErrorWhereInput {
-    const where: Prisma.PlgErrorWhereInput = {
+  // [Helper] 날짜 파싱 및 기본값 설정 (Local Time 문자열 그대로 범위 설정)
+  private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
+    const now = new Date();
+    
+    // 시작일: 입력값 또는 7일 전
+    let startDate = start ? new Date(start) : new Date();
+    if (isNaN(startDate.getTime()) || !start) {
+        startDate = new Date();
+        startDate.setDate(startDate.getDate() - 7);
+    }
+    // 시간 부분을 00:00:00.000 으로 설정
+    startDate.setHours(0, 0, 0, 0);
+
+    // 종료일: 입력값 또는 오늘
+    let endDate = end ? new Date(end) : now;
+    if (isNaN(endDate.getTime())) {
+        endDate = now;
+    }
+    // 시간 부분을 23:59:59.999 로 설정 (하루 전체 포함)
+    endDate.setHours(23, 59, 59, 999);
+
+    return { startDate, endDate };
+  }
+
+  // 1. 에러 요약 정보
+  async getErrorSummary(params: ErrorQueryParams) {
+    const { site, sdwt, eqpId, start, end } = params;
+    const { startDate, endDate } = this.getSafeDates(start, end);
+
+    const whereCondition: Prisma.PlgErrorWhereInput = {
       timeStamp: {
-        gte: new Date(start),
-        lte: new Date(end),
+        gte: startDate,
+        lte: endDate,
       },
     };
 
-    // 장비 ID 직접 필터링
     if (eqpId) {
-      where.eqpid = eqpId;
-    }
-
-    // Site/SDWT 필터 조건
-    if (site || sdwt) {
-      where.equipment = {
-        sdwtRel: {
-          isUse: 'Y',
-          ...(site ? { site } : {}),
-        },
-        ...(sdwt ? { sdwt } : {}),
-      };
-    }
-
-    return where;
-  }
-
-  // 1. 에러 요약 통계
-  async getErrorSummary(
-    site: string,
-    sdwt: string,
-    start: string,
-    end: string,
-    eqpId?: string,
-  ) {
-    const where = this.getWhereInput(site, sdwt, start, end, eqpId);
-
-    // 전체 에러 수
-    const totalCount = await this.prisma.plgError.count({ where });
-
-    // 가장 많이 발생한 에러 ID (Top 1)
-    const groupByError = await this.prisma.plgError.groupBy({
-      by: ['errorId'],
-      where,
-      _count: { errorId: true },
-      orderBy: { _count: { errorId: 'desc' } },
-      take: 1,
-    });
-
-    const topItem = groupByError[0];
-    const topErrorCount = topItem?._count?.errorId ?? 0;
-    const topErrorId = topItem?.errorId || '-';
-
-    // [수정] Top Error ID에 해당하는 Label 조회 로직 추가
-    let topErrorLabel = 'Unknown';
-    if (topErrorId !== '-') {
-      // 해당 errorId를 가진 가장 최근 로그 하나를 조회하여 라벨 확인
-      const errorRecord = await this.prisma.plgError.findFirst({
-        where: { errorId: topErrorId },
-        select: { errorLabel: true },
-        orderBy: { timeStamp: 'desc' },
-      });
-
-      if (errorRecord && errorRecord.errorLabel) {
-        topErrorLabel = errorRecord.errorLabel;
+      whereCondition.eqpid = eqpId.trim();
+    } else if (site || sdwt) {
+      const eqpList = await this.getEqpIdsBySiteSdwt(site, sdwt);
+      if (eqpList.length > 0) {
+        whereCondition.eqpid = { in: eqpList };
+      } else {
+        return { 
+          totalErrorCount: 0, 
+          errorEqpCount: 0,
+          topErrorId: '-',
+          topErrorCount: 0,
+          topErrorLabel: '-',
+          errorCountByEqp: [] 
+        };
       }
     }
 
-    // 에러 발생 장비 수
-    const groupByEqpAll = await this.prisma.plgError.groupBy({
-      by: ['eqpid'],
-      where,
-    });
-    const errorEqpCount = groupByEqpAll.length;
+    try {
+      const totalErrorCount = await this.prisma.plgError.count({
+        where: whereCondition,
+      });
 
-    // Worst Equipment 차트용 데이터 (Top 10)
-    const groupByEqpTop10 = await this.prisma.plgError.groupBy({
-      by: ['eqpid'],
-      where,
-      _count: { errorId: true },
-      orderBy: { _count: { errorId: 'desc' } },
-      take: 10,
-    });
+      const byEqp = await this.prisma.plgError.groupBy({
+        by: ['eqpid'],
+        where: whereCondition,
+        _count: { _all: true },
+        orderBy: { _count: { eqpid: 'desc' } },
+      });
 
-    const errorCountByEqp = groupByEqpTop10.map((item) => ({
-      label: item.eqpid,
-      value: item._count.errorId,
-    }));
+      const byErrorId = await this.prisma.plgError.groupBy({
+        by: ['errorId'],
+        where: whereCondition,
+        _count: { _all: true },
+        orderBy: { _count: { errorId: 'desc' } },
+        take: 1,
+      });
 
-    return {
-      totalErrorCount: totalCount,
-      errorEqpCount: errorEqpCount,
-      topErrorId: topErrorId,
-      topErrorCount: topErrorCount,
-      topErrorLabel: topErrorLabel, // [적용] 조회된 실제 라벨 반환
-      errorCountByEqp: errorCountByEqp,
-    };
+      let topErrorId = '-';
+      let topErrorCount = 0;
+      let topErrorLabel = '-';
+
+      if (byErrorId.length > 0) {
+        topErrorId = String(byErrorId[0].errorId);
+        topErrorCount = byErrorId[0]._count._all;
+        
+        const errorInfo = await this.prisma.plgError.findFirst({
+          where: { errorId: topErrorId },
+          select: { errorLabel: true, errorDesc: true },
+        });
+        if (errorInfo) {
+          topErrorLabel = errorInfo.errorLabel || errorInfo.errorDesc || '-';
+        }
+      }
+
+      const errorCountByEqp = byEqp.slice(0, 10).map(item => ({
+        label: item.eqpid,
+        value: item._count._all
+      }));
+
+      return {
+        totalErrorCount,
+        errorEqpCount: byEqp.length,
+        topErrorId,
+        topErrorCount,
+        topErrorLabel,
+        errorCountByEqp,
+      };
+
+    } catch (e) {
+      this.logger.error('Error fetching error summary:', e);
+      throw e;
+    }
   }
 
-  // 2. 일별 에러 발생 트렌드
-  async getErrorTrend(
-    site: string,
-    sdwt: string,
-    start: string,
-    end: string,
-    eqpId?: string,
-  ) {
-    let filterSql = Prisma.sql`
-      WHERE e.time_stamp >= ${new Date(start)} 
-        AND e.time_stamp <= ${new Date(end)}
-    `;
+  // 2. 에러 트렌드
+  async getErrorTrend(params: ErrorQueryParams) {
+    const { site, sdwt, eqpId, start, end } = params;
+    const { startDate, endDate } = this.getSafeDates(start, end);
+
+    let eqpFilter = '';
+    const queryParams: any[] = [startDate, endDate];
 
     if (eqpId) {
-      filterSql = Prisma.sql`${filterSql} AND e.eqpid = ${eqpId}`;
+      eqpFilter = `AND e.eqpid = $${queryParams.length + 1}`;
+      queryParams.push(eqpId.trim());
+    } else if (site || sdwt) {
+      let joinFilter = '';
+      if (site) {
+        joinFilter += ` AND s.site = '${site}'`;
+      }
+      if (sdwt) {
+        joinFilter += ` AND s.sdwt = '${sdwt}'`;
+      }
+      
+      if (joinFilter) {
+        const eqpList = await this.getEqpIdsBySiteSdwt(site, sdwt);
+        if (eqpList.length > 0) {
+            const eqpStr = eqpList.map(id => `'${id}'`).join(',');
+            eqpFilter = `AND e.eqpid IN (${eqpStr})`;
+        } else {
+            return []; 
+        }
+      }
     }
 
-    if (sdwt) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt = ${sdwt}`;
-    } else if (site) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
-    }
-
-    return this.prisma.$queryRaw`
+    const sql = `
       SELECT DATE(e.time_stamp) as date, COUNT(*)::int as count
       FROM public.plg_error e
-      JOIN public.ref_equipment r ON e.eqpid = r.eqpid
-      ${filterSql}
+      WHERE e.time_stamp >= $1 
+        AND e.time_stamp <= $2
+        ${eqpFilter}
       GROUP BY DATE(e.time_stamp)
       ORDER BY date ASC
     `;
+
+    try {
+      const result = await this.prisma.$queryRawUnsafe<any[]>(sql, ...queryParams);
+      
+      return result.map(r => ({
+        date: typeof r.date === 'string' ? r.date : new Date(r.date).toISOString().split('T')[0],
+        count: r.count
+      }));
+    } catch (e) {
+      this.logger.error('Error fetching error trend:', e);
+      return [];
+    }
   }
 
-  // 3. 에러 로그 목록 조회
-  async getErrorLogs(
-    page: number,
-    limit: number,
-    site: string,
-    sdwt: string,
-    start: string,
-    end: string,
-    eqpId?: string,
-  ) {
-    const where = this.getWhereInput(site, sdwt, start, end, eqpId);
-    const skip = (page - 1) * limit;
+  // 3. 에러 목록 조회
+  async getErrorList(params: ErrorQueryParams & { page?: number, pageSize?: number }) {
+    const { site, sdwt, eqpId, start, end, page = 0, pageSize = 50 } = params;
+    const { startDate, endDate } = this.getSafeDates(start, end);
 
-    const [items, totalItems] = await this.prisma.$transaction([
-      this.prisma.plgError.findMany({
-        where,
-        skip,
-        take: limit,
-        orderBy: { timeStamp: 'desc' },
-        include: {
-          equipment: {
-            select: {
-              sdwtRel: { select: { site: true } },
-            },
-          },
-        },
-      }),
-      this.prisma.plgError.count({ where }),
-    ]);
+    const whereCondition: Prisma.PlgErrorWhereInput = {
+      timeStamp: {
+        gte: startDate,
+        lte: endDate,
+      },
+    };
 
-    const formattedItems = items.map((item) => ({
-      ...item,
-      eqpId: item.eqpid,
-      site: item.equipment?.sdwtRel?.site || '-',
-    }));
+    if (eqpId) {
+      whereCondition.eqpid = eqpId.trim();
+    } else if (site || sdwt) {
+      const eqpList = await this.getEqpIdsBySiteSdwt(site, sdwt);
+      if (eqpList.length > 0) {
+        whereCondition.eqpid = { in: eqpList };
+      } else {
+        return { totalItems: 0, items: [] };
+      }
+    }
 
-    return { items: formattedItems, totalItems };
+    try {
+      const [total, items] = await this.prisma.$transaction([
+        this.prisma.plgError.count({ where: whereCondition }),
+        this.prisma.plgError.findMany({
+          where: whereCondition,
+          take: Number(pageSize),
+          skip: Number(page) * Number(pageSize),
+          orderBy: { timeStamp: 'desc' },
+        }),
+      ]);
+
+      const mappedItems = items.map((item: any) => ({
+        ...item,
+        eqpId: item.eqpid,
+      }));
+
+      return { totalItems: total, items: mappedItems };
+    } catch (e) {
+      this.logger.error('Error fetching error list:', e);
+      throw e;
+    }
+  }
+
+  private async getEqpIdsBySiteSdwt(site?: string, sdwt?: string): Promise<string[]> {
+    if (!site && !sdwt) return [];
+
+    let sql = `
+      SELECT t1.eqpid 
+      FROM public.ref_equipment t1
+      JOIN public.ref_sdwt t2 ON t1.sdwt = t2.sdwt
+      WHERE 1=1
+    `;
+    const params: string[] = [];
+
+    if (site) {
+      sql += ` AND t2.site = $${params.length + 1}`;
+      params.push(site);
+    }
+    if (sdwt) {
+      sql += ` AND t2.sdwt = $${params.length + 1}`;
+      params.push(sdwt);
+    }
+
+    try {
+      const result = await this.prisma.$queryRawUnsafe<{ eqpid: string }[]>(sql, ...params);
+      return result.map(r => r.eqpid);
+    } catch (e) {
+      this.logger.error('Error fetching equipment IDs:', e);
+      return [];
+    }
   }
 }
