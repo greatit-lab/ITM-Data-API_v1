@@ -1,6 +1,4 @@
-// [전체 코드 교체]
-// 프로젝트: ITM-Data-API
-// 파일 경로: src/dashboard/dashboard.service.ts
+// ITM-Data-API/src/dashboard/dashboard.service.ts
 
 import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
@@ -48,6 +46,12 @@ export class DashboardService {
   // 1. 대시보드 요약 정보 조회
   async getSummary(site?: string, sdwt?: string) {
     try {
+      // [개선] 빈 문자열 파라미터 처리 (빈 문자열이면 undefined로 변환하여 필터 무시)
+      const safeSite = site && site.trim() !== '' ? site : undefined;
+      const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
+
+      this.logger.debug(`getSummary called with - site: ${safeSite}, sdwt: ${safeSdwt}`);
+
       // (1) 최신 Agent 버전 계산
       const distinctVersions = await this.prisma.agentInfo.findMany({
         distinct: ['appVer'],
@@ -63,13 +67,14 @@ export class DashboardService {
       const latestAgentVersion =
         versions.length > 0 ? versions[versions.length - 1] : '';
 
-      // (2) 장비 필터 조건 생성 (RefEquipmentWhereInput 구조 가정)
+      // (2) 장비 필터 조건 생성
+      // [주의] safeSite, safeSdwt가 undefined이면 조건에서 제외됨 -> 전체 조회
       const equipmentWhere: Prisma.RefEquipmentWhereInput = {
         sdwtRel: {
           isUse: 'Y',
-          ...(site ? { site } : {}),
+          ...(safeSite ? { site: safeSite } : {}),
         },
-        ...(sdwt ? { sdwt } : {}),
+        ...(safeSdwt ? { sdwt: safeSdwt } : {}),
       };
 
       // 시간 기준점 설정
@@ -98,7 +103,10 @@ export class DashboardService {
 
       // 전체 SDWT 수
       const totalSdwts = await this.prisma.refSdwt.count({
-        where: { isUse: 'Y', ...(site ? { site } : {}) }
+        where: { 
+          isUse: 'Y', 
+          ...(safeSite ? { site: safeSite } : {}) 
+        }
       });
 
       // (4) 에러 통계 조회
@@ -167,13 +175,17 @@ export class DashboardService {
   // 2. Agent 상태 목록 조회 (Raw Query)
   async getAgentStatus(site?: string, sdwt?: string) {
     try {
+      // [개선] 빈 문자열 파라미터 안전 처리
+      const safeSite = site && site.trim() !== '' ? site : undefined;
+      const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
+
       // 동적 WHERE 절 구성
       let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
 
-      if (sdwt) {
-        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt = ${sdwt}`;
-      } else if (site) {
-        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
+      if (safeSdwt) {
+        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt = ${safeSdwt}`;
+      } else if (safeSite) {
+        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${safeSite})`;
       }
 
       // 복잡한 조인을 위한 Raw Query 실행
