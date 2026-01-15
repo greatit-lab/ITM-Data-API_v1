@@ -3,6 +3,7 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
@@ -43,6 +44,8 @@ interface StatsRawResult {
 
 interface PdfResult {
   file_uri: string;
+  datetime: Date;
+  original_filename?: string;
 }
 
 export interface GoldenSpectrumResponse {
@@ -110,12 +113,14 @@ interface PopplerModule {
 
 @Injectable()
 export class WaferService {
+  private readonly logger = new Logger(WaferService.name);
+
   constructor(private prisma: PrismaService) {}
 
-  // 1. Distinct Values 조회 (필터 목록)
+  // 1. Distinct Values 조회
   async getDistinctValues(
     column: string,
-    params: WaferQueryParams
+    params: WaferQueryParams,
   ): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } =
       params;
@@ -164,7 +169,7 @@ export class WaferService {
     try {
       const result = await this.prisma.$queryRawUnsafe<{ val: unknown }[]>(
         sql,
-        ...queryParams
+        ...queryParams,
       );
       return result
         .map((r) => {
@@ -174,7 +179,7 @@ export class WaferService {
         })
         .filter((v) => v !== '');
     } catch (e) {
-      console.warn(`Error fetching distinct ${column}:`, e);
+      this.logger.warn(`Error fetching distinct ${column}:`, e);
       return [];
     }
   }
@@ -224,11 +229,11 @@ export class WaferService {
     try {
       const results = await this.prisma.$queryRawUnsafe<{ point: number }[]>(
         sql,
-        ...queryParams
+        ...queryParams,
       );
       return results.map((r) => String(r.point));
     } catch (e) {
-      console.error('Error fetching distinct points:', e);
+      this.logger.error('Error fetching distinct points:', e);
       return [];
     }
   }
@@ -267,7 +272,7 @@ export class WaferService {
         dynamicColumns = ['t1', 'gof', 'mse'];
       }
     } catch (e) {
-      console.warn(
+      this.logger.warn(
         'Failed to fetch dynamic metrics config, using defaults.',
         e,
       );
@@ -366,7 +371,7 @@ export class WaferService {
 
       return series;
     } catch (e) {
-      console.error('Error fetching spectrum trend:', e);
+      this.logger.error('Error fetching spectrum trend:', e);
       return [];
     }
   }
@@ -395,6 +400,7 @@ export class WaferService {
 
       const tsRaw = targetDate.toISOString();
 
+      // [수정] 정확한 시간 일치 (=) 사용
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
@@ -402,10 +408,8 @@ export class WaferService {
            AND "waferid" = $2  
            AND "point" = $3    
            AND "eqpid" = $4    
-           AND "ts" >= $5::timestamp - interval '2 second'
-           AND "ts" <= $5::timestamp + interval '2 second'
+           AND "ts" = $5::timestamp 
            AND "class" = 'GEN'
-         ORDER BY ABS(EXTRACT(EPOCH FROM ("ts" - $5::timestamp))) ASC
          LIMIT 1`,
         lotId,
         String(waferId),
@@ -432,7 +436,7 @@ export class WaferService {
         symbol: 'none',
       };
     } catch (e) {
-      console.error('Error fetching GEN spectrum:', e);
+      this.logger.error('Error fetching GEN spectrum:', e);
       return null;
     }
   }
@@ -537,6 +541,7 @@ export class WaferService {
     };
   }
 
+  // [수정] PDF 이미지 조회 (1페이지 Fallback 추가)
   async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
@@ -546,60 +551,70 @@ export class WaferService {
       );
     }
 
+    // 1. DB에서 정확한 파일 경로 확인
     const pdfCheckResult = await this.checkPdf({
       eqpId,
       lotId,
       waferId,
-      servTs: dateTime,
+      dateTime: dateTime,
     });
 
     if (!pdfCheckResult.exists || !pdfCheckResult.url) {
+      this.logger.warn(
+        `[PDF] No matching PDF record found in DB for ${eqpId} @ ${dateTime}`,
+      );
       throw new NotFoundException('PDF file URI not found in database.');
     }
 
+    const downloadUrl = pdfCheckResult.url;
+    this.logger.log(`[PDF] Target File URI: ${downloadUrl}`);
+
+    // [확인] HTTP/HTTPS 프로토콜만 허용 (로컬 경로 차단)
+    if (!downloadUrl.startsWith('http')) {
+      this.logger.warn(`[PDF] Skipped non-HTTP URL: ${downloadUrl}`);
+      throw new InternalServerErrorException('Only HTTP/HTTPS URLs are supported.');
+    }
+
+    // 2. 캐시 경로 생성
     const dateObj = new Date(dateTime as string);
     const dateStr = dateObj.toISOString().slice(0, 10).replace(/-/g, '');
     const cacheFileName = `wafer_${eqpId}_${dateStr}_pt${pointNumber}.png`;
     const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
+    // 3. 캐시 검증
     if (fs.existsSync(cacheFilePath)) {
-      try {
-        const imageBuffer = fs.readFileSync(cacheFilePath);
-        return imageBuffer.toString('base64');
-      } catch {
-        /* ignore */
+      const stats = fs.statSync(cacheFilePath);
+      if (stats.size === 0) {
+        fs.unlinkSync(cacheFilePath);
+      } else {
+        try {
+          const imageBuffer = fs.readFileSync(cacheFilePath);
+          return imageBuffer.toString('base64');
+        } catch (e) {
+          this.logger.warn(`[PDF] Failed to read cache: ${e}`);
+        }
       }
     }
 
-    let downloadUrl = pdfCheckResult.url;
-    const baseUrl = process.env.PDF_SERVER_BASE_URL;
-
-    if (baseUrl && !downloadUrl.startsWith('http')) {
-      let normalizedPath = downloadUrl.replace(/\\/g, '/');
-      if (!normalizedPath.startsWith('/'))
-        normalizedPath = `/${normalizedPath}`;
-      const normalizedBase = baseUrl.endsWith('/')
-        ? baseUrl.slice(0, -1)
-        : baseUrl;
-      downloadUrl = `${normalizedBase}${normalizedPath}`;
-    }
-
-    const encodedUrl = encodeURI(downloadUrl);
     const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
     const tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
     const outputPrefix = path.join(os.tmpdir(), `temp_img_${tempId}`);
 
     try {
+      this.logger.debug(`[PDF] Downloading via HTTP...`);
+      const encodedUrl = encodeURI(downloadUrl);
       const writer = fs.createWriteStream(tempPdfPath);
+
       const response = await axios({
         url: encodedUrl,
         method: 'GET',
         responseType: 'stream',
-        proxy: false,
+        proxy: false, // [중요] 사내망 접속 시 프록시 우회
+        timeout: 10000,
       });
 
       const headers = response.headers as Record<string, unknown>;
-      const contentType = headers['content-type'];
+      const contentType = headers['content-type'] as string;
 
       if (
         typeof contentType === 'string' &&
@@ -608,7 +623,7 @@ export class WaferService {
         writer.close();
         if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath);
         throw new Error(
-          `Invalid content-type: ${contentType}. Server returned HTML instead of PDF.`,
+          `Invalid content-type: ${contentType}. Server returned HTML.`,
         );
       }
 
@@ -619,20 +634,22 @@ export class WaferService {
         writer.on('error', reject);
       });
 
+      // 5. PDF 파일 검증
       try {
+        const stats = fs.statSync(tempPdfPath);
+        if (stats.size === 0) {
+          throw new Error('Downloaded file size is 0 bytes.');
+        }
+
         const fd = fs.openSync(tempPdfPath, 'r');
         const headerBuffer = Buffer.alloc(100);
         const bytesRead = fs.readSync(fd, headerBuffer, 0, 100, 0);
         fs.closeSync(fd);
-
         const headerString = headerBuffer.toString('utf8', 0, bytesRead);
 
         if (bytesRead < 4 || !headerString.startsWith('%PDF')) {
-          console.error(
-            `[PDF Signature Error] First 100 chars of downloaded file: \n${headerString}`,
-          );
           throw new Error(
-            `File signature mismatch. The downloaded file is NOT a PDF. Content starts with: ${headerString.substring(0, 50)}...`,
+            'File signature mismatch. The downloaded file is NOT a PDF.',
           );
         }
       } catch (checkErr) {
@@ -640,15 +657,17 @@ export class WaferService {
         throw checkErr;
       }
 
-      const popplerBinPath = process.env.POPPLER_BIN_PATH; 
-      
+      // 6. 이미지 변환 (Poppler)
+      const popplerBinPath = process.env.POPPLER_BIN_PATH;
       if (!popplerBinPath) {
-        throw new Error('POPPLER_BIN_PATH is not defined in environment variables.');
+        throw new Error(
+          'POPPLER_BIN_PATH is not defined in environment variables.',
+        );
       }
-      
-      const targetPage = Number(pointNumber);
 
-      const opts = {
+      // [수정] Point 번호 페이지 시도 -> 실패 시 1페이지 Fallback
+      let targetPage = Number(pointNumber);
+      let opts = {
         format: 'png',
         out_dir: os.tmpdir(),
         out_prefix: path.basename(outputPrefix),
@@ -657,8 +676,18 @@ export class WaferService {
       };
 
       const popplerLib = poppler as unknown as PopplerModule;
-      await popplerLib.convert(tempPdfPath, opts);
+      
+      try {
+        await popplerLib.convert(tempPdfPath, opts);
+      } catch (err) {
+        this.logger.warn(`[PDF] Page ${targetPage} failed. Falling back to Page 1.`);
+        // Fallback to Page 1
+        targetPage = 1;
+        opts.page = 1;
+        await popplerLib.convert(tempPdfPath, opts);
+      }
 
+      // 변환된 이미지 찾기
       const dirFiles = fs.readdirSync(os.tmpdir());
       const generatedImageName = dirFiles.find(
         (f) => f.startsWith(path.basename(outputPrefix)) && f.endsWith('.png'),
@@ -666,24 +695,28 @@ export class WaferService {
 
       if (!generatedImageName) {
         throw new Error(
-          'Image generation failed (poppler did not output png).',
+          'Poppler finished but no PNG file was created.',
         );
       }
 
       const generatedImagePath = path.join(os.tmpdir(), generatedImageName);
 
+      // 캐시 저장
       try {
         fs.copyFileSync(generatedImagePath, cacheFilePath);
         fs.unlinkSync(generatedImagePath);
-      } catch {
-        /* ignore */
+      } catch (e) {
+        this.logger.warn(`[PDF] Failed to save cache: ${e}`);
       }
 
       const finalPath = fs.existsSync(cacheFilePath)
         ? cacheFilePath
         : generatedImagePath;
       const imageBuffer = fs.readFileSync(finalPath);
-      const base64Image = imageBuffer.toString('base64');
+
+      this.logger.log(
+        `[PDF] Success! Returning image size: ${imageBuffer.length} bytes`,
+      );
 
       try {
         if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath);
@@ -691,7 +724,7 @@ export class WaferService {
         /* ignore */
       }
 
-      return base64Image;
+      return imageBuffer.toString('base64');
     } catch (e) {
       try {
         if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath);
@@ -700,67 +733,93 @@ export class WaferService {
       }
 
       const error = e as { code?: string; message?: string };
-      console.error(`[ERROR] PDF Processing Failed. URL: ${encodedUrl}`, e);
+      this.logger.error(
+        `[ERROR] PDF Processing Failed. URL: ${downloadUrl}`,
+        e,
+      );
       throw new InternalServerErrorException(
         `Failed to process PDF: ${error.message || 'Unknown error'}`,
       );
     }
   }
 
+  // [수정] checkPdf: 정확한 시간 일치 (=) 사용
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
-    const { eqpId, lotId, waferId, servTs } = params;
-    if (!eqpId || !servTs) return { exists: false, url: null };
+    const { eqpId, lotId, waferId, servTs, dateTime } = params;
+
+    // dateTime 우선, 없으면 servTs 사용
+    const targetTimeVal = dateTime || servTs;
+
+    if (!eqpId || !targetTimeVal) return { exists: false, url: null };
 
     try {
-      const ts = typeof servTs === 'string' ? servTs : servTs.toISOString();
+      const tsStr =
+        typeof targetTimeVal === 'string'
+          ? targetTimeVal
+          : targetTimeVal.toISOString();
 
+      this.logger.debug(
+        `[PDF Search] Eqp: ${eqpId}, TargetTime: ${tsStr} (Exact Match Only)`,
+      );
+
+      // [수정] 범위 검색 제거, 정확한 일치 검색 사용
       const results = await this.prisma.$queryRawUnsafe<PdfResult[]>(
-        `SELECT file_uri FROM public.plg_wf_map 
+        `SELECT file_uri, datetime FROM public.plg_wf_map 
           WHERE eqpid = $1 
-            AND datetime >= $2::timestamp - interval '24 hours'
-            AND datetime <= $2::timestamp + interval '24 hours'
+            AND datetime = $2::timestamp
           ORDER BY datetime DESC`,
         eqpId,
-        ts,
+        tsStr,
       );
+
+      this.logger.debug(`[PDF Search] Found ${results.length} exact candidates.`);
 
       if (!results || results.length === 0) {
         return { exists: false, url: null };
       }
 
+      // 후보군 필터링 (LotID, WaferID 포함 여부)
+      let candidates = results;
+
       if (lotId) {
         const targetLot = lotId.trim();
         const targetLotUnderscore = targetLot.replace(/\./g, '_');
 
-        const matched = results.find((r) => {
+        candidates = results.filter((r) => {
           if (!r.file_uri) return false;
           const uri = r.file_uri;
+          const filename = path.basename(uri);
 
           const hasLot =
-            uri.includes(targetLot) || uri.includes(targetLotUnderscore);
+            filename.includes(targetLot) ||
+            filename.includes(targetLotUnderscore);
 
           let hasWafer = true;
           if (waferId) {
-            hasWafer = uri.includes(String(waferId));
+            hasWafer = filename.includes(String(waferId));
           }
-
           return hasLot && hasWafer;
         });
-
-        if (matched) {
-          return { exists: true, url: matched.file_uri };
-        }
-      } else {
-        return { exists: true, url: results[0].file_uri };
       }
+
+      if (candidates.length > 0) {
+        // 정확한 일치 중 첫 번째 반환
+        this.logger.log(`[PDF Match] Exact Match Found: ${candidates[0].file_uri}`);
+        return { exists: true, url: candidates[0].file_uri };
+      }
+
+      this.logger.warn(`[PDF Match] No candidate matched LotID/WaferID.`);
+      return { exists: false, url: null };
+
     } catch (e) {
-      console.warn(`Failed to check PDF for ${String(eqpId)}:`, e);
+      this.logger.warn(`Failed to check PDF for ${String(eqpId)}:`, e);
     }
     return { exists: false, url: null };
   }
 
+  // [수정] Spectrum 조회: 정확한 시간 일치 (=) 사용, LIMIT 제거
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
 
@@ -769,19 +828,19 @@ export class WaferService {
     }
 
     try {
-      const targetDate = new Date(ts);
-      const tsRaw = targetDate.toISOString();
+      const tsRaw = new Date(ts).toISOString();
       const tableName = 'public.plg_onto_spectrum';
 
+      // [수정] 정확한 시간 일치, LIMIT 제거하여 EXP/GEN 모두 조회
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
          WHERE "eqpid" = $1 
-           AND "ts" >= $2::timestamp - interval '2 second'
-           AND "ts" <= $2::timestamp + interval '2 second'
+           AND "ts" = $2::timestamp
            AND "lotid" = $3 
            AND "waferid" = $4 
-           AND "point" = $5`,
+           AND "point" = $5
+         ORDER BY "class" ASC`,
         eqpId,
         tsRaw,
         lotId,
@@ -790,71 +849,102 @@ export class WaferService {
       );
 
       if (!results || results.length === 0) {
+        this.logger.warn(
+          `[Spectrum] No data found for ${lotId} W${waferId} Pt${pointNumber} @ ${tsRaw}`,
+        );
         return [];
       }
 
-      return results.map((r) => ({
+      // 중복 제거 (같은 class가 여러 개일 경우 1개만 남김)
+      const uniqueResults = new Map<string, SpectrumRawResult>();
+      results.forEach((r) => {
+        if (!uniqueResults.has(r.class)) {
+          uniqueResults.set(r.class, r);
+        }
+      });
+
+      return Array.from(uniqueResults.values()).map((r) => ({
         class: r.class,
         wavelengths: r.wavelengths,
         values: r.values,
       }));
     } catch (e) {
-      console.error('[WaferService] Error fetching spectrum data:', e);
+      this.logger.error('[WaferService] Error fetching spectrum data:', e);
       return [];
     }
   }
 
-  // [수정] 통계 로직 개선: T1 의존성 제거 및 존재하지 않는 컬럼 조회 방지
   async getStatistics(params: WaferQueryParams) {
     const whereSql = this.buildUniqueWhere(params);
     if (!whereSql) return {};
 
     try {
-      // 1. 실제 DB에 존재하는 컬럼 목록 조회 (42703 에러 방지)
-      const validColumnsResult = await this.prisma.$queryRawUnsafe<{ column_name: string }[]>(
+      const validColumnsResult = await this.prisma.$queryRawUnsafe<
+        { column_name: string }[]
+      >(
         `SELECT column_name 
          FROM information_schema.columns 
-         WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
+         WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`,
       );
-      
-      const validColumnSet = new Set(validColumnsResult.map(r => r.column_name.toLowerCase()));
 
-      // 2. 기본 컬럼 정의 (thickness 등 오류 유발 가능성 있는 컬럼 포함)
+      const validColumnSet = new Set(
+        validColumnsResult.map((r) => r.column_name.toLowerCase()),
+      );
+
       let targetColumns = ['t1', 'gof', 'z', 'srvisz', 'mse', 'thickness'];
 
-      // 3. DB 설정에서 추가 메트릭 가져오기
       try {
-        const configMetrics = await this.prisma.$queryRaw<{ metric_name: string }[]>`
+        const configMetrics = await this.prisma.$queryRaw<
+          { metric_name: string }[]
+        >`
           SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'
         `;
         if (configMetrics.length > 0) {
-          const configNames = configMetrics.map(c => c.metric_name.toLowerCase());
+          const configNames = configMetrics.map((c) =>
+            c.metric_name.toLowerCase(),
+          );
           targetColumns = [...new Set([...targetColumns, ...configNames])];
         }
       } catch (e) {
-        console.warn('Failed to fetch metric config, using defaults.');
+        this.logger.warn('Failed to fetch metric config, using defaults.');
       }
 
-      // 4. 제외 목록 필터링 + 실제 DB 존재 여부 확인
-      const excludeCols = ['x', 'y', 'diex', 'diey', 'dierow', 'diecol', 'dienum', 'diepointtag', 'point', 'lotid', 'waferid', 'eqpid', 'serv_ts', 'datetime'];
-      
-      targetColumns = targetColumns.filter(col => {
+      const excludeCols = [
+        'x',
+        'y',
+        'diex',
+        'diey',
+        'dierow',
+        'diecol',
+        'dienum',
+        'diepointtag',
+        'point',
+        'lotid',
+        'waferid',
+        'eqpid',
+        'serv_ts',
+        'datetime',
+      ];
+
+      targetColumns = targetColumns.filter((col) => {
         const lowerCol = col.toLowerCase();
-        // 제외 목록에 없으면서 && 실제 DB에 존재하는 컬럼만 선택
         return !excludeCols.includes(lowerCol) && validColumnSet.has(lowerCol);
       });
 
       if (targetColumns.length === 0) {
-        return {}; // 조회할 컬럼이 하나도 없으면 빈 객체 반환
+        return {};
       }
 
-      // 5. 동적 SQL 생성
-      const selectParts = targetColumns.map(col => `
+      const selectParts = targetColumns
+        .map(
+          (col) => `
         MAX("${col}") as "${col}_max", 
         MIN("${col}") as "${col}_min", 
         AVG("${col}") as "${col}_mean", 
         STDDEV_SAMP("${col}") as "${col}_std"
-      `).join(', ');
+      `,
+        )
+        .join(', ');
 
       const sql = `
         SELECT ${selectParts}
@@ -866,11 +956,9 @@ export class WaferService {
       const result = await this.prisma.$queryRawUnsafe<StatsRawResult[]>(sql);
       const row = result[0] || {};
 
-      // 6. 결과 매핑
       const statsResult: Record<string, any> = {};
 
       for (const col of targetColumns) {
-        // 데이터가 없으면(null) 건너뜀
         if (row[`${col}_max`] === null || row[`${col}_max`] === undefined) {
           continue;
         }
@@ -893,9 +981,8 @@ export class WaferService {
       }
 
       return statsResult;
-
     } catch (e) {
-      console.error('Error in getStatistics:', e);
+      this.logger.error('Error in getStatistics:', e);
       return {};
     }
   }
@@ -963,7 +1050,7 @@ export class WaferService {
       const data = rawData.map((row) => headers.map((h) => row[h]));
       return { headers, data };
     } catch (e) {
-      console.error('Error in getPointData:', e);
+      this.logger.error('Error in getPointData:', e);
       return { headers: [], data: [] };
     }
   }
@@ -975,23 +1062,24 @@ export class WaferService {
     const targetDate = p.dateTime || p.servTs;
 
     if (targetDate) {
-      let dateStr = "";
+      let dateStr = '';
       if (typeof targetDate === 'string') {
         dateStr = targetDate;
       } else {
         dateStr = targetDate.toISOString();
       }
-      
-      const cleanDateStr = dateStr.replace('T', ' ').replace('Z', '').split('.')[0];
-      
+
+      const cleanDateStr = dateStr
+        .replace('T', ' ')
+        .replace('Z', '')
+        .split('.')[0];
+
       sql += ` AND datetime >= '${cleanDateStr}'::timestamp - interval '2 second'`;
       sql += ` AND datetime <= '${cleanDateStr}'::timestamp + interval '2 second'`;
 
       if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
       if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
-      
-    } 
-    else {
+    } else {
       if (p.startDate) {
         const s =
           typeof p.startDate === 'string'
@@ -1006,7 +1094,8 @@ export class WaferService {
       }
       if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
       if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
-      if (p.cassetteRcp) sql += ` AND cassettercp = '${String(p.cassetteRcp)}'`;
+      if (p.cassetteRcp)
+        sql += ` AND cassettercp = '${String(p.cassetteRcp)}'`;
       if (p.stageRcp) sql += ` AND stagercp = '${String(p.stageRcp)}'`;
       if (p.stageGroup) sql += ` AND stagegroup = '${String(p.stageGroup)}'`;
       if (p.film) sql += ` AND film = '${String(p.film)}'`;
@@ -1062,7 +1151,7 @@ export class WaferService {
       );
       return res.map((r) => r.eqpid);
     } catch (e) {
-      console.error('Error fetching matching equipments:', e);
+      this.logger.error('Error fetching matching equipments:', e);
       return [];
     }
   }
@@ -1083,7 +1172,7 @@ export class WaferService {
       `;
       if (conf.length > 0) metrics = conf.map((c) => c.metric_name);
     } catch (e) {
-      console.warn('Failed to fetch metrics config:', e);
+      this.logger.warn('Failed to fetch metrics config:', e);
     }
 
     const selectCols = metrics.map((m) => `"${m}"`).join(', ');
@@ -1120,7 +1209,7 @@ export class WaferService {
         ...queryParams,
       );
     } catch (e) {
-      console.error('Error fetching comparison data:', e);
+      this.logger.error('Error fetching comparison data:', e);
       return [];
     }
   }
@@ -1212,83 +1301,82 @@ export class WaferService {
         };
       });
     } catch (e) {
-      console.error('Error in getOpticalTrend:', e);
+      this.logger.error('Error in getOpticalTrend:', e);
       return [];
     }
   }
 
-  // [추가] 누락된 메서드 구현 1: getResidualMap
   async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
     const whereSql = this.buildUniqueWhere(params);
     if (!whereSql) return [];
-    
-    // 기본적으로 't1'을 사용하되 params.metric이 있으면 그것을 사용
-    const metric = params.metric || 't1'; 
-    
+
+    const metric = params.metric || 't1';
+
     try {
-      const data = await this.prisma.$queryRawUnsafe<{ point: number, x: number, y: number, val: number }[]>(
-        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${whereSql}`
+      const data = await this.prisma.$queryRawUnsafe<
+        { point: number; x: number; y: number; val: number }[]
+      >(
+        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${whereSql}`,
       );
-      
+
       if (!data.length) return [];
-      
-      const validData = data.filter(d => d.val !== null);
+
+      const validData = data.filter((d) => d.val !== null);
       if (!validData.length) return [];
 
-      const mean = validData.reduce((acc, cur) => acc + cur.val, 0) / validData.length;
-      
-      return validData.map(d => ({
+      const mean =
+        validData.reduce((acc, cur) => acc + cur.val, 0) / validData.length;
+
+      return validData.map((d) => ({
         point: d.point,
         x: d.x,
         y: d.y,
-        residual: d.val - mean
+        residual: d.val - mean,
       }));
     } catch (e) {
-      console.error('Error in getResidualMap:', e);
+      this.logger.error('Error in getResidualMap:', e);
       return [];
     }
   }
 
-  // [수정] Golden Ref 조회 로직: 'GOLDEN' 클래스가 아닌 '최고 GOF(Best Known)' 데이터 조회
-  async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenSpectrumResponse | null> {
+  async getGoldenSpectrum(
+    params: WaferQueryParams,
+  ): Promise<GoldenSpectrumResponse | null> {
     const { eqpId, lotId, pointId, cassetteRcp, stageGroup } = params;
-    
-    // 조건 필수값 체크
+
     if (!eqpId || !lotId || !pointId) return null;
-    
+
     try {
-        // 1. 해당 조건(Lot, RCP, Stage, Point)에서 GOF가 가장 높은(Best) 웨이퍼 조회
-        const bestGofSql = `
+      const bestGofSql = `
             SELECT waferid
             FROM public.plg_wf_flat
             WHERE eqpid = $1
               AND lotid = $2
               AND point = $3
-              ${cassetteRcp ? "AND cassettercp = $4" : ""}
-              ${stageGroup ? "AND stagegroup = $5" : ""}
+              ${cassetteRcp ? 'AND cassettercp = $4' : ''}
+              ${stageGroup ? 'AND stagegroup = $5' : ''}
               AND gof IS NOT NULL
             ORDER BY gof DESC
             LIMIT 1
         `;
-        
-        const queryParams: any[] = [eqpId, lotId, Number(pointId)];
-        if (cassetteRcp) queryParams.push(cassetteRcp);
-        if (stageGroup) queryParams.push(stageGroup);
 
-        const bestData = await this.prisma.$queryRawUnsafe<{ waferid: unknown }[]>(bestGofSql, ...queryParams);
-        
-        if (!bestData || bestData.length === 0) return null; // 조건에 맞는 데이터가 없음
+      const queryParams: any[] = [eqpId, lotId, Number(pointId)];
+      if (cassetteRcp) queryParams.push(cassetteRcp);
+      if (stageGroup) queryParams.push(stageGroup);
 
-        const targetWaferId = String(bestData[0].waferid);
+      const bestData = await this.prisma.$queryRawUnsafe<
+        { waferid: unknown }[]
+      >(bestGofSql, ...queryParams);
 
-        // 2. 찾은 Best Wafer의 스펙트럼 데이터 조회 (EXP 클래스 기준)
-        // plg_onto_spectrum 테이블에서 해당 웨이퍼/포인트의 스펙트럼 가져오기
-        const spectrumSql = `
+      if (!bestData || bestData.length === 0) return null;
+
+      const targetWaferId = String(bestData[0].waferid);
+
+      const spectrumSql = `
             SELECT wavelengths, "values"
             FROM public.plg_onto_spectrum
             WHERE eqpid = $1
               AND lotid = $2
-              -- [중요] WaferID 타입 이슈 방지를 위해 ::varchar 캐스팅 제거하고 파라미터 바인딩 사용
               AND waferid = $3 
               AND point = $4
               AND class = 'EXP' 
@@ -1296,125 +1384,124 @@ export class WaferService {
             LIMIT 1
         `;
 
-        const spectrum = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
-            spectrumSql, 
-            eqpId, 
-            lotId, 
-            targetWaferId, 
-            Number(pointId)
-        );
-        
-        if (!spectrum || spectrum.length === 0) return null;
-        
-        return {
-            wavelengths: spectrum[0].wavelengths,
-            values: spectrum[0].values
-        };
-    } catch(e) { 
-        console.error('Error in getGoldenSpectrum:', e);
-        return null; 
+      const spectrum = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
+        spectrumSql,
+        eqpId,
+        lotId,
+        targetWaferId,
+        Number(pointId),
+      );
+
+      if (!spectrum || spectrum.length === 0) return null;
+
+      return {
+        wavelengths: spectrum[0].wavelengths,
+        values: spectrum[0].values,
+      };
+    } catch (e) {
+      this.logger.error('Error in getGoldenSpectrum:', e);
+      return null;
     }
   }
 
-  // [수정] Metric 목록 조회 로직 개선: 기본값 강제 할당 제거 및 실제 데이터 존재 여부 필수로 확인
   async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
     try {
-        // 1. 설정 테이블에서 Metric 목록 조회
-        const configMetrics = await this.prisma.$queryRaw<{metric_name: string}[]>`
+      const configMetrics = await this.prisma.$queryRaw<
+        { metric_name: string }[]
+      >`
             SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name
         `;
-        
-        // [수정] 설정 테이블이 비어있을 경우 임의의 기본값(t1 등)을 반환하지 않고 빈 배열 처리
-        // "없는 메트릭"이 조회되는 오동작 방지
-        let candidates = configMetrics.map(m => m.metric_name);
-        
-        if (candidates.length === 0) {
-            return []; 
-        }
 
-        // 2. 실제 테이블(plg_wf_flat) 스키마의 컬럼 목록 조회 (SQL Injection 방지 및 유효성 검증)
-        const tableColumns = await this.prisma.$queryRawUnsafe<{ column_name: string }[]>(
-            `SELECT column_name 
+      let candidates = configMetrics.map((m) => m.metric_name);
+
+      if (candidates.length === 0) {
+        return [];
+      }
+
+      const tableColumns = await this.prisma.$queryRawUnsafe<
+        { column_name: string }[]
+      >(
+        `SELECT column_name 
              FROM information_schema.columns 
-             WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
-        );
+             WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`,
+      );
 
-        const validColumnSet = new Set(tableColumns.map(c => c.column_name.toLowerCase()));
+      const validColumnSet = new Set(
+        tableColumns.map((c) => c.column_name.toLowerCase()),
+      );
 
-        // 3. 설정된 메트릭 중 실제 테이블 스키마에 존재하는 것만 필터링 (교집합)
-        candidates = candidates.filter(metric => validColumnSet.has(metric.toLowerCase()));
+      candidates = candidates.filter((metric) =>
+        validColumnSet.has(metric.toLowerCase()),
+      );
 
-        if (candidates.length === 0) return [];
+      if (candidates.length === 0) return [];
 
-        // 4. [핵심] 선택된 조건(Lot, RCP, Stage, Film)에 맞는 실제 데이터 존재 여부 확인 (Count > 0)
-        // waferId 조건은 제외하고 Lot 전체 범위로 체크
-        const whereSql = this.buildUniqueWhere({ 
-            ...params, 
-            waferId: undefined 
-        }); 
-        
-        if (!whereSql) return candidates; 
+      const whereSql = this.buildUniqueWhere({
+        ...params,
+        waferId: undefined,
+      });
 
-        // 동적 Count 쿼리 생성: 각 메트릭 컬럼에 데이터가 몇 개나 있는지 확인
-        const countSelects = candidates.map(col => `COUNT("${col}") as "${col}"`).join(', ');
-        const countQuery = `SELECT ${countSelects} FROM public.plg_wf_flat ${whereSql}`;
-        
-        const countResults = await this.prisma.$queryRawUnsafe<Record<string, number | bigint>[]>(countQuery);
-        
-        if (!countResults || countResults.length === 0) return [];
-        
-        const counts = countResults[0];
-        
-        // 실제 데이터 개수(Count)가 0보다 큰 메트릭만 최종 반환
-        return candidates.filter(metric => Number(counts[metric]) > 0);
+      if (!whereSql) return candidates;
 
-    } catch (e) { 
-        console.error('Failed to fetch available metrics:', e);
-        // 에러 발생 시에도 임의의 값을 반환하지 않고 빈 배열 반환하여 오동작 방지
-        return []; 
+      const countSelects = candidates
+        .map((col) => `COUNT("${col}") as "${col}"`)
+        .join(', ');
+      const countQuery = `SELECT ${countSelects} FROM public.plg_wf_flat ${whereSql}`;
+
+      const countResults = await this.prisma.$queryRawUnsafe<
+        Record<string, number | bigint>[]
+      >(countQuery);
+
+      if (!countResults || countResults.length === 0) return [];
+
+      const counts = countResults[0];
+
+      return candidates.filter((metric) => Number(counts[metric]) > 0);
+    } catch (e) {
+      this.logger.error('Failed to fetch available metrics:', e);
+      return [];
     }
   }
 
-  // [추가] 누락된 메서드 구현 4: getLotUniformityTrend
-  async getLotUniformityTrend(params: WaferQueryParams & { metric: string }): Promise<any[]> {
+  async getLotUniformityTrend(
+    params: WaferQueryParams & { metric: string },
+  ): Promise<any[]> {
     const { metric, ...rest } = params;
     const targetMetric = metric || 't1';
-    
-    // lot 단위 조회를 위해 waferId 조건 제거
-    const whereSql = this.buildUniqueWhere({ ...rest, waferId: undefined }); 
+
+    const whereSql = this.buildUniqueWhere({ ...rest, waferId: undefined });
     if (!whereSql) return [];
-    
+
     try {
-        const results = await this.prisma.$queryRawUnsafe<any[]>(
-            `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
+      const results = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
              FROM public.plg_wf_flat ${whereSql} 
-             ORDER BY waferid, point`
-        );
-        
-        // WaferID 별로 그룹화
-        const grouped: Record<string, any[]> = {};
-        results.forEach(row => {
-            const wid = String(row.waferid);
-            if (!grouped[wid]) grouped[wid] = [];
-            grouped[wid].push(row);
-        });
-        
-        const series = Object.keys(grouped).map(wid => ({
-            waferId: Number(wid),
-            dataPoints: grouped[wid].map(p => ({
-                point: p.point,
-                value: p.value,
-                x: p.x,
-                y: p.y,
-                dieRow: p.dierow,
-                dieCol: p.diecol
-            }))
-        }));
-        
-        return series;
-    } catch(e) { 
-        console.error('Error in getLotUniformityTrend:', e);
-        return []; 
+             ORDER BY waferid, point`,
+      );
+
+      const grouped: Record<string, any[]> = {};
+      results.forEach((row) => {
+        const wid = String(row.waferid);
+        if (!grouped[wid]) grouped[wid] = [];
+        grouped[wid].push(row);
+      });
+
+      const series = Object.keys(grouped).map((wid) => ({
+        waferId: Number(wid),
+        dataPoints: grouped[wid].map((p) => ({
+          point: p.point,
+          value: p.value,
+          x: p.x,
+          y: p.y,
+          dieRow: p.dierow,
+          dieCol: p.diecol,
+        })),
+      }));
+
+      return series;
+    } catch (e) {
+      this.logger.error('Error in getLotUniformityTrend:', e);
+      return [];
     }
   }
 }
