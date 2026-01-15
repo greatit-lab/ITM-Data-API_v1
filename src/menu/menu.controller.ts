@@ -1,57 +1,34 @@
 // ITM-Data-API/src/menu/menu.controller.ts
-import { Controller, Get, Post, Put, Delete, Body, UseGuards, Param, Request } from '@nestjs/common';
-import { MenuService } from './menu.service';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard'; // Auth 모듈의 Guard Import
-
-// JWT Payload에 포함된 User 정보 인터페이스 (Auth 모듈에 정의된 것과 일치해야 함)
-interface User {
-  userId: string;
-  username: string;
-  role: string;
-  // 필요한 경우 site, sdwt 등 추가
-}
-
-interface RequestWithUser extends Request {
-  user: User;
-}
-
-// DTO 클래스 정의
-export class CreateMenuDto {
-  label: string;
-  routerPath?: string;
-  parentId?: number;
-  icon?: string;
-  sortOrder?: number;
-  statusTag?: string;
-  isVisible?: boolean;
-  roles?: string[];
-}
-
-export class UpdateMenuDto {
-  label?: string;
-  routerPath?: string;
-  parentId?: number;
-  icon?: string;
-  sortOrder?: number;
-  statusTag?: string;
-  isVisible?: boolean;
-  roles?: string[];
-}
+import { Controller, Get, Post, Put, Delete, Body, UseGuards, Param, Request, Logger, Query } from '@nestjs/common';
+import { MenuService, CreateMenuDto, UpdateMenuDto } from './menu.service'; // DTO Import
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @Controller('menu')
-@UseGuards(JwtAuthGuard) // 모든 API에 JWT 인증 적용
 export class MenuController {
+  private readonly logger = new Logger(MenuController.name);
+
   constructor(private readonly menuService: MenuService) {}
 
-  // 1. 내 메뉴 조회 (사이드바용: 로그인한 사용자의 Role 기반 필터링)
+  // 1. 내 메뉴 조회
   @Get('my')
-  async getMyMenus(@Request() req: RequestWithUser) {
-    // req.user가 없으면 기본값 'USER' 사용 (안전 장치)
-    const role = req.user?.role ?? 'USER';
-    return this.menuService.getMyMenus(role);
+  async getMyMenus(
+    @Request() req: any, 
+    @Query('role') queryRole?: string // 쿼리 파라미터로 role 수신
+  ) {
+    const tokenRole = req.user?.role;
+    // 결정된 Role: 쿼리 파라미터 우선 -> 토큰 -> 기본값
+    const finalRole = queryRole || tokenRole || 'USER';
+
+    // [디버깅 로그] 3단계: Data API 컨트롤러 진입 확인
+    this.logger.warn(`[DEBUG-DATA-3] MenuController.getMyMenus() Called`);
+    this.logger.warn(`[DEBUG-DATA-3] QueryRole: "${queryRole}"`);
+    this.logger.warn(`[DEBUG-DATA-3] TokenRole: "${tokenRole}"`);
+    this.logger.warn(`[DEBUG-DATA-3] -> Decided FinalRole: "${finalRole}"`);
+
+    return this.menuService.getMyMenus(finalRole);
   }
 
-  // 2. 전체 메뉴 트리 조회 (관리자 화면용: 모든 메뉴 및 권한 정보 포함)
+  // 2. 전체 메뉴 트리 조회
   @Get('all')
   async getAllMenus() {
     return this.menuService.getAllMenus();
@@ -81,7 +58,7 @@ export class MenuController {
     return this.menuService.getAllRolePermissions();
   }
 
-  // 7. 특정 Role의 권한 일괄 저장
+  // 7. 특정 Role 권한 저장
   @Post('permissions/:role')
   async savePermissions(
     @Param('role') role: string,
