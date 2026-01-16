@@ -24,13 +24,33 @@ export class AuthController {
     return this.authService.guestLogin(loginDto);
   }
 
+  // =========================================================
+  // [누락된 부분 추가] 사용자 Context (Site/SDWT) 관리
+  // =========================================================
+
+  @Get('context')
+  async getUserContext(@Query('loginId') loginId: string) {
+    this.logger.log(`[API Request] GET /auth/context - loginId: ${loginId}`);
+    const result = await this.authService.getUserContext(loginId);
+    this.logger.log(`[API Response] GET /auth/context - Result: ${JSON.stringify(result)}`);
+    return result;
+  }
+
+  @Post('context')
+  async saveUserContext(@Body() body: { loginId: string; site: string; sdwt: string }) {
+    this.logger.log(`[API Request] POST /auth/context - Body: ${JSON.stringify(body)}`);
+    return this.authService.saveUserContext(body.loginId, body.site, body.sdwt);
+  }
+
+  // =========================================================
   // [Backend 연동 엔드포인트]
+  // =========================================================
 
   @Get('whitelist/check')
   async checkWhitelist(
     @Query('compId') compId?: string,
     @Query('deptId') deptId?: string,
-    @Query('username') username?: string, // 테스트용
+    @Query('username') username?: string, 
   ) {
     return this.authService.checkWhitelist(compId, deptId);
   }
