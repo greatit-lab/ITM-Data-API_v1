@@ -6,13 +6,16 @@ import { PrismaService } from '../prisma.service';
 export class AdminService {
   constructor(private prisma: PrismaService) {}
 
+  // ---------------------------------------------------------
+  // [Helper] KST 시간 생성 함수
+  // ---------------------------------------------------------
   private getKstDate(): Date {
     const now = new Date();
     return new Date(now.getTime() + 9 * 60 * 60 * 1000);
   }
 
   // ==========================================
-  // [User Management]
+  // [User Management] 시스템 사용자 조회
   // ==========================================
   async getAllUsers() {
     return this.prisma.sysUser.findMany({
@@ -26,10 +29,9 @@ export class AdminService {
   }
 
   // ==========================================
-  // [Admin Management]
+  // [Admin Management] 운영자(Manager) 관리
   // ==========================================
   async getAllAdmins() {
-    // [확인] 사용자 제공 컬럼(assigned_at) 반영
     return this.prisma.cfgAdminUser.findMany({
       orderBy: { assignedAt: 'desc' },
     });
@@ -54,13 +56,11 @@ export class AdminService {
   }
 
   // ==========================================
-  // [Access Code / Whitelist] (수정됨)
+  // [Access Code / Whitelist] 접근 허용 관리
   // ==========================================
   async getAllAccessCodes() {
-    // [수정] 사용자가 제공한 컬럼 정보에 맞춰 조회
-    // 실제 DB에 존재하는 컬럼만 명시적으로 select 합니다.
     return this.prisma.refAccessCode.findMany({
-      orderBy: { updatedAt: 'desc' }, // updated_at이 존재한다고 하셨으므로 정렬 가능
+      orderBy: { updatedAt: 'desc' },
       select: {
         compid: true,
         compName: true,
@@ -77,7 +77,7 @@ export class AdminService {
     const kstNow = this.getKstDate();
     return this.prisma.refAccessCode.create({
       data: {
-        compid: data.compid, // PK로 사용됨
+        compid: data.compid, // PK
         compName: data.compName,
         deptid: data.deptid,
         deptName: data.deptName,
@@ -88,13 +88,11 @@ export class AdminService {
     });
   }
 
-  // [수정] Key를 id(number) -> compid(string)로 변경
   async updateAccessCode(compid: string, data: any) {
     const kstNow = this.getKstDate();
     return this.prisma.refAccessCode.update({
-      where: { compid }, // Schema에서 @id로 설정한 컬럼
+      where: { compid },
       data: {
-        // compid는 PK이므로 수정 불가 (필요시 삭제 후 재생성)
         compName: data.compName,
         deptid: data.deptid,
         deptName: data.deptName,
@@ -105,7 +103,6 @@ export class AdminService {
     });
   }
 
-  // [수정] Key를 id(number) -> compid(string)로 변경
   async deleteAccessCode(compid: string) {
     return this.prisma.refAccessCode.delete({
       where: { compid },
@@ -113,7 +110,7 @@ export class AdminService {
   }
 
   // ==========================================
-  // [Guest Management]
+  // [Guest Management] 게스트 이력 관리
   // ==========================================
   async getAllGuests() {
     return this.prisma.cfgGuestAccess.findMany({
@@ -143,7 +140,7 @@ export class AdminService {
   }
 
   // ==========================================
-  // [Guest Request]
+  // [Guest Request] 접근 신청 관리
   // ==========================================
   async getGuestRequests() {
     return this.prisma.cfgGuestRequest.findMany({
@@ -203,7 +200,7 @@ export class AdminService {
   }
 
   // ==========================================
-  // [Infra]
+  // [Infra] 1. 에러 심각도 (Severity)
   // ==========================================
   async getSeverities() {
     return this.prisma.errSeverityMap.findMany();
@@ -233,6 +230,9 @@ export class AdminService {
     });
   }
 
+  // ==========================================
+  // [Infra] 2. 분석 지표 (Metrics)
+  // ==========================================
   async getMetrics() {
     return this.prisma.cfgLotUniformityMetrics.findMany();
   }
@@ -258,6 +258,97 @@ export class AdminService {
   async deleteMetric(metricName: string) {
     return this.prisma.cfgLotUniformityMetrics.delete({
       where: { metricName },
+    });
+  }
+
+  // ==========================================
+  // [System Config] 1. 공통 서버 설정 (New Server)
+  // ==========================================
+  async getNewServerConfig() {
+    // id는 1로 고정하여 관리
+    return this.prisma.cfgNewServer.findUnique({
+      where: { id: 1 },
+    });
+  }
+
+  async updateNewServerConfig(data: any) {
+    // upsert: 없으면 생성, 있으면 수정
+    return this.prisma.cfgNewServer.upsert({
+      where: { id: 1 },
+      update: {
+        newDbHost: data.newDbHost,
+        newDbUser: data.newDbUser,
+        newDbPw: data.newDbPw,
+        newDbPort: data.newDbPort ? parseInt(data.newDbPort) : 5432,
+        newFtpHost: data.newFtpHost,
+        newFtpUser: data.newFtpUser,
+        newFtpPw: data.newFtpPw,
+        newFtpPort: data.newFtpPort ? parseInt(data.newFtpPort) : 21,
+        description: data.description,
+      },
+      create: {
+        id: 1,
+        newDbHost: data.newDbHost || '',
+        newDbUser: data.newDbUser,
+        newDbPw: data.newDbPw,
+        newDbPort: data.newDbPort ? parseInt(data.newDbPort) : 5432,
+        newFtpHost: data.newFtpHost || '',
+        newFtpUser: data.newFtpUser,
+        newFtpPw: data.newFtpPw,
+        newFtpPort: data.newFtpPort ? parseInt(data.newFtpPort) : 21,
+        description: data.description,
+      },
+    });
+  }
+
+  // ==========================================
+  // [System Config] 2. 장비별 에이전트 설정 (Cfg Server)
+  // [개선] Site, SDWT 정보 Join 하여 반환
+  // ==========================================
+  async getCfgServers() {
+    // 1. 에이전트 설정 목록 조회
+    const servers = await this.prisma.cfgServer.findMany({
+      orderBy: { eqpid: 'asc' },
+    });
+
+    if (!servers.length) return [];
+
+    // 2. 관련된 장비들의 Site, SDWT 정보 조회 (Join)
+    const eqpIds = servers.map(s => s.eqpid);
+    const equipments = await this.prisma.refEquipment.findMany({
+      where: { eqpid: { in: eqpIds } },
+      select: {
+        eqpid: true,
+        sdwt: true,
+        sdwtRel: {
+          select: { site: true }
+        }
+      }
+    });
+
+    // 3. 매핑용 Map 생성 (eqpid -> equipment info)
+    const eqpMap = new Map(equipments.map(e => [e.eqpid, e]));
+
+    // 4. 데이터 병합 (Merge)
+    return servers.map(server => {
+      const eqp = eqpMap.get(server.eqpid);
+      return {
+        ...server,
+        // 장비 정보가 있으면 해당 정보를, 없으면 '-' 처리
+        sdwt: eqp?.sdwt || '-',
+        site: eqp?.sdwtRel?.site || '-'
+      };
+    });
+  }
+
+  async updateCfgServer(eqpid: string, data: any) {
+    return this.prisma.cfgServer.update({
+      where: { eqpid },
+      data: {
+        agentDbHost: data.agentDbHost,
+        agentFtpHost: data.agentFtpHost,
+        updateFlag: data.updateFlag, // 'yes' | 'no'
+      },
     });
   }
 }
