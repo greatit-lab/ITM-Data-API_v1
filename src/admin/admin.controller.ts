@@ -1,5 +1,5 @@
 // ITM-Data-API/src/admin/admin.controller.ts
-import { Controller, Get, Post, Put, Delete, Body, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Put, Delete, Body, Param } from '@nestjs/common';
 import { AdminService } from './admin.service';
 
 @Controller('admin')
@@ -7,7 +7,7 @@ export class AdminController {
   constructor(private readonly adminService: AdminService) {}
 
   // ==========================================
-  // [User Management] 시스템 사용자 조회
+  // [User Management]
   // ==========================================
   @Get('users')
   async getAllUsers() {
@@ -15,7 +15,53 @@ export class AdminController {
   }
 
   // ==========================================
-  // [Guest Management] 게스트 관리
+  // [Admin Management]
+  // ==========================================
+  @Get('admins')
+  async getAllAdmins() {
+    return this.adminService.getAllAdmins();
+  }
+
+  @Post('admins')
+  async addAdmin(@Body() body: any) {
+    return this.adminService.addAdmin(body);
+  }
+
+  @Delete('admins/:loginId')
+  async deleteAdmin(@Param('loginId') loginId: string) {
+    return this.adminService.deleteAdmin(loginId);
+  }
+
+  // ==========================================
+  // [Access Code / Whitelist] (수정됨)
+  // ==========================================
+  @Get('guest/access')
+  async getAllAccessCodes() {
+    return this.adminService.getAllAccessCodes();
+  }
+
+  @Post('guest/access')
+  async createAccessCode(@Body() body: any) {
+    return this.adminService.createAccessCode(body);
+  }
+
+  // [수정] id(number) -> compid(string)
+  @Put('access-codes/:compid')
+  async updateAccessCode(
+    @Param('compid') compid: string,
+    @Body() body: any
+  ) {
+    return this.adminService.updateAccessCode(compid, body);
+  }
+
+  // [수정] id(number) -> compid(string)
+  @Delete('guest/access/:compid')
+  async deleteAccessCode(@Param('compid') compid: string) {
+    return this.adminService.deleteAccessCode(compid);
+  }
+
+  // ==========================================
+  // [Guest Management]
   // ==========================================
   @Get('guests')
   async getAllGuests() {
@@ -33,7 +79,7 @@ export class AdminController {
   }
 
   // ==========================================
-  // [Guest Request] 접근 신청 관리
+  // [Guest Request]
   // ==========================================
   @Get('guest/request')
   async getGuestRequests() {
@@ -57,7 +103,7 @@ export class AdminController {
   }
 
   // ==========================================
-  // [추가] 1. 에러 심각도 (Error Severity)
+  // [Infra - Severity]
   // ==========================================
   @Get('severity')
   async getSeverities() {
@@ -83,7 +129,7 @@ export class AdminController {
   }
 
   // ==========================================
-  // [추가] 2. 분석 지표 (Analysis Metrics)
+  // [Infra - Metrics]
   // ==========================================
   @Get('metrics')
   async getMetrics() {
