@@ -39,10 +39,6 @@ export class AdminService {
 
   async addGuest(data: any) {
     const kstNow = this.getKstDate();
-    
-    // validUntil이 문자열로 넘어올 경우 처리 (KST 보정 필요 시 로직 추가 가능)
-    // 현재는 입력받은 날짜 그대로 사용
-    
     return this.prisma.cfgGuestAccess.create({
       data: {
         loginId: data.loginId,
@@ -51,7 +47,7 @@ export class AdminService {
         reason: data.reason,
         validUntil: new Date(data.validUntil),
         grantedRole: 'GUEST',
-        createdAt: kstNow, // [수정] UTC -> KST
+        createdAt: kstNow, 
       },
     });
   }
@@ -71,29 +67,24 @@ export class AdminService {
     });
   }
 
-  // [승인 로직] KST 적용
   async approveGuestRequest(reqId: number, approverId: string) {
     const request = await this.prisma.cfgGuestRequest.findUnique({ where: { reqId } });
     if (!request) throw new NotFoundException('Request not found');
 
     const kstNow = this.getKstDate();
-    
-    // 유효기간: KST 현재 시간 기준 + 30일
     const validUntil = new Date(kstNow.getTime());
     validUntil.setDate(validUntil.getDate() + 30);
 
     return this.prisma.$transaction(async (tx) => {
-      // 1. 요청 상태 변경 (processedAt: KST)
       await tx.cfgGuestRequest.update({
         where: { reqId },
         data: {
           status: 'APPROVED',
           processedBy: approverId,
-          processedAt: kstNow, // [수정] UTC -> KST
+          processedAt: kstNow,
         },
       });
 
-      // 2. 게스트 권한 부여 (createdAt: KST)
       const guest = await tx.cfgGuestAccess.upsert({
         where: { loginId: request.loginId },
         update: {
@@ -108,25 +99,84 @@ export class AdminService {
           reason: request.reason,
           grantedRole: 'GUEST',
           validUntil: validUntil,
-          createdAt: kstNow, // [수정] UTC -> KST
+          createdAt: kstNow,
         },
       });
-
       return guest;
     });
   }
 
-  // [반려 로직] KST 적용
   async rejectGuestRequest(reqId: number, rejectorId: string) {
     const kstNow = this.getKstDate();
-
     return this.prisma.cfgGuestRequest.update({
       where: { reqId },
       data: {
         status: 'REJECTED',
         processedBy: rejectorId,
-        processedAt: kstNow, // [수정] UTC -> KST
+        processedAt: kstNow,
       },
+    });
+  }
+
+  // ==========================================
+  // [추가] 1. 에러 심각도 (Error Severity)
+  // ==========================================
+  async getSeverities() {
+    return this.prisma.errSeverityMap.findMany();
+  }
+
+  async addSeverity(data: any) {
+    return this.prisma.errSeverityMap.create({
+      data: {
+        errorId: data.errorId,
+        severity: data.severity,
+      },
+    });
+  }
+
+  async updateSeverity(errorId: string, data: any) {
+    return this.prisma.errSeverityMap.update({
+      where: { errorId },
+      data: {
+        severity: data.severity,
+      },
+    });
+  }
+
+  async deleteSeverity(errorId: string) {
+    return this.prisma.errSeverityMap.delete({
+      where: { errorId },
+    });
+  }
+
+  // ==========================================
+  // [추가] 2. 분석 지표 (Analysis Metrics)
+  // ==========================================
+  async getMetrics() {
+    return this.prisma.cfgLotUniformityMetrics.findMany();
+  }
+
+  async addMetric(data: any) {
+    return this.prisma.cfgLotUniformityMetrics.create({
+      data: {
+        metricName: data.metricName,
+        isExcluded: data.isExcluded ? 'Y' : 'N',
+      },
+    });
+  }
+
+  async updateMetric(metricName: string, data: any) {
+    return this.prisma.cfgLotUniformityMetrics.update({
+      where: { metricName },
+      data: {
+        isExcluded: data.isExcluded ? 'Y' : 'N',
+      },
+    });
+  }
+
+  async deleteMetric(metricName: string) {
+    return this.prisma.cfgLotUniformityMetrics.delete({
+      where: { metricName },
     });
   }
 }
