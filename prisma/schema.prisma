@@ -27,32 +27,31 @@ model RefEquipment {
   
   lastUpdate DateTime? @default(now()) @map("last_update") @db.Timestamp(0)
 
-  sdwtRel RefSdwt @relation(fields: [sdwt], references: [sdwt])
-
-  agentInfo   AgentInfo?
+  // Relations
+  sdwtRel    RefSdwt   @relation(fields: [sdwt], references: [sdwt])
+  agentInfo  AgentInfo?
   agentStatus AgentStatus?
-  
-  // [수정] ItmInfo와의 1:1 관계 추가 (이 부분이 빠져서 에러 발생)
-  itmInfo     ItmInfo?
+  itmInfo    ItmInfo?
 
-  plgErrors   PlgError[]
-  eqpPerfs    EqpPerf[]
-  lampLifes   EqpLampLife[]
+  plgErrors  PlgError[]
+  eqpPerfs   EqpPerf[]
+  lampLifes  EqpLampLife[]
 
   @@map("ref_equipment")
 }
 
 model RefSdwt {
-  id     String   @id @db.Char(7)
-  sdwt   String   @unique @db.VarChar(50)
-  site   String   @db.VarChar(10)
-  campus String?  @db.VarChar(50)
-  desc   String?  @db.VarChar(50)
-  isUse  String   @default("N") @map("is_use") @db.Char(1)
+  id       String   @id @db.Char(7)
+  sdwt     String   @unique @db.VarChar(50)
+  site     String   @db.VarChar(10)
+  campus   String?  @db.VarChar(50)
+  desc     String?  @db.VarChar(50)
+  isUse    String   @default("N") @map("is_use") @db.Char(1)
   
-  update DateTime @default(now()) @db.Timestamp(0)
+  update   DateTime @default(now()) @db.Timestamp(0)
 
-  equipments RefEquipment[]
+  // Relations
+  equipments   RefEquipment[]
   userContexts SysUserContext[]
 
   @@map("ref_sdwt")
@@ -74,7 +73,7 @@ model AgentInfo {
   disk       String?
   vga        String?
   
-  equipment RefEquipment @relation(fields: [eqpid], references: [eqpid])
+  equipment  RefEquipment @relation(fields: [eqpid], references: [eqpid])
 
   @@map("agent_info")
 }
@@ -213,7 +212,6 @@ model ItmInfo {
   version     String?
   dbVersion   String? @map("db_version")
 
-  // [수정] RefEquipment와의 관계 설정 추가
   equipment   RefEquipment @relation(fields: [eqpid], references: [eqpid])
 
   @@map("itm_info")
@@ -237,10 +235,12 @@ model ErrSeverityMap {
 // [New SSO / Auth] 신규 권한 및 메뉴 관리
 // ==========================================
 
+// [수정] Whitelist 유연성을 위해 ID 기반으로 변경하고 코드 컬럼들을 Nullable로 설정
 model RefAccessCode {
-  compid      String   @id @map("compid") @db.VarChar(50) 
+  id          Int      @id @default(autoincrement())
+  compid      String?  @map("compid") @db.VarChar(50) 
   compName    String?  @map("comp_name") @db.VarChar(100)
-  deptid      String   @map("deptid") @db.VarChar(50)
+  deptid      String?  @map("deptid") @db.VarChar(50)
   deptName    String?  @map("dept_name") @db.VarChar(100)
   description String?  @db.VarChar(100)
   isActive    String   @default("Y") @map("is_active") @db.Char(1)
@@ -256,8 +256,8 @@ model RefMenu {
   routerPath String? @map("router_path") @db.VarChar(100)
   icon       String? @db.VarChar(50)
 
-  parentId Int?      @map("parent_id")
-  parent   RefMenu?  @relation("MenuHierarchy", fields: [parentId], references: [menuId])
+  parentId Int?     @map("parent_id")
+  parent   RefMenu? @relation("MenuHierarchy", fields: [parentId], references: [menuId])
   children RefMenu[] @relation("MenuHierarchy")
 
   sortOrder Int @default(0) @map("sort_order")
@@ -279,9 +279,9 @@ model CfgMenuRole {
 }
 
 model CfgAdminUser {
-  loginId    String   @id @map("login_id") @db.VarChar(50)
-  role       String   @default("MANAGER") @db.VarChar(20)
-  assignedBy String?  @map("assigned_by") @db.VarChar(50)
+  loginId    String    @id @map("login_id") @db.VarChar(50)
+  role       String    @default("MANAGER") @db.VarChar(20)
+  assignedBy String?   @map("assigned_by") @db.VarChar(50)
   
   assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamp(0)
 
@@ -296,6 +296,7 @@ model CfgGuestAccess {
   grantedRole String   @default("GUEST") @map("granted_role") @db.VarChar(20)
   reason      String?  @db.VarChar(100)
 
+  // [핵심] 유효기간 컬럼 (D-Day 계산용)
   validUntil  DateTime @map("valid_until") @db.Timestamp(0)
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
@@ -303,37 +304,40 @@ model CfgGuestAccess {
 }
 
 model CfgGuestRequest {
-  reqId       Int      @id @default(autoincrement()) @map("req_id")
-  loginId     String   @map("login_id") @db.VarChar(50)
+  reqId       Int       @id @default(autoincrement()) @map("req_id")
+  loginId     String    @map("login_id") @db.VarChar(50)
   
-  deptCode    String?  @map("dept_code") @db.VarChar(50)
-  deptName    String?  @map("dept_name") @db.VarChar(100)
+  deptCode    String?   @map("dept_code") @db.VarChar(50)
+  deptName    String?   @map("dept_name") @db.VarChar(100)
   
-  reason      String?  @db.VarChar(200)
+  reason      String?   @db.VarChar(200)
   
-  status      String   @default("PENDING") @db.VarChar(20) 
+  status      String    @default("PENDING") @db.VarChar(20) 
   
-  processedBy String?  @map("processed_by") @db.VarChar(50)
+  processedBy String?   @map("processed_by") @db.VarChar(50)
   
   processedAt DateTime? @map("processed_at") @db.Timestamp(0)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamp(0)
 
   @@map("cfg_guest_request")
 }
 
 model SysUser {
-  loginId     String   @id @map("login_id") @db.VarChar(50)
-  loginCount  Int      @default(1) @map("login_count")
+  loginId    String    @id @map("login_id") @db.VarChar(50)
+  loginCount Int       @default(1) @map("login_count")
   
   lastLoginAt DateTime @default(now()) @map("last_login_at") @db.Timestamp(0)
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
+  // Relations
   context SysUserContext?
   @@map("sys_user")
 }
 
 model SysUserContext {
   loginId String @id @map("login_id") @db.VarChar(50)
+  
+  // RefSdwt의 id(String @db.Char(7))와 연결
   lastSdwtId String  @map("last_sdwt_id") @db.Char(7)
   sdwtInfo   RefSdwt @relation(fields: [lastSdwtId], references: [id])
   
