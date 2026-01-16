@@ -1,4 +1,4 @@
-// [전체 코드 교체] ITM-Data-API/src/auth/auth.controller.ts
+// ITM-Data-API/src/auth/auth.controller.ts
 import { Controller, Post, Get, Body, Query, Logger } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginDto, SyncUserDto } from './auth.interface';
