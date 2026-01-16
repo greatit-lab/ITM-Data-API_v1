@@ -1,4 +1,4 @@
-// ITM-Data-API/src/auth/auth.controller.ts
+// [전체 코드 교체] ITM-Data-API/src/auth/auth.controller.ts
 import { Controller, Post, Get, Body, Query, Logger } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { LoginDto, SyncUserDto } from './auth.interface';
@@ -25,7 +25,26 @@ export class AuthController {
   }
 
   // =========================================================
-  // [누락된 부분 추가] 사용자 Context (Site/SDWT) 관리
+  // [Guest Request] 게스트 권한 신청 (신규 추가)
+  // =========================================================
+  
+  /**
+   * 게스트 접근 권한 신청 등록
+   * BFF에서 전달된 신청 정보를 DB(cfg_guest_request)에 저장합니다.
+   */
+  @Post('guest-request')
+  async createGuestRequest(@Body() body: any) {
+    this.logger.log(`[Guest Request] Received request for: ${body.loginId}`);
+    return this.authService.createGuestRequest(body);
+  }
+
+  @Get('guest-request/status')
+  async getGuestRequestStatus(@Query('loginId') loginId: string) {
+    return this.authService.getGuestRequestStatus(loginId);
+  }
+
+  // =========================================================
+  // [사용자 Context (Site/SDWT) 관리]
   // =========================================================
 
   @Get('context')
@@ -68,10 +87,5 @@ export class AuthController {
   @Get('guest/check')
   async checkGuest(@Query('loginId') loginId: string) {
     return this.authService.checkGuest(loginId);
-  }
-
-  @Get('guest-request/status')
-  async getGuestRequestStatus(@Query('loginId') loginId: string) {
-    return this.authService.getGuestRequestStatus(loginId);
   }
 }
