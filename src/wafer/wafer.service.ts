@@ -10,7 +10,6 @@ import { Prisma } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-// [변경] pdf-poppler 제거 및 child_process 사용
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
@@ -139,6 +138,7 @@ export class WaferService {
     return { startDate, endDate };
   }
 
+  // [핵심 수정] DISTINCT 대신 GROUP BY 사용 + 시간순 정렬 + TRIM 적용
   async getDistinctValues(
     column: string,
     params: WaferQueryParams,
@@ -160,7 +160,8 @@ export class WaferService {
     const queryParams: (string | number | Date)[] = [];
 
     if (eqpId) {
-      whereClause += ` AND eqpid = $${queryParams.length + 1}`;
+      // [보안] TRIM을 적용하여 공백으로 인한 불일치 방지
+      whereClause += ` AND TRIM(eqpid) = TRIM($${queryParams.length + 1})`;
       queryParams.push(eqpId);
     }
     if (lotId && colName !== 'lotid') {
@@ -180,14 +181,25 @@ export class WaferService {
       queryParams.push(film);
     }
 
-    // [수정] LotID가 있으면 날짜 제한 무시 (전체 기간 검색)
+    // LotID 목록 조회 시, LotID 필터가 없다면 날짜 필터 적용
     if (!lotId && startDate && endDate) {
       const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
       whereClause += ` AND serv_ts >= $${queryParams.length + 1} AND serv_ts <= $${queryParams.length + 2}`;
       queryParams.push(s, e);
     }
 
-    const sql = `SELECT DISTINCT "${colName}" as val FROM ${table} ${whereClause} ORDER BY "${colName}" DESC LIMIT 100`;
+    // [중요 변경]
+    // 1. GROUP BY "${colName}" : 중복 제거 효과
+    // 2. ORDER BY MAX(serv_ts) DESC : 가장 최근에 작업된 항목부터 정렬 (알파벳순 아님)
+    // 3. LIMIT 10000 : 넉넉하게 설정
+    const sql = `
+      SELECT "${colName}" as val 
+      FROM ${table} 
+      ${whereClause} 
+      GROUP BY "${colName}" 
+      ORDER BY MAX(serv_ts) DESC 
+      LIMIT 10000
+    `;
 
     try {
       const result = await this.prisma.$queryRawUnsafe<{ val: unknown }[]>(
@@ -207,11 +219,11 @@ export class WaferService {
     }
   }
 
-  // [수정] Point 조회 (LotID 있을 시 날짜제한 해제 + JOIN 강화 + 필터 추가)
+  // [수정] Point 조회 (TRIM 적용 및 로직 유지)
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
-    // JOIN 조건: TRIM 적용 및 integer 변환 (매칭률 향상)
+    // JOIN 조건: TRIM 적용 및 integer 변환
     let sql = `
       SELECT DISTINCT s.point
       FROM public.plg_onto_spectrum s
@@ -226,7 +238,8 @@ export class WaferService {
     const queryParams: (string | number | Date)[] = [];
 
     if (eqpId) {
-      sql += ` AND s.eqpid = $${queryParams.length + 1}`;
+      // Point 조회에도 TRIM 적용
+      sql += ` AND TRIM(s.eqpid) = TRIM($${queryParams.length + 1})`;
       queryParams.push(eqpId);
     }
     if (lotId) {
@@ -237,7 +250,6 @@ export class WaferService {
       sql += ` AND f.cassettercp = $${queryParams.length + 1}`;
       queryParams.push(cassetteRcp);
     }
-    // [추가] StageRCP 필터
     if (stageRcp) {
       sql += ` AND f.stagercp = $${queryParams.length + 1}`;
       queryParams.push(stageRcp);
@@ -246,13 +258,11 @@ export class WaferService {
       sql += ` AND f.stagegroup = $${queryParams.length + 1}`;
       queryParams.push(stageGroup);
     }
-    // [추가] Film 필터
     if (film) {
       sql += ` AND f.film = $${queryParams.length + 1}`;
       queryParams.push(film);
     }
 
-    // [핵심] LotID가 *없을 때만* 날짜 필터 적용 (LotID 있으면 과거 데이터도 조회)
     if (!lotId && startDate && endDate) {
       const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
       sql += ` AND s.ts >= $${queryParams.length + 1} AND s.ts <= $${queryParams.length + 2}`;
@@ -266,7 +276,7 @@ export class WaferService {
         sql,
         ...queryParams,
       );
-      this.logger.debug(`[getDistinctPoints] Found ${results.length} points for Lot: ${lotId}`);
+      this.logger.debug(`[getDistinctPoints] Found ${results.length} points`);
       return results.map((r) => String(r.point));
     } catch (e) {
       this.logger.error('Error fetching distinct points:', e);
@@ -274,7 +284,7 @@ export class WaferService {
     }
   }
 
-  // [수정] Trend 조회 (LotID 있을 시 날짜제한 해제 + JOIN 강화 + 필터 추가)
+  // [수정] Trend 조회 (TRIM 적용)
   async getSpectrumTrend(params: WaferQueryParams): Promise<any[]> {
     const {
       eqpId,
@@ -319,7 +329,7 @@ export class WaferService {
     const queryParams: (string | number | Date)[] = [];
     const selectColumns = dynamicColumns.map((col) => `f."${col}"`).join(', ');
 
-    // [수정] JOIN 조건: s.waferid::integer = f.waferid
+    // JOIN 시 TRIM 적용
     let sql = `
       SELECT DISTINCT ON (s."waferid")
         s."waferid", s."wavelengths", s."values", s."ts", s."eqpid",
@@ -340,7 +350,6 @@ export class WaferService {
       sql += ` AND f."cassettercp" = $${queryParams.length + 1}`;
       queryParams.push(cassetteRcp);
     }
-    // [추가]
     if (stageRcp) {
       sql += ` AND f."stagercp" = $${queryParams.length + 1}`;
       queryParams.push(stageRcp);
@@ -349,13 +358,12 @@ export class WaferService {
       sql += ` AND f."stagegroup" = $${queryParams.length + 1}`;
       queryParams.push(stageGroup);
     }
-    // [추가]
     if (film) {
       sql += ` AND f."film" = $${queryParams.length + 1}`;
       queryParams.push(film);
     }
     if (eqpId) {
-      sql += ` AND s."eqpid" = $${queryParams.length + 1}`;
+      sql += ` AND TRIM(s."eqpid") = TRIM($${queryParams.length + 1})`;
       queryParams.push(eqpId);
     }
 
@@ -365,7 +373,6 @@ export class WaferService {
     sql += ` AND s."waferid" IN (${waferParams})`;
     queryParams.push(...waferIdList);
 
-    // [핵심] LotID가 있으면 날짜 필터 생략
     if (!lotId && startDate) {
       const { startDate: s } = this.getSafeDates(startDate);
       sql += ` AND s."ts" >= $${queryParams.length + 1}`;
@@ -505,7 +512,8 @@ export class WaferService {
 
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
-    // [수정] LotID가 있으면 날짜 제한 해제 (undefined 처리)
+    // [수정] Prisma where 조건에는 trim 옵션이 없으므로 raw query 대신 contains를 쓸 수도 있으나,
+    // 여기서는 기본 Prisma 기능을 신뢰하되, LotID 등은 insensitive 모드 사용
     const where: Prisma.PlgWfFlatWhereInput = {
       eqpid: eqpId || undefined,
       servTs: lotId ? undefined : {
@@ -585,7 +593,7 @@ export class WaferService {
     };
   }
 
-  // [유지] PDF 이미지 조회 (타임아웃 60초 + CMD창 숨김 + 프로세스 직접 제어)
+  // [유지] PDF 이미지 조회
   async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
@@ -595,7 +603,6 @@ export class WaferService {
       );
     }
 
-    // 1. DB에서 정확한 파일 경로 확인
     const pdfCheckResult = await this.checkPdf({
       eqpId,
       lotId,
@@ -616,13 +623,11 @@ export class WaferService {
       throw new InternalServerErrorException('Only HTTP/HTTPS URLs are supported.');
     }
 
-    // 2. 캐시 경로 생성
     const dateObj = new Date(dateTime as string);
     const dateStr = dateObj.toISOString().slice(0, 10).replace(/-/g, '');
     const cacheFileName = `wafer_${eqpId}_${dateStr}_pt${pointNumber}.png`;
     const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
-    // 3. 캐시 검증
     if (fs.existsSync(cacheFilePath)) {
       if (fs.statSync(cacheFilePath).size > 0) {
         try {
@@ -633,7 +638,6 @@ export class WaferService {
       }
     }
 
-    // 4. 다운로드 준비
     const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
     const tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
     const outputPrefix = path.join(os.tmpdir(), `temp_img_${tempId}`);
@@ -657,12 +661,10 @@ export class WaferService {
         writer.on('error', reject);
       });
 
-      // 5. 파일 검증
       if (!fs.existsSync(tempPdfPath) || fs.statSync(tempPdfPath).size === 0) {
         throw new Error('Downloaded PDF is empty or missing.');
       }
 
-      // 6. 변환 실행 함수 (pdftocairo 직접 실행)
       const popplerBinPath = process.env.POPPLER_BIN_PATH;
       if (!popplerBinPath) throw new Error('POPPLER_BIN_PATH is missing.');
       const pdftocairoExe = path.join(popplerBinPath, 'pdftocairo.exe');
@@ -688,7 +690,7 @@ export class WaferService {
         
         const startTime = Date.now();
         await execFileAsync(pdftocairoExe, args, {
-          timeout: 60000, // 타임아웃 60초
+          timeout: 60000, 
           windowsHide: true,
           maxBuffer: 1024 * 1024 * 10 
         });
@@ -696,28 +698,20 @@ export class WaferService {
         this.logger.debug(`[PDF] Conversion took ${duration}ms`);
       };
 
-      // 7. 실행 및 Fallback 로직
       let conversionSuccess = false;
 
-      // 시도 1: 요청 페이지
       try {
         await runConversion(targetPage);
         if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
           conversionSuccess = true;
         }
       } catch (err: any) {
-        const errTime = err.killed ? ' (Timed out after 60s)' : '';
-        this.logger.warn(`[PDF] Page ${targetPage} failed${errTime}: ${err.message}`);
-        if (err.stderr) this.logger.warn(`[PDF] Stderr: ${err.stderr}`);
+        this.logger.warn(`[PDF] Page ${targetPage} failed: ${err.message}`);
       }
 
-      // 시도 2: 실패 시 1페이지로 재시도 (안정성 강화)
       if (!conversionSuccess) {
         this.logger.warn(`[PDF] Retrying with Page 1 after 500ms delay...`);
-        
-        // 0.5초 대기 (파일 Lock 해제)
         await new Promise(resolve => setTimeout(resolve, 500));
-
         try {
           await runConversion(1);
           if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
@@ -725,12 +719,10 @@ export class WaferService {
             this.logger.log(`[PDF] Fallback to Page 1 successful.`);
           }
         } catch (err: any) {
-          const errTime = err.killed ? ' (Timed out after 60s)' : '';
-          this.logger.error(`[PDF] Even Page 1 failed${errTime}. Reason: ${err.message}`);
+          this.logger.error(`[PDF] Even Page 1 failed. Reason: ${err.message}`);
         }
       }
 
-      // 8. 결과 반환
       if (!conversionSuccess || !fs.existsSync(expectedOutput)) {
         throw new Error('Poppler finished but PNG file was not created or empty.');
       }
@@ -743,7 +735,6 @@ export class WaferService {
       const finalPath = fs.existsSync(cacheFilePath) ? cacheFilePath : expectedOutput;
       const imageBuffer = fs.readFileSync(finalPath);
 
-      // 청소
       try { if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); } catch {}
 
       return imageBuffer.toString('base64');
@@ -777,10 +768,6 @@ export class WaferService {
         typeof targetTimeVal === 'string'
           ? targetTimeVal
           : targetTimeVal.toISOString();
-
-      this.logger.debug(
-        `[PDF Search] Eqp: ${eqpId}, TargetTime: ${tsStr} (Exact Match Only)`,
-      );
 
       const results = await this.prisma.$queryRawUnsafe<PdfResult[]>(
         `SELECT file_uri, datetime FROM public.plg_wf_map 
@@ -819,11 +806,8 @@ export class WaferService {
       }
 
       if (candidates.length > 0) {
-        this.logger.log(`[PDF Match] Exact Match Found: ${candidates[0].file_uri}`);
         return { exists: true, url: candidates[0].file_uri };
       }
-
-      this.logger.warn(`[PDF Match] No candidate matched LotID/WaferID.`);
       return { exists: false, url: null };
 
     } catch (e) {
@@ -832,7 +816,6 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
-  // [수정] Spectrum 조회: 정확한 시간 일치 (=) 사용, LIMIT 제거
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
 
@@ -918,20 +901,8 @@ export class WaferService {
       }
 
       const excludeCols = [
-        'x',
-        'y',
-        'diex',
-        'diey',
-        'dierow',
-        'diecol',
-        'dienum',
-        'diepointtag',
-        'point',
-        'lotid',
-        'waferid',
-        'eqpid',
-        'serv_ts',
-        'datetime',
+        'x', 'y', 'diex', 'diey', 'dierow', 'diecol', 'dienum',
+        'diepointtag', 'point', 'lotid', 'waferid', 'eqpid', 'serv_ts', 'datetime',
       ];
 
       targetColumns = targetColumns.filter((col) => {
@@ -1011,15 +982,8 @@ export class WaferService {
       if (!rawData || rawData.length === 0) return { headers: [], data: [] };
 
       const excludeCols = new Set([
-        'eqpid',
-        'lotid',
-        'waferid',
-        'serv_ts',
-        'cassettercp',
-        'stagercp',
-        'stagegroup',
-        'film',
-        'datetime',
+        'eqpid', 'lotid', 'waferid', 'serv_ts',
+        'cassettercp', 'stagercp', 'stagegroup', 'film', 'datetime',
       ]);
       const allKeys = new Set<string>();
       rawData.forEach((row) => {
@@ -1029,20 +993,8 @@ export class WaferService {
       });
 
       const customOrder = [
-        'point',
-        'mse',
-        't1',
-        'gof',
-        'x',
-        'y',
-        'diex',
-        'diey',
-        'dierow',
-        'diecol',
-        'dienum',
-        'diepointtag',
-        'z',
-        'srvisz',
+        'point', 'mse', 't1', 'gof', 'x', 'y', 'diex', 'diey',
+        'dierow', 'diecol', 'dienum', 'diepointtag', 'z', 'srvisz',
       ];
       const headers = Array.from(allKeys).sort((a, b) => {
         const lowerA = a.toLowerCase();
@@ -1088,7 +1040,6 @@ export class WaferService {
       if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
       if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
     } else {
-      // [수정] LotID가 있으면 날짜 필터 무시 (전체 기간 검색)
       if (!p.lotId) {
         if (p.startDate) {
           const { startDate: s } = this.getSafeDates(p.startDate);
@@ -1245,7 +1196,6 @@ export class WaferService {
         queryParams.push(film);
       }
 
-      // [수정] JOIN 조건: s.waferid::integer = f.waferid
       const sql = `
         SELECT 
           s.ts, s.lotid, s.waferid, s.point, s.wavelengths, s."values"
