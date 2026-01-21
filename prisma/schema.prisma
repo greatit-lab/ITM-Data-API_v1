@@ -72,7 +72,6 @@ model AgentInfo {
   memory     String?
   disk       String?
   vga        String?
-  
   equipment  RefEquipment @relation(fields: [eqpid], references: [eqpid])
 
   @@map("agent_info")
@@ -235,7 +234,6 @@ model ErrSeverityMap {
 // [New SSO / Auth] 신규 권한 및 메뉴 관리
 // ==========================================
 
-// [수정] 실제 DB에 맞춰 id 컬럼 삭제 및 compid를 PK로 지정
 model RefAccessCode {
   compid      String   @id @map("compid") @db.VarChar(50) 
   compName    String?  @map("comp_name") @db.VarChar(100)
@@ -256,7 +254,7 @@ model RefMenu {
   icon       String? @db.VarChar(50)
 
   parentId Int?      @map("parent_id")
-  parent   RefMenu? @relation("MenuHierarchy", fields: [parentId], references: [menuId])
+  parent   RefMenu?  @relation("MenuHierarchy", fields: [parentId], references: [menuId])
   children RefMenu[] @relation("MenuHierarchy")
 
   sortOrder Int @default(0) @map("sort_order")
@@ -295,7 +293,6 @@ model CfgGuestAccess {
   grantedRole String   @default("GUEST") @map("granted_role") @db.VarChar(20)
   reason      String?  @db.VarChar(100)
 
-  // [핵심] 유효기간 컬럼 (D-Day 계산용)
   validUntil  DateTime @map("valid_until") @db.Timestamp(0)
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
@@ -305,16 +302,11 @@ model CfgGuestAccess {
 model CfgGuestRequest {
   reqId       Int       @id @default(autoincrement()) @map("req_id")
   loginId     String    @map("login_id") @db.VarChar(50)
-  
   deptCode    String?   @map("dept_code") @db.VarChar(50)
   deptName    String?   @map("dept_name") @db.VarChar(100)
-  
   reason      String?   @db.VarChar(200)
-  
   status      String    @default("PENDING") @db.VarChar(20) 
-  
   processedBy String?   @map("processed_by") @db.VarChar(50)
-  
   processedAt DateTime? @map("processed_at") @db.Timestamp(0)
   createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamp(0)
 
@@ -329,14 +321,16 @@ model SysUser {
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
   // Relations
-  context SysUserContext?
+  context  SysUserContext?
+  posts    SysBoard[]        // 작성한 게시글
+  comments SysBoardComment[] // 작성한 댓글
+
   @@map("sys_user")
 }
 
 model SysUserContext {
   loginId String @id @map("login_id") @db.VarChar(50)
   
-  // RefSdwt의 id(String @db.Char(7))와 연결
   lastSdwtId String  @map("last_sdwt_id") @db.Char(7)
   sdwtInfo   RefSdwt @relation(fields: [lastSdwtId], references: [id])
   
@@ -370,4 +364,70 @@ model CfgServer {
   update       DateTime? @map("update") @db.Timestamp(0)
   
   @@map("cfg_server")
+}
+
+// ==========================================
+// [New Feature] Community / Support (Q&A & Manual)
+// ==========================================
+
+// 1. 게시판 (Q&A, 공지 등)
+model SysBoard {
+  postId      Int      @id @default(autoincrement()) @map("post_id")
+  category    String   @default("QNA") @db.VarChar(20) // QNA, NOTICE, BUG
+  
+  title       String   @db.VarChar(200)
+  content     String   @db.Text // HTML 포함된 긴 텍스트 (WYSIWYG)
+  
+  authorId    String   @map("author_id") @db.VarChar(50)
+  author      SysUser  @relation(fields: [authorId], references: [loginId])
+  
+  views       Int      @default(0)
+  isSecret    String   @default("N") @map("is_secret") @db.Char(1) // 비밀글 여부
+  status      String   @default("OPEN") @db.VarChar(20) // OPEN, ANSWERED, CLOSED
+  
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
+
+  comments    SysBoardComment[]
+  files       SysFile[] // 게시글에 포함된 파일들
+
+  @@map("sys_board")
+}
+
+// 2. 댓글 (Q&A 답변용)
+model SysBoardComment {
+  commentId   Int      @id @default(autoincrement()) @map("comment_id")
+  
+  postId      Int      @map("post_id")
+  post        SysBoard @relation(fields: [postId], references: [postId], onDelete: Cascade)
+  
+  authorId    String   @map("author_id") @db.VarChar(50)
+  author      SysUser  @relation(fields: [authorId], references: [loginId])
+  
+  content     String   @db.Text
+  
+  parentId    Int?     @map("parent_id") // 대댓글 기능용 (선택)
+  
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+
+  @@map("sys_board_comment")
+}
+
+// 3. 파일/이미지 관리 (에디터 붙여넣기 대응)
+model SysFile {
+  fileId      String   @id @default(uuid()) @map("file_id") // UUID 사용
+  fileName    String   @map("file_name") @db.VarChar(200)
+  fileType    String?  @map("file_type") @db.VarChar(50) // image/png, application/pdf etc
+  fileSize    Int?     @map("file_size")
+  
+  // 저장 경로 또는 URL (로컬 저장 시 상대 경로)
+  filePath    String   @map("file_path") @db.VarChar(500) 
+  
+  // 게시글과 연동 (어떤 글에 포함된 이미지인지)
+  postId      Int?     @map("post_id")
+  post        SysBoard? @relation(fields: [postId], references: [postId], onDelete: SetNull)
+
+  uploadedAt  DateTime @default(now()) @map("uploaded_at") @db.Timestamp(0)
+
+  @@map("sys_file")
 }
