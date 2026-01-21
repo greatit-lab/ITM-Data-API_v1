@@ -1,7 +1,16 @@
 // ITM-Data-API/src/board/board.controller.ts
-import { 
-  Controller, Get, Post, Body, Query, Param, Delete, Put, 
-  ParseIntPipe, UsePipes, ValidationPipe 
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Query,
+  Param,
+  Delete,
+  Put,
+  ParseIntPipe,
+  UsePipes,
+  ValidationPipe,
 } from '@nestjs/common';
 import { BoardService } from './board.service';
 import { CreatePostDto, CreateCommentDto } from './dto/board.dto';
@@ -21,7 +30,21 @@ export class BoardController {
     @Query('category') category = 'ALL',
     @Query('search') search = '',
   ) {
-    return this.boardService.getPosts(Number(page), Number(limit), category, search);
+    return this.boardService.getPosts(
+      Number(page),
+      Number(limit),
+      category,
+      search,
+    );
+  }
+
+  /**
+   * [추가] 팝업 공지사항 목록 조회
+   * GET /api/board/popups
+   */
+  @Get('popups')
+  async getPopupNotices() {
+    return this.boardService.getPopupNotices();
   }
 
   /**
@@ -44,25 +67,36 @@ export class BoardController {
   }
 
   /**
+   * 게시글 수정
+   * PUT /api/board/:id
+   */
+  @Put(':id')
+  async updatePost(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateData: any,
+  ) {
+    return this.boardService.updatePost(id, updateData);
+  }
+
+  /**
+   * 게시글 상태 변경 (예: OPEN -> ANSWERED)
+   * PUT /api/board/:id/status
+   */
+  @Put(':id/status')
+  async updateStatus(
+    @Param('id', ParseIntPipe) id: number,
+    @Body('status') status: string,
+  ) {
+    return this.boardService.updateStatus(id, status);
+  }
+
+  /**
    * 게시글 삭제
    * DELETE /api/board/:id
    */
   @Delete(':id')
   async deletePost(@Param('id', ParseIntPipe) id: number) {
     return this.boardService.deletePost(id);
-  }
-
-  /**
-   * 게시글 상태 변경 (예: OPEN -> ANSWERED)
-   * PUT /api/board/:id/status
-   * Body: { status: 'ANSWERED' }
-   */
-  @Put(':id/status')
-  async updateStatus(
-    @Param('id', ParseIntPipe) id: number,
-    @Body('status') status: string
-  ) {
-    return this.boardService.updateStatus(id, status);
   }
 
   /**
@@ -73,5 +107,26 @@ export class BoardController {
   @UsePipes(new ValidationPipe())
   async createComment(@Body() createCommentDto: CreateCommentDto) {
     return this.boardService.createComment(createCommentDto);
+  }
+
+  /**
+   * 댓글 수정
+   * PUT /api/board/comment/:id
+   */
+  @Put('comment/:id')
+  async updateComment(
+    @Param('id', ParseIntPipe) id: number,
+    @Body() updateData: { content: string },
+  ) {
+    return this.boardService.updateComment(id, updateData.content);
+  }
+
+  /**
+   * 댓글 삭제
+   * DELETE /api/board/comment/:id
+   */
+  @Delete('comment/:id')
+  async deleteComment(@Param('id', ParseIntPipe) id: number) {
+    return this.boardService.deleteComment(id);
   }
 }
