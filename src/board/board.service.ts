@@ -9,7 +9,7 @@ export class BoardService {
 
   constructor(private prisma: PrismaService) {}
 
-  // 1. 게시글 목록 조회 (검색 및 페이징 포함)
+  // 1. 게시글 목록 조회
   async getPosts(page: number, limit: number, category?: string, search?: string) {
     try {
       const skip = (page - 1) * limit;
@@ -26,7 +26,6 @@ export class BoardService {
         ];
       }
 
-      // 1. 게시글 데이터 조회 (author 관계 사용)
       const [total, posts] = await Promise.all([
         this.prisma.sysBoard.count({ where: whereCondition }),
         this.prisma.sysBoard.findMany({
@@ -36,30 +35,24 @@ export class BoardService {
           orderBy: { createdAt: 'desc' },
           include: {
             _count: { select: { comments: true } },
-            author: true, // [수정] user -> author (Schema 관계명 일치)
+            author: true, 
           },
         }),
       ]);
 
-      // 2. 작성자들의 권한(Role) 정보 조회 (CfgAdminUser 테이블)
-      // 게시글 작성자 ID 목록 추출
       const authorIds = [...new Set(posts.map(p => p.authorId))];
-      
-      // 관리자 테이블에서 해당 ID들의 권한 조회
       const adminUsers = await this.prisma.cfgAdminUser.findMany({
         where: { loginId: { in: authorIds } },
         select: { loginId: true, role: true }
       });
 
-      // ID별 권한 맵 생성
       const roleMap = new Map(adminUsers.map(u => [u.loginId, u.role]));
 
-      // 3. 데이터 병합 (Frontend가 post.user.role로 접근 가능하도록 구조 변환)
       const mappedPosts = posts.map(post => ({
         ...post,
-        user: { // Frontend 호환성을 위한 가상 객체
+        user: { 
           ...post.author,
-          role: roleMap.get(post.authorId) || 'USER' // 관리자 아니면 USER
+          role: roleMap.get(post.authorId) || 'USER'
         }
       }));
 
@@ -83,11 +76,11 @@ export class BoardService {
       const post = await this.prisma.sysBoard.findUnique({
         where: { postId },
         include: {
-          author: true, // [수정] user -> author
+          author: true,
           comments: {
             orderBy: { createdAt: 'asc' },
             include: {
-              author: true // [수정] user -> author
+              author: true
             }
           },
           files: true,
@@ -96,13 +89,11 @@ export class BoardService {
 
       if (!post) throw new NotFoundException(`Post #${postId} not found`);
 
-      // 조회수 증가
       this.prisma.sysBoard.update({
         where: { postId },
         data: { views: { increment: 1 } },
       }).catch(e => this.logger.warn(`Failed to update views: ${e.message}`));
 
-      // 권한 정보 조회 (게시글 작성자 + 댓글 작성자들)
       const userIds = new Set<string>();
       userIds.add(post.authorId);
       post.comments.forEach(c => userIds.add(c.authorId));
@@ -113,16 +104,15 @@ export class BoardService {
       });
       const roleMap = new Map(adminUsers.map(u => [u.loginId, u.role]));
 
-      // 데이터 병합 및 구조 변환
       const mappedPost = {
         ...post,
-        user: { // 게시글 작성자 권한
+        user: { 
           ...post.author,
           role: roleMap.get(post.authorId) || 'USER'
         },
         comments: post.comments.map(comment => ({
           ...comment,
-          user: { // 댓글 작성자 권한
+          user: { 
             ...comment.author,
             role: roleMap.get(comment.authorId) || 'USER'
           }
@@ -140,6 +130,22 @@ export class BoardService {
   // 3. 게시글 작성
   async createPost(data: CreatePostDto) {
     try {
+      // [팝업 공지 자동 해제] 팝업 공지가 선택된 경우, 기존 공지들의 팝업 설정을 모두 해제
+      if (data.category === 'NOTICE' && data.isPopup === 'Y') {
+        await this.prisma.sysBoard.updateMany({
+          where: { category: 'NOTICE', isPopup: 'Y' },
+          data: { isPopup: 'N' }
+        });
+      }
+
+      // [관리자 공지 자동 완료] 공지사항(NOTICE)일 경우 자동으로 '완료(ANSWERED)' 상태로 설정
+      // 타입 오류 수정: string | undefined 로 명시
+      let initialStatus: string | undefined = undefined;
+      
+      if (data.category === 'NOTICE') {
+        initialStatus = 'ANSWERED';
+      }
+
       return await this.prisma.sysBoard.create({
         data: {
           title: data.title,
@@ -147,7 +153,8 @@ export class BoardService {
           authorId: data.authorId,
           category: data.category || 'QNA',
           isSecret: data.isSecret || 'N',
-          isPopup: data.isPopup || 'N', // [추가] 팝업 여부 저장
+          isPopup: data.isPopup || 'N',
+          status: initialStatus,
         },
       });
     } catch (error) {
@@ -159,6 +166,18 @@ export class BoardService {
   // 4. 게시글 수정
   async updatePost(postId: number, data: any) {
     try {
+      // [팝업 공지 자동 해제] 팝업 공지로 수정하는 경우, 다른 기존 공지들의 팝업 설정 해제
+      if (data.category === 'NOTICE' && data.isPopup === 'Y') {
+        await this.prisma.sysBoard.updateMany({
+          where: { 
+            category: 'NOTICE', 
+            isPopup: 'Y',
+            postId: { not: postId } // 현재 게시글 제외
+          },
+          data: { isPopup: 'N' }
+        });
+      }
+
       return await this.prisma.sysBoard.update({
         where: { postId },
         data: {
@@ -166,7 +185,7 @@ export class BoardService {
           content: data.content,
           category: data.category,
           isSecret: data.isSecret,
-          isPopup: data.isPopup, // [추가] 팝업 여부 수정
+          isPopup: data.isPopup,
         },
       });
     } catch (error) {
@@ -201,17 +220,41 @@ export class BoardService {
     }
   }
 
-  // 7. 댓글 작성
+  // 7. 댓글 작성 (트랜잭션 적용)
   async createComment(data: CreateCommentDto) {
     try {
-      return await this.prisma.sysBoardComment.create({
-        data: {
-          postId: Number(data.postId),
-          authorId: data.authorId,
-          content: data.content,
-          parentId: data.parentId ? Number(data.parentId) : null,
-        },
-      });
+      // [댓글/답변 트랜잭션] status가 존재하면 댓글 생성 + 상태 변경 동시 처리
+      if (data.status) {
+        return await this.prisma.$transaction(async (tx) => {
+          // 1. 댓글 생성
+          const comment = await tx.sysBoardComment.create({
+            data: {
+              postId: Number(data.postId),
+              authorId: data.authorId,
+              content: data.content,
+              parentId: data.parentId ? Number(data.parentId) : null,
+            },
+          });
+
+          // 2. 게시글 상태 업데이트 (예: ANSWERED)
+          await tx.sysBoard.update({
+            where: { postId: Number(data.postId) },
+            data: { status: data.status },
+          });
+
+          return comment;
+        });
+      } else {
+        // 기존 로직 (상태 변경 없음)
+        return await this.prisma.sysBoardComment.create({
+          data: {
+            postId: Number(data.postId),
+            authorId: data.authorId,
+            content: data.content,
+            parentId: data.parentId ? Number(data.parentId) : null,
+          },
+        });
+      }
     } catch (error) {
       this.logger.error(`Failed to createComment: ${error.message}`, error.stack);
       throw new InternalServerErrorException('댓글 작성 중 오류가 발생했습니다.');
@@ -243,14 +286,13 @@ export class BoardService {
     }
   }
 
-  // 10. [추가] 팝업 공지사항 조회
+  // 10. 팝업 공지사항 조회
   async getPopupNotices() {
     try {
       return await this.prisma.sysBoard.findMany({
         where: {
           category: 'NOTICE',
           isPopup: 'Y',
-          // 필요 시 status: 'OPEN' 등 추가 가능
         },
         orderBy: { createdAt: 'desc' },
       });
