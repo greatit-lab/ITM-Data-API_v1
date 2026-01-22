@@ -1,13 +1,17 @@
 // ITM-Data-API/src/board/board.service.ts
 import { Injectable, NotFoundException, Logger, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
+import { AlertService } from '../alert/alert.service'; // [추가] 알림 서비스
 import { CreatePostDto, CreateCommentDto } from './dto/board.dto';
 
 @Injectable()
 export class BoardService {
   private readonly logger = new Logger(BoardService.name);
 
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private alertService: AlertService, // [추가] 주입
+  ) {}
 
   // 1. 게시글 목록 조회
   async getPosts(page: number, limit: number, category?: string, search?: string) {
@@ -139,7 +143,6 @@ export class BoardService {
       }
 
       // [관리자 공지 자동 완료] 공지사항(NOTICE)일 경우 자동으로 '완료(ANSWERED)' 상태로 설정
-      // 타입 오류 수정: string | undefined 로 명시
       let initialStatus: string | undefined = undefined;
       
       if (data.category === 'NOTICE') {
@@ -166,13 +169,13 @@ export class BoardService {
   // 4. 게시글 수정
   async updatePost(postId: number, data: any) {
     try {
-      // [팝업 공지 자동 해제] 팝업 공지로 수정하는 경우, 다른 기존 공지들의 팝업 설정 해제
+      // [팝업 공지 자동 해제]
       if (data.category === 'NOTICE' && data.isPopup === 'Y') {
         await this.prisma.sysBoard.updateMany({
           where: { 
             category: 'NOTICE', 
             isPopup: 'Y',
-            postId: { not: postId } // 현재 게시글 제외
+            postId: { not: postId } 
           },
           data: { isPopup: 'N' }
         });
@@ -194,13 +197,28 @@ export class BoardService {
     }
   }
 
-  // 5. 게시글 상태 변경
+  // 5. 게시글 상태 변경 (알림 로직 포함)
   async updateStatus(postId: number, status: string) {
     try {
-      return await this.prisma.sysBoard.update({
+      const board = await this.prisma.sysBoard.findUnique({ where: { postId } });
+      if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
+
+      const updated = await this.prisma.sysBoard.update({
         where: { postId },
         data: { status },
       });
+
+      // [알림 발송] 상태가 'Complete' 또는 'ANSWERED'로 변경된 경우 (작성자가 아닌 관리자가 변경했다고 가정)
+      if ((status === 'Complete' || status === 'ANSWERED') && board.status !== status) {
+        // 본인이 본인 글의 상태를 바꾸는 경우는 제외할 수도 있으나, 보통 관리자가 처리하므로 알림 발송
+        await this.alertService.createAlert(
+          board.authorId,
+          `문의하신 게시글 [${board.title}]이(가) 완료 처리되었습니다.`,
+          `/support/qna/${postId}`
+        );
+      }
+
+      return updated;
     } catch (error) {
       this.logger.error(`Failed to updateStatus: ${error.message}`, error.stack);
       throw new InternalServerErrorException('상태 변경 중 오류가 발생했습니다.');
@@ -220,33 +238,17 @@ export class BoardService {
     }
   }
 
-  // 7. 댓글 작성 (트랜잭션 적용)
+  // 7. 댓글 작성 (트랜잭션 및 알림 적용)
   async createComment(data: CreateCommentDto) {
     try {
-      // [댓글/답변 트랜잭션] status가 존재하면 댓글 생성 + 상태 변경 동시 처리
-      if (data.status) {
-        return await this.prisma.$transaction(async (tx) => {
-          // 1. 댓글 생성
-          const comment = await tx.sysBoardComment.create({
-            data: {
-              postId: Number(data.postId),
-              authorId: data.authorId,
-              content: data.content,
-              parentId: data.parentId ? Number(data.parentId) : null,
-            },
-          });
+      // 게시글 정보 조회 (작성자 ID 필요)
+      const board = await this.prisma.sysBoard.findUnique({ where: { postId: Number(data.postId) } });
+      if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
-          // 2. 게시글 상태 업데이트 (예: ANSWERED)
-          await tx.sysBoard.update({
-            where: { postId: Number(data.postId) },
-            data: { status: data.status },
-          });
-
-          return comment;
-        });
-      } else {
-        // 기존 로직 (상태 변경 없음)
-        return await this.prisma.sysBoardComment.create({
+      // [댓글/답변 트랜잭션]
+      const result = await this.prisma.$transaction(async (tx) => {
+        // 1. 댓글 생성
+        const comment = await tx.sysBoardComment.create({
           data: {
             postId: Number(data.postId),
             authorId: data.authorId,
@@ -254,7 +256,33 @@ export class BoardService {
             parentId: data.parentId ? Number(data.parentId) : null,
           },
         });
+
+        // 2. 게시글 상태 업데이트 (옵션)
+        if (data.status) {
+          await tx.sysBoard.update({
+            where: { postId: Number(data.postId) },
+            data: { status: data.status },
+          });
+        }
+
+        return comment;
+      });
+
+      // [알림 발송] 댓글 작성자가 게시글 작성자와 다를 경우 (즉, 관리자 답변)
+      if (board.authorId !== data.authorId) {
+        // 1) 답변 등록 알림
+        await this.alertService.createAlert(
+          board.authorId,
+          `문의하신 게시글 [${board.title}]에 답변이 등록되었습니다.`,
+          `/support/qna/${data.postId}`
+        );
+
+        // 2) 상태가 완료로 변경되었으면 추가 알림 또는 위 알림으로 갈음
+        // 여기서는 '답변 등록' 알림 하나만 보내거나, 상태 변경이 있을 경우 로직을 통합할 수 있음.
+        // 위 updateStatus에서도 알림을 보내므로 중복 방지를 위해 여기서는 '상태 변경'이 없을 때만 보내거나 메시지를 구분함.
       }
+
+      return result;
     } catch (error) {
       this.logger.error(`Failed to createComment: ${error.message}`, error.stack);
       throw new InternalServerErrorException('댓글 작성 중 오류가 발생했습니다.');
