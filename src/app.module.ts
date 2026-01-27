@@ -1,6 +1,7 @@
 // ITM-Data-API/src/app.module.ts
 import { Module, NestModule, MiddlewareConsumer, Logger } from '@nestjs/common';
 import { PrismaService } from './prisma.service';
+import { ConfigModule } from '@nestjs/config'; // ConfigModule 추가 권장
 
 // 1. 기존 데이터 API 모듈
 import { WaferModule } from './wafer/wafer.module';
@@ -16,7 +17,7 @@ import { FiltersModule } from './filters/filters.module';
 
 // [New] 게시판 및 알림 모듈
 import { BoardModule } from './board/board.module';
-import { AlertModule } from './alert/alert.module'; // [추가]
+import { AlertModule } from './alert/alert.module'; // [확인] 포함됨
 
 // 3. 비즈니스 로직 이관 모듈
 import { DashboardModule } from './dashboard/dashboard.module';
@@ -28,6 +29,9 @@ import { ManualModule } from './manual/manual.module';
 
 @Module({
   imports: [
+    // ConfigModule 설정 (필요 시)
+    ConfigModule.forRoot({ isGlobal: true }),
+
     // 1. 데이터 모듈
     WaferModule,
     PreAlignModule,
@@ -42,7 +46,7 @@ import { ManualModule } from './manual/manual.module';
 
     // [New] 게시판 및 알림 모듈 등록
     BoardModule,
-    AlertModule, // [추가]
+    AlertModule,
 
     // 3. 비즈니스 모듈
     DashboardModule,
@@ -59,19 +63,16 @@ export class AppModule implements NestModule {
   private readonly logger = new Logger('HTTP');
 
   configure(consumer: MiddlewareConsumer) {
-    // 들어오는 모든 요청을 가로채서 로그를 출력하는 미들웨어
     consumer
       .apply((req: any, res: any, next: any) => {
         const { method, originalUrl } = req;
         const start = Date.now();
 
-        // [디버깅] 요청 도착 로그
         this.logger.log(`📥 Incoming Request: ${method} ${originalUrl}`);
 
         res.on('finish', () => {
           const { statusCode } = res;
           const duration = Date.now() - start;
-          // [디버깅] 응답 완료 로그
           this.logger.log(
             `📤 Response: ${method} ${originalUrl} ${statusCode} - ${duration}ms`,
           );
@@ -79,6 +80,6 @@ export class AppModule implements NestModule {
 
         next();
       })
-      .forRoutes('*'); // 모든 라우트에 적용
+      .forRoutes('*');
   }
 }
