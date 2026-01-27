@@ -376,13 +376,14 @@ model SysBoard {
   category     String    @default("QNA") @db.VarChar(20) // QNA, NOTICE, BUG
   
   title        String    @db.VarChar(200)
-  content      String    @db.Text // [PostgreSQL] Text 타입 (1GB)
+  content      String    @db.Text // [PostgreSQL] Text 타입은 1GB까지 저장 가능 (OK)
   
   authorId     String    @map("author_id") @db.VarChar(50)
   author       SysUser   @relation(fields: [authorId], references: [loginId])
   
   views        Int       @default(0)
   isSecret     String    @default("N") @map("is_secret") @db.Char(1) // 비밀글 여부
+  // [추가] 팝업 설정 여부 (Y: 팝업 띄움, N: 일반글)
   isPopup      String    @default("N") @map("is_popup") @db.Char(1) 
   status       String    @default("OPEN") @db.VarChar(20) // OPEN, ANSWERED, CLOSED
   
@@ -390,7 +391,7 @@ model SysBoard {
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
 
   comments     SysBoardComment[]
-  files        SysFile[] 
+  files        SysFile[] // 게시글에 포함된 파일들
 
   @@map("sys_board")
 }
@@ -407,22 +408,24 @@ model SysBoardComment {
   
   content      String    @db.Text
   
-  parentId     Int?      @map("parent_id") 
+  parentId     Int?      @map("parent_id") // 대댓글 기능용 (선택)
   
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
   @@map("sys_board_comment")
 }
 
-// 3. 파일/이미지 관리
+// 3. 파일/이미지 관리 (에디터 붙여넣기 대응)
 model SysFile {
-  fileId       String    @id @default(uuid()) @map("file_id") 
+  fileId       String    @id @default(uuid()) @map("file_id") // UUID 사용
   fileName     String    @map("file_name") @db.VarChar(200)
-  fileType     String?   @map("file_type") @db.VarChar(50) 
+  fileType     String?   @map("file_type") @db.VarChar(50) // image/png, application/pdf etc
   fileSize     Int?      @map("file_size")
   
+  // 저장 경로 또는 URL (로컬 저장 시 상대 경로)
   filePath     String    @map("file_path") @db.VarChar(500) 
   
+  // 게시글과 연동 (어떤 글에 포함된 이미지인지)
   postId       Int?      @map("post_id")
   post         SysBoard? @relation(fields: [postId], references: [postId], onDelete: SetNull)
 
@@ -437,10 +440,10 @@ model SysFile {
 
 model SysAlert {
   id         Int       @id @default(autoincrement())
-  userId     String    @map("user_id") 
-  type       String    
-  message    String    
-  link       String?   
+  userId     String    @map("user_id") // 알림 받을 사용자 ID
+  type       String    // 알림 유형 (예: 'BOARD_REPLY')
+  message    String    // 알림 내용
+  link       String?   // 클릭 시 이동할 링크
   isRead     Boolean   @default(false) @map("is_read")
   createdAt DateTime @default(now()) @map("created_at")
 
@@ -448,13 +451,13 @@ model SysAlert {
 }
 
 // [New Feature] User Manual Management
-// [확인] PostgreSQL content @db.Text 적용
+// [중요] PostgreSQL에서 @db.Text는 대용량(1GB)을 지원하므로 이미지 다수 포함 가능
 model SysManual {
   id           String    @id @map("section_id") @db.VarChar(255)
   title        String    @db.VarChar(100)
   subtitle     String?   @db.VarChar(200)
   icon         String?   @db.VarChar(50)
-  content      String    @db.Text  // [Postgres 최적화] Text 타입
+  content      String    @db.Text  // [확인] Postgres Text 타입 (Unlimited)
   imageUrl     String?   @map("image_url") @db.VarChar(500)
   sortOrder    Int       @default(0) @map("sort_order")
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
