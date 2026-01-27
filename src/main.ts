@@ -2,15 +2,19 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { Logger } from '@nestjs/common';
-import { json, urlencoded } from 'express'; // [추가] express 모듈
+import { json, urlencoded } from 'express';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
-  // NestJS 애플리케이션 생성 (HTTPS 옵션 제거 -> HTTP 모드)
-  const app = await NestFactory.create(AppModule);
+  // [중요 수정] bodyParser: false 옵션 추가
+  // NestJS의 기본 BodyParser(100kb 제한)를 비활성화해야 
+  // 아래의 app.use(json({ limit: '50mb' })) 설정이 올바르게 적용됩니다.
+  const app = await NestFactory.create(AppModule, {
+    bodyParser: false, 
+  });
 
-  // [추가] 요청 본문(Body) 크기 제한을 50MB로 증가 (이미지 붙여넣기 대응)
+  // [설정] 요청 본문(Body) 크기 제한을 50MB로 증가 (이미지 붙여넣기 대응)
   app.use(json({ limit: '50mb' }));
   app.use(urlencoded({ extended: true, limit: '50mb' }));
 
@@ -27,7 +31,7 @@ async function bootstrap() {
   // 3. 포트 설정
   const port = process.env.PORT || 8081;
 
-  // 4. 서버 시작 (HTTP)
+  // 4. 서버 시작
   await app.listen(port, '0.0.0.0');
 
   logger.log(`🚀 ITM Data API is running on: http://0.0.0.0:${port}/api`);
