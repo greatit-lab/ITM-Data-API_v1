@@ -1,28 +1,30 @@
 // ITM-DATA-API/src/alert/alert.controller.ts
-import { Controller, Get, Post, Body, Param, UseGuards, Request, ParseIntPipe } from '@nestjs/common';
+import { Controller, Get, Post, Param, Query, ParseIntPipe } from '@nestjs/common';
 import { AlertService } from './alert.service';
-// JwtAuthGuard가 auth 모듈에 있다고 가정
-import { JwtAuthGuard } from '../auth/jwt-auth.guard'; 
 
 @Controller('alert')
-@UseGuards(JwtAuthGuard)
+// [수정] @UseGuards(JwtAuthGuard) 제거 -> 인증 없이 접근 허용 (내부망 통신)
 export class AlertController {
   constructor(private readonly alertService: AlertService) {}
 
-  // 내 알림 조회
+  // 1. 내 알림 조회
+  // GET /alert?userId=gily.choi
   @Get()
-  async getMyAlerts(@Request() req) {
-    // req.user.userId는 JWT 전략에 따라 다를 수 있음 (username or userId 확인 필요)
-    return this.alertService.getMyAlerts(req.user.username); 
+  async getMyAlerts(@Query('userId') userId: string) {
+    if (!userId) return []; // userId 없으면 빈 배열 반환
+    return this.alertService.getMyAlerts(userId);
   }
 
-  // 안 읽은 개수 조회 (Polling용)
+  // 2. 안 읽은 개수 조회 (Polling용)
+  // GET /alert/unread-count?userId=gily.choi
   @Get('unread-count')
-  async getUnreadCount(@Request() req) {
-    return this.alertService.getUnreadCount(req.user.username);
+  async getUnreadCount(@Query('userId') userId: string) {
+    if (!userId) return 0;
+    return this.alertService.getUnreadCount(userId);
   }
 
-  // 읽음 처리
+  // 3. 읽음 처리
+  // POST /alert/:id/read
   @Post(':id/read')
   async readAlert(@Param('id', ParseIntPipe) id: number) {
     return this.alertService.readAlert(id);
