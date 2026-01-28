@@ -388,7 +388,7 @@ model SysBoard {
   status       String    @default("OPEN") @db.VarChar(20) // OPEN, ANSWERED, CLOSED
   
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
-  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
+  updatedAt    DateTime? @map("updated_at") @db.Timestamp(0)
 
   comments     SysBoardComment[]
   files        SysFile[] // 게시글에 포함된 파일들
