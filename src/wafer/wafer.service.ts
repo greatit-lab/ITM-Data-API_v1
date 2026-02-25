@@ -136,15 +136,19 @@ export class WaferService {
     return { startDate, endDate };
   }
 
-  // [신규] 문자열 조작 없이 URL 인코딩 이슈를 막아주는 날짜 파싱 유틸
+  // [수정 완료: 순수 Date 객체 파괴 방어 로직 추가]
   private parseSafeDate(dateVal: string | Date | undefined): Date {
     if (!dateVal) return new Date();
-    // URL의 '+' 기호를 강제로 공백으로 치환하여 타임존 오해 원천 차단
+    
+    // [핵심] 이미 DB에서 꺼낸 Date 객체라면, 건드리지 않고 그대로 반환!
+    if (dateVal instanceof Date) return dateVal;
+    
+    // URL 등에서 넘어온 '문자열'일 경우에만 + 기호를 치환
     const cleanStr = String(dateVal).replace(/\+/g, ' ');
     return new Date(cleanStr);
   }
 
-  // 동적 파티션 테이블(Spectrum) 데이터 존재 유무 검사
+  // [수정 완료: 안전장치가 포함된 스펙트럼 유무 검사]
   private async checkSpectrumExists(
     eqpId: string, 
     lotId: string, 
@@ -153,16 +157,21 @@ export class WaferService {
   ): Promise<boolean> {
     try {
       if (!dateVal) return false;
-      const targetDate = this.parseSafeDate(dateVal);
+      const targetDate = this.parseSafeDate(dateVal); 
       
+      // 혹시라도 날짜가 유효하지 않으면 중단 (에러 방어)
+      if (isNaN(targetDate.getTime())) return false;
+
       const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
       let tableName = 'public.plg_onto_spectrum';
       
+      // 과거 날짜일 경우 동적 월별 테이블명 조립
       if (!isToday) {
         const yy = dayjs(targetDate).format('YYYY');
         const mm = dayjs(targetDate).format('MM');
         tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
         
+        // 과거 테이블 존재 유무 1차 검증
         const checkTableSql = `
           SELECT EXISTS (
             SELECT FROM pg_tables 
@@ -174,6 +183,7 @@ export class WaferService {
         if (!tableExists[0]?.exists) return false;
       }
 
+      // 데이터 유무 초고속 확인
       const querySql = `
         SELECT EXISTS(
           SELECT 1 FROM ${tableName} 
@@ -190,7 +200,9 @@ export class WaferService {
         String(waferId)
       );
 
-      return result[0]?.exists || false;
+      // boolean 처리 완벽 대응
+      return result[0]?.exists === true || result[0]?.exists === 'true';
+      
     } catch (error) {
       this.logger.warn(`Spectrum check failed for ${eqpId}-${lotId}:`, error);
       return false;
@@ -524,6 +536,7 @@ export class WaferService {
     }
   }
 
+  // FlatData 목록 조회 시 checkSpectrumExists 연동
   async getFlatData(params: WaferQueryParams) {
     const {
       eqpId,
@@ -622,11 +635,13 @@ export class WaferService {
       }
     }
 
+    // Data Info 목록을 구성할 때 스펙트럼 유무를 개별 날짜 기준으로 동적 검사
     const updatedItems = await Promise.all(items.map(async (i) => {
       const checkDate = i.datetime || i.servTs;
       let hasSpec = false;
       
       if (checkDate && i.eqpid && i.lotid && i.waferid !== null) {
+        // 방금 위에서 만든 동적 파티션 확인 함수 호출!
         hasSpec = await this.checkSpectrumExists(i.eqpid, i.lotid, i.waferid, checkDate);
       }
 
@@ -641,7 +656,7 @@ export class WaferService {
         stageGroup: i.stagegroup,
         film: i.film,
         hasWaferMap: i.datetime ? mapLookup.has(`${i.eqpid}_${i.datetime.getTime()}`) : false,
-        hasSpectrum: hasSpec
+        hasSpectrum: hasSpec,  // 검사 결과 매핑
       };
     }));
 
@@ -651,57 +666,54 @@ export class WaferService {
     };
   }
 
+  // [수정] PDF 변환 실패의 "진짜 원인"을 프론트엔드 콘솔로 던져주도록 에러 핸들링 수정
   async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
     if (!eqpId || !dateTime || pointNumber === undefined) {
-      throw new InternalServerErrorException(
-        'EQP ID, DateTime, and PointNumber are required for PDF image.',
-      );
+      throw new InternalServerErrorException('EQP ID, DateTime, and PointNumber are required.');
     }
 
     let tempPdfPath: string | null = null;
     let expectedOutput: string | null = null;
 
     try {
-      const pdfCheckResult = await this.checkPdf({
-        eqpId,
-        lotId,
-        waferId,
-        dateTime: dateTime,
-      });
+      const pdfCheckResult = await this.checkPdf({ eqpId, lotId, waferId, dateTime });
 
       if (!pdfCheckResult.exists || !pdfCheckResult.url) {
         throw new NotFoundException('PDF file URI not found in database.');
       }
 
       const downloadUrl = pdfCheckResult.url;
+      
+      // [의심 1] DB에 저장된 경로가 http가 아닐 경우 (예: C:\파일... 등)
       if (!downloadUrl.startsWith('http')) {
-        throw new InternalServerErrorException('Only HTTP/HTTPS URLs are supported.');
+        throw new Error(`DB에 저장된 파일 경로가 HTTP 형식이 아닙니다. (현재경로: ${downloadUrl})`);
       }
 
-      // [수정] Dayjs를 활용하여 안전한 캐시 파일명 생성
-      const targetDate = this.parseSafeDate(dateTime);
-      const dateStr = dayjs(targetDate).format('YYMMDD');
-      const cacheFileName = `wafer_${eqpId}_${dateStr}_pt${pointNumber}.png`;
+      const cleanDateStr = String(dateTime).replace(/\+/g, '').replace(/[- :TZ]/g, '').substring(2, 8);
+      const cacheFileName = `wafer_${eqpId}_${cleanDateStr}_pt${pointNumber}.png`;
       const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
       if (fs.existsSync(cacheFilePath) && fs.statSync(cacheFilePath).size > 0) {
-        try { return fs.readFileSync(cacheFilePath).toString('base64'); } catch (e) { /* ignore */ }
+        try { return fs.readFileSync(cacheFilePath).toString('base64'); } catch (e) {}
       }
 
       const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
       tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
-      const outputPrefix = path.join(os.tmpdir(), `temp_img_${tempId}`);
-      expectedOutput = `${outputPrefix}.png`;
+      expectedOutput = path.join(os.tmpdir(), `temp_img_${tempId}.png`);
 
       const writer = fs.createWriteStream(tempPdfPath);
+      
+      // [의심 2] Axios 다운로드 중 에러 발생
       const response = await axios({
         url: encodeURI(downloadUrl),
         method: 'GET',
         responseType: 'stream',
         proxy: false,
         timeout: 10000,
+      }).catch(err => {
+         throw new Error(`Axios PDF 다운로드 실패: ${err.message}`);
       });
 
       (response.data as Readable).pipe(writer);
@@ -711,67 +723,29 @@ export class WaferService {
         writer.on('error', reject);
       });
 
-      if (!fs.existsSync(tempPdfPath) || fs.statSync(tempPdfPath).size === 0) {
-        throw new Error('Downloaded PDF is empty or missing.');
-      }
-
       const popplerBinPath = process.env.POPPLER_BIN_PATH;
-      if (!popplerBinPath) throw new Error('POPPLER_BIN_PATH is missing.');
+      // [의심 3] Poppler 환경 변수 누락
+      if (!popplerBinPath) throw new Error('서버 환경변수에 POPPLER_BIN_PATH가 설정되지 않았습니다.');
+      
       const pdftocairoExe = path.join(popplerBinPath, 'pdftocairo.exe');
-      
-      let targetPage = Number(pointNumber);
-      if (isNaN(targetPage) || targetPage < 1) targetPage = 1;
+      let targetPage = Number(pointNumber) || 1;
+      const outputPrefix = expectedOutput.replace('.png', '');
 
-      const runConversion = async (page: number) => {
-        if (expectedOutput && fs.existsSync(expectedOutput)) {
-            try { fs.unlinkSync(expectedOutput); } catch(e) {}
-        }
-        if (!tempPdfPath || !expectedOutput) return;
-
-        const args = [ '-png', '-f', String(page), '-l', String(page), '-singlefile', tempPdfPath, outputPrefix ];
-        
-        await execFileAsync(pdftocairoExe, args, {
-          timeout: 60000, 
-          windowsHide: true,
-          maxBuffer: 1024 * 1024 * 10 
-        });
-      };
-
-      let conversionSuccess = false;
+      // [의심 4] Poppler 변환 실행 중 에러
       try {
-        await runConversion(targetPage);
-        if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
-          conversionSuccess = true;
-        }
+        await execFileAsync(pdftocairoExe, [ '-png', '-f', String(targetPage), '-l', String(targetPage), '-singlefile', tempPdfPath, outputPrefix ], { timeout: 60000 });
       } catch (err: any) {
-        this.logger.warn(`[PDF] Page ${targetPage} failed: ${err.message}`);
+         throw new Error(`Poppler 변환 실패: ${err.message}`);
       }
 
-      if (!conversionSuccess) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        try {
-          await runConversion(1);
-          if (fs.existsSync(expectedOutput) && fs.statSync(expectedOutput).size > 0) {
-            conversionSuccess = true;
-          }
-        } catch (err: any) {
-          this.logger.error(`[PDF] Fallback failed: ${err.message}`);
-        }
+      if (!fs.existsSync(expectedOutput)) {
+        throw new Error('Poppler 실행은 끝났으나 PNG 파일이 생성되지 않았습니다.');
       }
 
-      if (!conversionSuccess || !fs.existsSync(expectedOutput)) {
-        throw new Error('Poppler finished but PNG file was not created.');
-      }
-
-      try {
-        fs.copyFileSync(expectedOutput, cacheFilePath);
-        fs.unlinkSync(expectedOutput);
-      } catch (e) { /* ignore */ }
-
-      const finalPath = fs.existsSync(cacheFilePath) ? cacheFilePath : expectedOutput;
-      const imageBuffer = fs.readFileSync(finalPath);
+      fs.copyFileSync(expectedOutput, cacheFilePath);
+      const imageBuffer = fs.readFileSync(expectedOutput);
       
-      try { if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); } catch {}
+      try { fs.unlinkSync(expectedOutput); if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); } catch {}
 
       return imageBuffer.toString('base64');
 
@@ -779,19 +753,18 @@ export class WaferService {
       try { 
         if (tempPdfPath && fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); 
         if (expectedOutput && fs.existsSync(expectedOutput)) fs.unlinkSync(expectedOutput);
-      } catch { /* ignore */ }
+      } catch {}
       
-      if (e instanceof NotFoundException) {
-          throw e;
-      }
+      if (e instanceof NotFoundException) throw e;
       
-      const error = e as { code?: string; message?: string };
-      this.logger.error(`[ERROR] PDF Processing Failed: ${error.message}`);
-      throw new InternalServerErrorException(`Failed to process PDF`);
+      const error = e as Error;
+      this.logger.error(`[PDF Processing Failed] ${error.message}`);
+      // [핵심 해결] 가려졌던 에러 메시지를 그대로 프론트엔드로 던짐!
+      throw new InternalServerErrorException(`PDF 처리 오류: ${error.message}`);
     }
   }
 
-  // [핵심 수정] 타임존 파괴 문제 해결 및 Prisma ORM 적용으로 100% 안전한 파일 조회
+  // [수정] 타임존 개입을 완벽히 배제하고, 입력된 시간 문자열 그대로 DB와 매칭
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
@@ -801,50 +774,45 @@ export class WaferService {
     if (!eqpId || !targetTimeVal) return { exists: false, url: null };
 
     try {
-      const targetDate = this.parseSafeDate(targetTimeVal);
+      // URL 인코딩된 '+' 기호만 공백으로 복구 (예: 2026-02-25 14:33:22)
+      const cleanDateStr = String(targetTimeVal).replace(/\+/g, ' ').replace('T', ' ').replace('Z', '');
 
-      // Raw Query 대신 Prisma의 안전한 ORM 쿼리 사용 (타임존/소수점 오차 완벽 해결)
-      const results = await this.prisma.plgWfMap.findMany({
-        where: {
-          eqpid: eqpId,
-          datetime: {
-            gte: new Date(targetDate.getTime() - 2000), // 시간 앞뒤 2초 여유
-            lte: new Date(targetDate.getTime() + 2000),
-          }
-        },
-        orderBy: { datetime: 'desc' },
-        select: { file_uri: true, datetime: true }
-      });
+      // 타임존 변환 없이, DB의 datetime과 입력된 시간을 '초(second)' 단위까지만 정확히 텍스트로 잘라서 비교
+      const results = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT file_uri, datetime FROM public.plg_wf_map 
+         WHERE TRIM(eqpid) = TRIM($1)
+           AND date_trunc('second', datetime) = date_trunc('second', $2::timestamp)
+         ORDER BY datetime DESC`,
+        eqpId,
+        cleanDateStr
+      );
 
       if (!results || results.length === 0) {
         return { exists: false, url: null };
       }
 
+      const getUri = (r: any) => r.fileUri || r.file_uri || r.file_url || null;
       let candidates = results;
-      if (lotId) {
-        const targetLot = lotId.trim();
-        const targetLotUnderscore = targetLot.replace(/\./g, '_');
 
+      if (lotId) {
+        const targetLot = lotId.trim().replace(/\./g, '_'); // fallback용
         candidates = results.filter((r) => {
-          if (!r.file_uri) return false;
-          const uri = r.file_uri;
+          const uri = getUri(r);
+          if (!uri) return false;
+          
           const filename = path.basename(uri);
-          const hasLot = filename.includes(targetLot) || filename.includes(targetLotUnderscore);
-          let hasWafer = true;
-          if (waferId) {
-            hasWafer = filename.includes(String(waferId));
-          }
+          const hasLot = filename.includes(lotId.trim()) || filename.includes(targetLot);
+          const hasWafer = waferId ? filename.includes(String(waferId)) : true;
           return hasLot && hasWafer;
         });
       }
 
-      if (candidates.length > 0) {
-        return { exists: true, url: candidates[0].file_uri };
+      if (candidates.length > 0 && getUri(candidates[0])) {
+        return { exists: true, url: getUri(candidates[0]) };
       }
 
-      // [폴백 방어] 깐깐한 파일명 조건에서 떨어져도 DB에 있으면 냅다 반환!
-      if (results.length > 0) {
-        return { exists: true, url: results[0].file_uri };
+      if (results.length > 0 && getUri(results[0])) {
+        return { exists: true, url: getUri(results[0]) };
       }
 
       return { exists: false, url: null };
