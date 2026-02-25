@@ -2,38 +2,31 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
-// [수정] import * as dayjs -> import dayjs (Default Import 사용)
 import dayjs from 'dayjs';
-// [수정] import * as utc -> import utc (Default Import 사용)
 import utc from 'dayjs/plugin/utc';
 
-// [핵심] UTC 플러그인 활성화
 dayjs.extend(utc);
 
 @Injectable()
 export class PerformanceService {
   constructor(private prisma: PrismaService) {}
 
-  /**
-   * [핵심 유틸] 날짜 문자열을 UTC Date 객체로 변환
-   * 예: "2026-01-28 14:00:00" -> 2026-01-28T14:00:00.000Z
-   * 이렇게 해야 Prisma가 DB에 쿼리를 날릴 때 "14:00:00" 시간을 그대로 유지함.
-   */
   private parseDate(dateStr: string): Date {
-    // 로컬 시간대 변환 없이, 입력된 문자열 그대로를 UTC 시간으로 해석
     return dayjs.utc(dateStr).toDate();
   }
 
-  // 1. 장비 성능 이력 조회
   async getPerformanceHistory(
     startDate: string,
     endDate: string,
     eqpids?: string,
+    intervalSec: number = 300, // [수정] 5분(300초)으로 변경
   ) {
+    const safeInterval = (intervalSec && !isNaN(intervalSec) && intervalSec > 0) ? intervalSec : 300; // [수정] 5분(300초)으로 변경
+
     const where: Prisma.EqpPerfWhereInput = {
       servTs: {
-        gte: this.parseDate(startDate), // [수정] UTC 강제 변환 유틸 사용
-        lte: this.parseDate(endDate),   // [수정] UTC 강제 변환 유틸 사용
+        gte: this.parseDate(startDate), 
+        lte: this.parseDate(endDate),   
       },
     };
 
@@ -47,9 +40,50 @@ export class PerformanceService {
       orderBy: { servTs: 'asc' },
     });
 
+    if (safeInterval > 0 && results.length > 0) {
+      const grouped = new Map<string, any>();
+      
+      for (const row of results) {
+        const timeMs = row.servTs.getTime();
+        const bucketTime = Math.floor(timeMs / (safeInterval * 1000)) * (safeInterval * 1000);
+        const bucketKey = `${row.eqpid}_${bucketTime}`;
+        
+        if (!grouped.has(bucketKey)) {
+          grouped.set(bucketKey, {
+            count: 1,
+            eqpid: row.eqpid,
+            servTs: new Date(bucketTime),
+            cpuUsage: row.cpuUsage ? Number(row.cpuUsage) : 0,
+            memUsage: row.memUsage ? Number(row.memUsage) : 0,
+            cpuTemp: row.cpuTemp ? Number(row.cpuTemp) : 0,
+            gpuTemp: row.gpuTemp ? Number(row.gpuTemp) : 0,
+            fanSpeed: row.fanSpeed ? Number(row.fanSpeed) : 0,
+          });
+        } else {
+          const bucket = grouped.get(bucketKey);
+          bucket.count++;
+          bucket.cpuUsage += row.cpuUsage ? Number(row.cpuUsage) : 0;
+          bucket.memUsage += row.memUsage ? Number(row.memUsage) : 0;
+          bucket.cpuTemp += row.cpuTemp ? Number(row.cpuTemp) : 0;
+          bucket.gpuTemp += row.gpuTemp ? Number(row.gpuTemp) : 0;
+          bucket.fanSpeed += row.fanSpeed ? Number(row.fanSpeed) : 0;
+        }
+      }
+
+      return Array.from(grouped.values()).map((bucket) => ({
+        eqpId: bucket.eqpid,
+        timestamp: dayjs.utc(bucket.servTs).format('YYYY-MM-DD HH:mm:ss'),
+        cpuUsage: Number((bucket.cpuUsage / bucket.count).toFixed(2)),
+        memoryUsage: Number((bucket.memUsage / bucket.count).toFixed(2)),
+        cpuTemp: Number((bucket.cpuTemp / bucket.count).toFixed(2)),
+        gpuTemp: Number((bucket.gpuTemp / bucket.count).toFixed(2)),
+        fanSpeed: Number((bucket.fanSpeed / bucket.count).toFixed(2)),
+      })).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    }
+
     return results.map((row) => ({
       eqpId: row.eqpid,
-      timestamp: row.servTs,
+      timestamp: dayjs.utc(row.servTs).format('YYYY-MM-DD HH:mm:ss'),
       cpuUsage: row.cpuUsage,
       memoryUsage: row.memUsage,
       cpuTemp: row.cpuTemp,
@@ -58,7 +92,6 @@ export class PerformanceService {
     }));
   }
 
-  // 2. 프로세스별 메모리 이력 조회
   async getProcessHistory(
     startDate: string,
     endDate: string,
@@ -69,21 +102,20 @@ export class PerformanceService {
       where: {
         eqpid: eqpId,
         servTs: {
-          gte: this.parseDate(startDate), // [수정] UTC 강제 변환 유틸 사용
-          lte: this.parseDate(endDate),   // [수정] UTC 강제 변환 유틸 사용
+          gte: this.parseDate(startDate), 
+          lte: this.parseDate(endDate),   
         },
       },
       orderBy: { servTs: 'asc' },
     });
 
     return results.map((row: any) => ({
-      timestamp: row.servTs,
+      timestamp: dayjs.utc(row.servTs).format('YYYY-MM-DD HH:mm:ss'),
       processName: row.processName,
       memoryUsageMB: row.memoryUsageMb ?? row.memoryUsageMB ?? 0,
     }));
   }
 
-  // 3. ITM Agent 프로세스 트렌드 조회
   async getItmAgentTrend(
     site: string,
     sdwt: string,
@@ -92,8 +124,8 @@ export class PerformanceService {
     eqpid?: string,
     interval: number = 60,
   ) {
-    const start = this.parseDate(startDate); // [수정] UTC 강제 변환 유틸 사용
-    const end = this.parseDate(endDate);     // [수정] UTC 강제 변환 유틸 사용
+    const start = this.parseDate(startDate); 
+    const end = this.parseDate(endDate);     
 
     let filterSql = Prisma.sql`
       WHERE p.process_name LIKE '%Agent%' 
@@ -125,6 +157,9 @@ export class PerformanceService {
       ORDER BY 1 ASC
     `;
 
-    return results;
+    return (results as any[]).map(r => ({
+      ...r,
+      timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
+    }));
   }
 }
