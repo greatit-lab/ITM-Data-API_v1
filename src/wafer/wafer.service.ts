@@ -617,7 +617,7 @@ export class WaferService {
     ]);
     const total = uniqueGroups.length;
 
-    let mapLookup = new Set<string>();
+    const mapLookup = new Set<string>();
 
     if (items.length > 0) {
       const eqpIds = [...new Set(items.map(i => i.eqpid))];
@@ -666,7 +666,7 @@ export class WaferService {
     };
   }
 
-  // [수정] PDF 변환 실패의 "진짜 원인"을 프론트엔드 콘솔로 던져주도록 에러 핸들링 수정
+  // [완전체] Poppler 옵션 충돌 제거 및 동적 파일명 추적 로직 적용
   async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
@@ -675,7 +675,8 @@ export class WaferService {
     }
 
     let tempPdfPath: string | null = null;
-    let expectedOutput: string | null = null;
+    let expectedOutputBase: string | null = null;
+    let actualOutputFound: string | null = null;
 
     try {
       const pdfCheckResult = await this.checkPdf({ eqpId, lotId, waferId, dateTime });
@@ -684,11 +685,12 @@ export class WaferService {
         throw new NotFoundException('PDF file URI not found in database.');
       }
 
-      const downloadUrl = pdfCheckResult.url;
-      
-      // [의심 1] DB에 저장된 경로가 http가 아닐 경우 (예: C:\파일... 등)
-      if (!downloadUrl.startsWith('http')) {
-        throw new Error(`DB에 저장된 파일 경로가 HTTP 형식이 아닙니다. (현재경로: ${downloadUrl})`);
+      const dbUrl = pdfCheckResult.url;
+      let finalDownloadUrl = dbUrl;
+
+      if (!dbUrl.startsWith('http')) {
+        const baseUrl = 'http://localhost:8082'; // <-- 실제 파일서버 IP 유지
+        finalDownloadUrl = `${baseUrl.replace(/\/$/, '')}/${dbUrl.replace(/^\//, '')}`;
       }
 
       const cleanDateStr = String(dateTime).replace(/\+/g, '').replace(/[- :TZ]/g, '').substring(2, 8);
@@ -701,70 +703,103 @@ export class WaferService {
 
       const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
       tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
-      expectedOutput = path.join(os.tmpdir(), `temp_img_${tempId}.png`);
-
-      const writer = fs.createWriteStream(tempPdfPath);
       
-      // [의심 2] Axios 다운로드 중 에러 발생
+      // 이번엔 확장자 없이 prefix만 지정합니다.
+      expectedOutputBase = path.join(os.tmpdir(), `temp_img_${tempId}`);
+
       const response = await axios({
-        url: encodeURI(downloadUrl),
+        url: encodeURI(finalDownloadUrl),
         method: 'GET',
-        responseType: 'stream',
+        responseType: 'arraybuffer',
         proxy: false,
         timeout: 10000,
       }).catch(err => {
-         throw new Error(`Axios PDF 다운로드 실패: ${err.message}`);
+         throw new Error(`Axios 다운로드 실패 (${finalDownloadUrl}): ${err.message}`);
       });
 
-      (response.data as Readable).pipe(writer);
+      const fileBuffer = Buffer.from(response.data);
+      this.logger.log(`[PDF Download] 용량: ${fileBuffer.length} Bytes, 타겟: ${finalDownloadUrl}`);
 
-      await new Promise<void>((resolve, reject) => {
-        writer.on('finish', () => resolve());
-        writer.on('error', reject);
-      });
+      if (fileBuffer.length === 0) throw new Error(`다운로드된 파일이 0 Byte 입니다.`);
+      if (fileBuffer.subarray(0, 4).toString('utf8') !== '%PDF') throw new Error(`파일이 PDF 형식이 아닙니다.`);
+
+      // 동기식 파일 저장
+      fs.writeFileSync(tempPdfPath, fileBuffer);
 
       const popplerBinPath = process.env.POPPLER_BIN_PATH;
-      // [의심 3] Poppler 환경 변수 누락
-      if (!popplerBinPath) throw new Error('서버 환경변수에 POPPLER_BIN_PATH가 설정되지 않았습니다.');
+      if (!popplerBinPath) throw new Error('POPPLER_BIN_PATH 환경변수 누락');
       
       const pdftocairoExe = path.join(popplerBinPath, 'pdftocairo.exe');
       let targetPage = Number(pointNumber) || 1;
-      const outputPrefix = expectedOutput.replace('.png', '');
 
-      // [의심 4] Poppler 변환 실행 중 에러
+      const execOptions = {
+        timeout: 60000,
+        cwd: popplerBinPath,
+        env: { ...process.env, PATH: `${popplerBinPath};${process.env.PATH}` }
+      };
+
+      // Poppler 실행 헬퍼 함수
+      const runPoppler = async (page: number) => {
+         try {
+           // [핵심 변경 1] 버그를 일으키는 '-singlefile' 옵션 삭제!
+           await execFileAsync(pdftocairoExe, [ '-png', '-f', String(page), '-l', String(page), tempPdfPath!, expectedOutputBase! ], execOptions);
+         } catch (err: any) {
+           const stderrMsg = err.stderr ? err.stderr.toString().trim() : '';
+           // OS 자체 에러 코드(예: 3221225781)가 뜬다면 C++ 재배포 패키지 누락 등 시스템 문제입니다.
+           const crashCode = err.code || 'N/A';
+           throw new Error(`[Code: ${crashCode}] [stderr: ${stderrMsg}]`);
+         }
+      };
+
       try {
-        await execFileAsync(pdftocairoExe, [ '-png', '-f', String(targetPage), '-l', String(targetPage), '-singlefile', tempPdfPath, outputPrefix ], { timeout: 60000 });
+        await runPoppler(targetPage);
       } catch (err: any) {
-         throw new Error(`Poppler 변환 실패: ${err.message}`);
+         this.logger.warn(`Poppler 변환 실패 (Page ${targetPage}). 1페이지로 복구 시도. 원인: ${err.message}`);
+         try {
+             await runPoppler(1);
+         } catch (fallbackErr: any) {
+             throw new Error(`Poppler 완전 실패: ${fallbackErr.message}`);
+         }
       }
 
-      if (!fs.existsSync(expectedOutput)) {
-        throw new Error('Poppler 실행은 끝났으나 PNG 파일이 생성되지 않았습니다.');
-      }
-
-      fs.copyFileSync(expectedOutput, cacheFilePath);
-      const imageBuffer = fs.readFileSync(expectedOutput);
+      // [핵심 변경 2] Poppler가 마음대로 붙인 꼬리표(temp_img_123-02.png 등)를 폴더에서 직접 뒤져서 찾아냅니다.
+      const tempDir = os.tmpdir();
+      const filesInTemp = fs.readdirSync(tempDir);
+      const basePrefix = path.basename(expectedOutputBase);
       
-      try { fs.unlinkSync(expectedOutput); if (fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); } catch {}
+      const generatedFileName = filesInTemp.find(f => f.startsWith(basePrefix) && f.endsWith('.png'));
+      
+      if (!generatedFileName) {
+        throw new Error(`Poppler 실행은 정상 종료되었으나, PNG 파일을 찾을 수 없습니다. (Prefix: ${basePrefix})`);
+      }
+
+      actualOutputFound = path.join(tempDir, generatedFileName);
+
+      fs.copyFileSync(actualOutputFound, cacheFilePath);
+      const imageBuffer = fs.readFileSync(actualOutputFound);
+      
+      try { 
+        if (actualOutputFound && fs.existsSync(actualOutputFound)) fs.unlinkSync(actualOutputFound); 
+        if (tempPdfPath && fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); 
+      } catch {}
 
       return imageBuffer.toString('base64');
 
     } catch (e) {
       try { 
         if (tempPdfPath && fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); 
-        if (expectedOutput && fs.existsSync(expectedOutput)) fs.unlinkSync(expectedOutput);
+        if (actualOutputFound && fs.existsSync(actualOutputFound)) fs.unlinkSync(actualOutputFound);
       } catch {}
       
       if (e instanceof NotFoundException) throw e;
       
       const error = e as Error;
       this.logger.error(`[PDF Processing Failed] ${error.message}`);
-      // [핵심 해결] 가려졌던 에러 메시지를 그대로 프론트엔드로 던짐!
       throw new InternalServerErrorException(`PDF 처리 오류: ${error.message}`);
     }
   }
 
-  // [수정] 타임존 개입을 완벽히 배제하고, 입력된 시간 문자열 그대로 DB와 매칭
+  // [수정] Date 객체가 문자열로 변환되면서 깨지는 버그를 원천 차단
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
@@ -774,10 +809,23 @@ export class WaferService {
     if (!eqpId || !targetTimeVal) return { exists: false, url: null };
 
     try {
-      // URL 인코딩된 '+' 기호만 공백으로 복구 (예: 2026-02-25 14:33:22)
-      const cleanDateStr = String(targetTimeVal).replace(/\+/g, ' ').replace('T', ' ').replace('Z', '');
+      // 1. 값의 타입에 따라 안전하게 Date 객체로 추출
+      let targetDate: Date;
+      if (targetTimeVal instanceof Date) {
+        targetDate = targetTimeVal;
+      } else {
+        // 문자열인 경우에만 URL 인코딩(+) 기호를 공백으로 복원 후 파싱
+        const strVal = String(targetTimeVal).replace(/\+/g, ' ').replace('T', ' ').replace('Z', '');
+        targetDate = new Date(strVal);
+      }
 
-      // 타임존 변환 없이, DB의 datetime과 입력된 시간을 '초(second)' 단위까지만 정확히 텍스트로 잘라서 비교
+      // 날짜가 유효하지 않으면 조기 종료
+      if (isNaN(targetDate.getTime())) return { exists: false, url: null };
+
+      // 2. DB(PostgreSQL)가 완벽하게 인식하는 순수 YYYY-MM-DD HH:mm:ss 문자열로 강제 변환
+      const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss');
+
+      // 3. 타임존 꼬임 없이 초(second) 단위까지만 텍스트로 정확히 비교
       const results = await this.prisma.$queryRawUnsafe<any[]>(
         `SELECT file_uri, datetime FROM public.plg_wf_map 
          WHERE TRIM(eqpid) = TRIM($1)
@@ -807,10 +855,12 @@ export class WaferService {
         });
       }
 
+      // 1순위: 파일명(Lot, Wafer) 조건 매칭 성공 시 반환
       if (candidates.length > 0 && getUri(candidates[0])) {
         return { exists: true, url: getUri(candidates[0]) };
       }
 
+      // 2순위: 깐깐한 조건에서 떨어졌어도, 해당 시간에 DB에 Map이 있으면 반환 (404 방어)
       if (results.length > 0 && getUri(results[0])) {
         return { exists: true, url: getUri(results[0]) };
       }
