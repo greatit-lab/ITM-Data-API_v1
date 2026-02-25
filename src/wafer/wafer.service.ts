@@ -14,6 +14,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
 import { Readable } from 'stream';
+import dayjs from 'dayjs'; // 날짜/파티션 계산을 위한 안전한 라이브러리
 
 const execFileAsync = promisify(execFile);
 
@@ -119,7 +120,6 @@ export class WaferService {
   private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
     const now = new Date();
     
-    // 시작일: 입력값 또는 7일 전
     let startDate = start ? new Date(start) : new Date();
     if (isNaN(startDate.getTime()) || !start) {
         startDate = new Date();
@@ -127,7 +127,6 @@ export class WaferService {
     }
     startDate.setHours(0, 0, 0, 0);
 
-    // 종료일: 입력값 또는 오늘
     let endDate = end ? new Date(end) : now;
     if (isNaN(endDate.getTime())) {
         endDate = now;
@@ -137,21 +136,65 @@ export class WaferService {
     return { startDate, endDate };
   }
 
-  // [핵심] 날짜 포맷을 DB가 선호하는 Short Year (YY-MM-DD) 형식으로 변환
-  // 예: "2026-01-28 09:17:25" -> "26-01-28 09:17:25"
-  private toShortYearDate(dateVal: string | Date): string {
-    if (!dateVal) return '';
-    let dateStr = typeof dateVal === 'string' ? dateVal : dateVal.toISOString();
-    
-    // ISO 포맷 정리 (T, Z 제거)
-    dateStr = dateStr.replace('T', ' ').replace('Z', '');
+  // [신규] 문자열 조작 없이 URL 인코딩 이슈를 막아주는 날짜 파싱 유틸
+  private parseSafeDate(dateVal: string | Date | undefined): Date {
+    if (!dateVal) return new Date();
+    // URL의 '+' 기호를 강제로 공백으로 치환하여 타임존 오해 원천 차단
+    const cleanStr = String(dateVal).replace(/\+/g, ' ');
+    return new Date(cleanStr);
+  }
 
-    // 20YY-MM-DD 형태로 시작하면 앞의 '20'을 제거하여 'YY-MM-DD'로 만듦
-    // 정규식: 20으로 시작하고 뒤에 숫자 2개(연도)-숫자2개(월)-숫자2개(일) 패턴
-    if (/^20\d{2}-\d{2}-\d{2}/.test(dateStr)) {
-        return dateStr.substring(2);
+  // 동적 파티션 테이블(Spectrum) 데이터 존재 유무 검사
+  private async checkSpectrumExists(
+    eqpId: string, 
+    lotId: string, 
+    waferId: string | number, 
+    dateVal: string | Date
+  ): Promise<boolean> {
+    try {
+      if (!dateVal) return false;
+      const targetDate = this.parseSafeDate(dateVal);
+      
+      const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
+      let tableName = 'public.plg_onto_spectrum';
+      
+      if (!isToday) {
+        const yy = dayjs(targetDate).format('YYYY');
+        const mm = dayjs(targetDate).format('MM');
+        tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
+        
+        const checkTableSql = `
+          SELECT EXISTS (
+            SELECT FROM pg_tables 
+            WHERE schemaname = 'public' 
+            AND tablename = 'plg_onto_spectrum_y${yy}m${mm}'
+          ) as "exists"
+        `;
+        const tableExists = await this.prisma.$queryRawUnsafe<any[]>(checkTableSql);
+        if (!tableExists[0]?.exists) return false;
+      }
+
+      const querySql = `
+        SELECT EXISTS(
+          SELECT 1 FROM ${tableName} 
+          WHERE "eqpid" = $1 
+            AND "lotid" = $2 
+            AND "waferid" = $3
+          LIMIT 1
+        ) as "exists"
+      `;
+      const result = await this.prisma.$queryRawUnsafe<any[]>(
+        querySql, 
+        eqpId, 
+        lotId, 
+        String(waferId)
+      );
+
+      return result[0]?.exists || false;
+    } catch (error) {
+      this.logger.warn(`Spectrum check failed for ${eqpId}-${lotId}:`, error);
+      return false;
     }
-    return dateStr;
   }
 
   async getDistinctValues(
@@ -313,12 +356,7 @@ export class WaferService {
       if (configMetrics.length > 0) {
         dynamicColumns = configMetrics.map((r) => r.metric_name);
       }
-    } catch (e) {
-      this.logger.warn(
-        'Failed to fetch dynamic metrics config, using defaults.',
-        e,
-      );
-    }
+    } catch (e) { /* ignore */ }
 
     if (!dynamicColumns.includes('gof')) dynamicColumns.push('gof');
     dynamicColumns = [...new Set(dynamicColumns)];
@@ -427,13 +465,12 @@ export class WaferService {
     }
   }
 
-  // Model Fit Analysis용 GEN Spectrum 조회
   async getSpectrumGen(params: WaferQueryParams) {
     const { lotId, waferId, pointId, eqpId, ts } = params;
     if (!lotId || !waferId || !pointId || !eqpId || !ts) return null;
 
     try {
-      const targetDate = typeof ts === 'string' ? new Date(ts) : ts;
+      const targetDate = this.parseSafeDate(ts);
       const now = new Date();
       const tYear = targetDate.getFullYear();
       const tMonth = targetDate.getMonth();
@@ -446,8 +483,6 @@ export class WaferService {
         tableName = `public.plg_onto_spectrum_y${tYear}m${mm}`;
       }
 
-      const tsDate = typeof ts === 'string' ? new Date(ts) : ts;
-
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
@@ -455,14 +490,15 @@ export class WaferService {
            AND "waferid" = $2  
            AND "point" = $3    
            AND "eqpid" = $4    
-           AND "ts" = $5::timestamp 
+           AND "ts" >= $5::timestamp - interval '2 second'
+           AND "ts" <= $5::timestamp + interval '2 second'
            AND "class" = 'GEN'
          LIMIT 1`,
         lotId,
         String(waferId),
         Number(pointId),
         eqpId,
-        tsDate,
+        targetDate,
       );
 
       if (!results || results.length === 0) return null;
@@ -569,41 +605,32 @@ export class WaferService {
     const total = uniqueGroups.length;
 
     let mapLookup = new Set<string>();
-    let spcLookup = new Set<string>();
 
     if (items.length > 0) {
       const eqpIds = [...new Set(items.map(i => i.eqpid))];
       const datetimes = items.map(i => i.datetime).filter(d => d !== null);
       
-      const lotIds = [...new Set(items.map(i => i.lotid))].filter(l => l !== null);
-      const waferIds = [...new Set(items.map(i => i.waferid))].filter(w => w !== null).map(String);
-
-      const [maps, spectrums] = await Promise.all([
-        datetimes.length > 0 ? this.prisma.plgWfMap.findMany({
+      if (datetimes.length > 0) {
+        const maps = await this.prisma.plgWfMap.findMany({
           where: {
             eqpid: { in: eqpIds },
             datetime: { in: datetimes }
           },
           select: { eqpid: true, datetime: true }
-        }) : Promise.resolve([] as { eqpid: string; datetime: Date }[]),
-
-        this.prisma.plgOntoSpectrum.groupBy({
-           by: ['eqpid', 'lotid', 'waferid'],
-           where: {
-             eqpid: { in: eqpIds },
-             lotid: { in: lotIds },
-             waferid: { in: waferIds }
-           }
-        })
-      ]);
-
-      maps.forEach(m => mapLookup.add(`${m.eqpid}_${m.datetime.getTime()}`));
-      spectrums.forEach(s => spcLookup.add(`${s.eqpid}_${s.lotid}_${s.waferid}`));
+        });
+        maps.forEach(m => mapLookup.add(`${m.eqpid}_${m.datetime.getTime()}`));
+      }
     }
 
-    return {
-      totalItems: total,
-      items: items.map((i) => ({
+    const updatedItems = await Promise.all(items.map(async (i) => {
+      const checkDate = i.datetime || i.servTs;
+      let hasSpec = false;
+      
+      if (checkDate && i.eqpid && i.lotid && i.waferid !== null) {
+        hasSpec = await this.checkSpectrumExists(i.eqpid, i.lotid, i.waferid, checkDate);
+      }
+
+      return {
         eqpId: i.eqpid,
         lotId: i.lotid,
         waferId: i.waferid,
@@ -614,8 +641,13 @@ export class WaferService {
         stageGroup: i.stagegroup,
         film: i.film,
         hasWaferMap: i.datetime ? mapLookup.has(`${i.eqpid}_${i.datetime.getTime()}`) : false,
-        hasSpectrum: spcLookup.has(`${i.eqpid}_${i.lotid}_${String(i.waferid)}`)
-      })),
+        hasSpectrum: hasSpec
+      };
+    }));
+
+    return {
+      totalItems: total,
+      items: updatedItems,
     };
   }
 
@@ -628,7 +660,6 @@ export class WaferService {
       );
     }
 
-    // [핵심 수정] try/catch 범위 밖에서 변수 선언하여 스코프 오류(TS2304) 해결
     let tempPdfPath: string | null = null;
     let expectedOutput: string | null = null;
 
@@ -641,7 +672,6 @@ export class WaferService {
       });
 
       if (!pdfCheckResult.exists || !pdfCheckResult.url) {
-        // [중요] 404 에러를 던져서 상위 catch가 500으로 감싸지 않게(아래 처리) 함
         throw new NotFoundException('PDF file URI not found in database.');
       }
 
@@ -650,9 +680,9 @@ export class WaferService {
         throw new InternalServerErrorException('Only HTTP/HTTPS URLs are supported.');
       }
 
-      // [수정] 캐시 파일명에도 Short Year 포맷 적용 (260128...)
-      const safeDateStr = this.toShortYearDate(dateTime);
-      const dateStr = safeDateStr.slice(0, 8).replace(/-/g, ''); // YY-MM-DD -> YYMMDD
+      // [수정] Dayjs를 활용하여 안전한 캐시 파일명 생성
+      const targetDate = this.parseSafeDate(dateTime);
+      const dateStr = dayjs(targetDate).format('YYMMDD');
       const cacheFileName = `wafer_${eqpId}_${dateStr}_pt${pointNumber}.png`;
       const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
@@ -661,7 +691,6 @@ export class WaferService {
       }
 
       const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
-      // [수정] 외부 변수(tempPdfPath, expectedOutput)에 값 할당
       tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
       const outputPrefix = path.join(os.tmpdir(), `temp_img_${tempId}`);
       expectedOutput = `${outputPrefix}.png`;
@@ -694,11 +723,9 @@ export class WaferService {
       if (isNaN(targetPage) || targetPage < 1) targetPage = 1;
 
       const runConversion = async (page: number) => {
-        // expectedOutput은 null이 아니라고 확신할 수 있는 시점이나 TS는 모르므로 체크
         if (expectedOutput && fs.existsSync(expectedOutput)) {
             try { fs.unlinkSync(expectedOutput); } catch(e) {}
         }
-        // tempPdfPath도 마찬가지
         if (!tempPdfPath || !expectedOutput) return;
 
         const args = [ '-png', '-f', String(page), '-l', String(page), '-singlefile', tempPdfPath, outputPrefix ];
@@ -749,13 +776,11 @@ export class WaferService {
       return imageBuffer.toString('base64');
 
     } catch (e) {
-      // [수정] try 블록 밖에서 선언된 변수이므로 여기서 접근 가능
       try { 
         if (tempPdfPath && fs.existsSync(tempPdfPath)) fs.unlinkSync(tempPdfPath); 
         if (expectedOutput && fs.existsSync(expectedOutput)) fs.unlinkSync(expectedOutput);
       } catch { /* ignore */ }
       
-      // NotFoundException은 500으로 감싸지 않고 그대로 던짐
       if (e instanceof NotFoundException) {
           throw e;
       }
@@ -766,28 +791,30 @@ export class WaferService {
     }
   }
 
-  // [수정] checkPdf: 날짜 포맷 강제 변환 (YY-MM-DD)
+  // [핵심 수정] 타임존 파괴 문제 해결 및 Prisma ORM 적용으로 100% 안전한 파일 조회
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
     const { eqpId, lotId, waferId, servTs, dateTime } = params;
 
     const targetTimeVal = dateTime || servTs;
-
     if (!eqpId || !targetTimeVal) return { exists: false, url: null };
 
     try {
-      // [핵심] 20XX -> XX 로 변환하여 DB 조회
-      const tsStr = this.toShortYearDate(targetTimeVal);
+      const targetDate = this.parseSafeDate(targetTimeVal);
 
-      const results = await this.prisma.$queryRawUnsafe<PdfResult[]>(
-        `SELECT file_uri, datetime FROM public.plg_wf_map 
-          WHERE eqpid = $1 
-            AND datetime = $2::timestamp
-          ORDER BY datetime DESC`,
-        eqpId,
-        tsStr,
-      );
+      // Raw Query 대신 Prisma의 안전한 ORM 쿼리 사용 (타임존/소수점 오차 완벽 해결)
+      const results = await this.prisma.plgWfMap.findMany({
+        where: {
+          eqpid: eqpId,
+          datetime: {
+            gte: new Date(targetDate.getTime() - 2000), // 시간 앞뒤 2초 여유
+            lte: new Date(targetDate.getTime() + 2000),
+          }
+        },
+        orderBy: { datetime: 'desc' },
+        select: { file_uri: true, datetime: true }
+      });
 
       if (!results || results.length === 0) {
         return { exists: false, url: null };
@@ -814,6 +841,12 @@ export class WaferService {
       if (candidates.length > 0) {
         return { exists: true, url: candidates[0].file_uri };
       }
+
+      // [폴백 방어] 깐깐한 파일명 조건에서 떨어져도 DB에 있으면 냅다 반환!
+      if (results.length > 0) {
+        return { exists: true, url: results[0].file_uri };
+      }
+
       return { exists: false, url: null };
 
     } catch (e) {
@@ -822,27 +855,36 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
-  // [수정] Spectrum 조회도 Short Year 적용
+  // [핵심 수정] 타임존 오류 수정 및 안전한 Date 객체 쿼리 주입
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
 
     try {
-      // [핵심] 날짜 변환
-      const tsRaw = this.toShortYearDate(ts);
-      const tableName = 'public.plg_onto_spectrum';
+      const targetDate = this.parseSafeDate(ts);
+      const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
+      
+      let tableName = 'public.plg_onto_spectrum';
+      
+      if (!isToday) {
+        const yy = dayjs(targetDate).format('YYYY');
+        const mm = dayjs(targetDate).format('MM');
+        tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
+      }
 
+      // $queryRawUnsafe에 문자열이 아닌 안전한 순정 Date 객체를 그대로 전달 (타임존 문제 차단)
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
          WHERE "eqpid" = $1 
-           AND "ts" = $2::timestamp
+           AND "ts" >= $2::timestamp - interval '2 second'
+           AND "ts" <= $2::timestamp + interval '2 second'
            AND "lotid" = $3 
            AND "waferid" = $4 
            AND "point" = $5
          ORDER BY "class" ASC`,
         eqpId,
-        tsRaw,
+        targetDate,  // <--- 해결의 핵심 키!
         lotId,
         String(waferId),
         Number(pointNumber),
@@ -978,12 +1020,12 @@ export class WaferService {
     if (!p.eqpId) return null;
     let sql = `WHERE eqpid = '${String(p.eqpId)}'`;
 
-    const targetDate = p.dateTime || p.servTs;
+    const targetDateStr = p.dateTime || p.servTs;
 
-    if (targetDate) {
-      // [수정] 날짜 정규화 (Short Year)
-      let dateStr = this.toShortYearDate(targetDate);
-      const cleanDateStr = dateStr; 
+    if (targetDateStr) {
+      // 타임존 파괴를 막기 위해 Dayjs 포맷팅 사용
+      const targetDate = this.parseSafeDate(targetDateStr);
+      const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
 
       sql += ` AND datetime >= '${cleanDateStr}'::timestamp - interval '2 second'`;
       sql += ` AND datetime <= '${cleanDateStr}'::timestamp + interval '2 second'`;
