@@ -6,38 +6,38 @@ import { PerformanceService } from './performance.service';
 export class PerformanceController {
   constructor(private readonly performanceService: PerformanceService) {}
 
-  // 1. 장비 성능 이력
   @Get('history')
   async getHistory(
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
     @Query('eqpids') eqpids?: string,
-    @Query('interval') interval?: number, // [참고] 기존에 있었거나 필요하다면 추가
+    @Query('interval') interval?: string,
   ) {
+    const intervalSec = interval ? parseInt(interval, 10) : 300; // [수정] 5분(300초)으로 변경
     return this.performanceService.getPerformanceHistory(
       startDate,
       endDate,
       eqpids,
+      intervalSec, 
     );
   }
 
-  // 2. 프로세스 이력
   @Get('process-history')
   async getProcessHistory(
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
     @Query('eqpId') eqpId: string,
-    @Query('interval') interval?: number,
+    @Query('interval') interval?: string,
   ) {
+    const intervalSec = interval ? parseInt(interval, 10) : 60;
     return this.performanceService.getProcessHistory(
       startDate,
       endDate,
       eqpId,
-      Number(interval),
+      intervalSec,
     );
   }
 
-  // 3. ITM Agent 트렌드
   @Get('itm-agent-trend')
   async getItmAgentTrend(
     @Query('site') site: string,
@@ -45,10 +45,9 @@ export class PerformanceController {
     @Query('startDate') startDate: string,
     @Query('endDate') endDate: string,
     @Query('eqpid') eqpid?: string,
-    @Query('interval') interval?: number, // [추가] Interval 파라미터 수신
+    @Query('interval') interval?: string, 
   ) {
-    // interval이 없을 경우 기본값 60초
-    const intervalSec = interval ? Number(interval) : 60;
+    const intervalSec = interval ? parseInt(interval, 10) : 60;
     return this.performanceService.getItmAgentTrend(
       site,
       sdwt,
