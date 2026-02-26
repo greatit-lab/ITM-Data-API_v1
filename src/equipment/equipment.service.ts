@@ -71,20 +71,16 @@ export class EquipmentService {
       orderBy: { eqpid: 'asc' },
     });
 
-    const now = new Date().getTime();
-    const ONLINE_THRESHOLD_MS = 5 * 60 * 1000;
-
     return results.map((eqp) => {
       const info: any = eqp.agentInfo || {};
       const status: any = eqp.agentStatus || {};
       const itm: any = eqp.itmInfo || {};
 
+      // [수정된 부분] AgentStatus의 status 컬럼 값을 직접 참조하여 Online 여부 판단
+      // 기존 시간 차이 기반 계산법을 제거하고 DB 값 기준으로 변경
       let isOnline = false;
-      if (status.lastPerfUpdate) {
-        const lastContactTime = new Date(status.lastPerfUpdate).getTime();
-        if (now - lastContactTime < ONLINE_THRESHOLD_MS) {
-          isOnline = true;
-        }
+      if (status.status && status.status.toUpperCase() === 'ONLINE') {
+        isOnline = true;
       }
 
       return {
