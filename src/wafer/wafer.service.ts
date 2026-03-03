@@ -13,7 +13,6 @@ import * as os from 'os';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
-import { Readable } from 'stream';
 import dayjs from 'dayjs'; // 날짜/파티션 계산을 위한 안전한 라이브러리
 
 const execFileAsync = promisify(execFile);
@@ -136,19 +135,14 @@ export class WaferService {
     return { startDate, endDate };
   }
 
-  // [수정 완료: 순수 Date 객체 파괴 방어 로직 추가]
   private parseSafeDate(dateVal: string | Date | undefined): Date {
     if (!dateVal) return new Date();
-    
-    // [핵심] 이미 DB에서 꺼낸 Date 객체라면, 건드리지 않고 그대로 반환!
     if (dateVal instanceof Date) return dateVal;
     
-    // URL 등에서 넘어온 '문자열'일 경우에만 + 기호를 치환
     const cleanStr = String(dateVal).replace(/\+/g, ' ');
     return new Date(cleanStr);
   }
 
-  // [수정 완료: 안전장치가 포함된 스펙트럼 유무 검사]
   private async checkSpectrumExists(
     eqpId: string, 
     lotId: string, 
@@ -158,20 +152,16 @@ export class WaferService {
     try {
       if (!dateVal) return false;
       const targetDate = this.parseSafeDate(dateVal); 
-      
-      // 혹시라도 날짜가 유효하지 않으면 중단 (에러 방어)
       if (isNaN(targetDate.getTime())) return false;
 
       const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
       let tableName = 'public.plg_onto_spectrum';
       
-      // 과거 날짜일 경우 동적 월별 테이블명 조립
       if (!isToday) {
         const yy = dayjs(targetDate).format('YYYY');
         const mm = dayjs(targetDate).format('MM');
         tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
         
-        // 과거 테이블 존재 유무 1차 검증
         const checkTableSql = `
           SELECT EXISTS (
             SELECT FROM pg_tables 
@@ -183,7 +173,6 @@ export class WaferService {
         if (!tableExists[0]?.exists) return false;
       }
 
-      // 데이터 유무 초고속 확인
       const querySql = `
         SELECT EXISTS(
           SELECT 1 FROM ${tableName} 
@@ -200,7 +189,6 @@ export class WaferService {
         String(waferId)
       );
 
-      // boolean 처리 완벽 대응
       return result[0]?.exists === true || result[0]?.exists === 'true';
       
     } catch (error) {
@@ -362,9 +350,7 @@ export class WaferService {
     try {
       const configMetrics = await this.prisma.$queryRaw<
         { metric_name: string }[]
-      >`
-        SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'
-      `;
+      >`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`;
       if (configMetrics.length > 0) {
         dynamicColumns = configMetrics.map((r) => r.metric_name);
       }
@@ -536,7 +522,6 @@ export class WaferService {
     }
   }
 
-  // FlatData 목록 조회 시 checkSpectrumExists 연동
   async getFlatData(params: WaferQueryParams) {
     const {
       eqpId,
@@ -635,13 +620,11 @@ export class WaferService {
       }
     }
 
-    // Data Info 목록을 구성할 때 스펙트럼 유무를 개별 날짜 기준으로 동적 검사
     const updatedItems = await Promise.all(items.map(async (i) => {
       const checkDate = i.datetime || i.servTs;
       let hasSpec = false;
       
       if (checkDate && i.eqpid && i.lotid && i.waferid !== null) {
-        // 방금 위에서 만든 동적 파티션 확인 함수 호출!
         hasSpec = await this.checkSpectrumExists(i.eqpid, i.lotid, i.waferid, checkDate);
       }
 
@@ -656,7 +639,7 @@ export class WaferService {
         stageGroup: i.stagegroup,
         film: i.film,
         hasWaferMap: i.datetime ? mapLookup.has(`${i.eqpid}_${i.datetime.getTime()}`) : false,
-        hasSpectrum: hasSpec,  // 검사 결과 매핑
+        hasSpectrum: hasSpec,
       };
     }));
 
@@ -666,7 +649,6 @@ export class WaferService {
     };
   }
 
-  // [완전체] Poppler 옵션 충돌 제거 및 동적 파일명 추적 로직 적용
   async getPdfImage(params: WaferQueryParams): Promise<string> {
     const { eqpId, lotId, waferId, dateTime, pointNumber } = params;
 
@@ -689,12 +671,18 @@ export class WaferService {
       let finalDownloadUrl = dbUrl;
 
       if (!dbUrl.startsWith('http')) {
-        const baseUrl = 'http://localhost:8082'; // <-- 실제 파일서버 IP 유지
+        const baseUrl = process.env.FILE_SERVER_URL || 'http://localhost:8082';
         finalDownloadUrl = `${baseUrl.replace(/\/$/, '')}/${dbUrl.replace(/^\//, '')}`;
       }
 
-      const cleanDateStr = String(dateTime).replace(/\+/g, '').replace(/[- :TZ]/g, '').substring(2, 8);
-      const cacheFileName = `wafer_${eqpId}_${cleanDateStr}_pt${pointNumber}.png`;
+      // [핵심 변경] 완전히 고유한 캐시 파일명 생성 로직 적용
+      // YYMMDD만 자르지 않고 전체 시분초와 Lot, Wafer 정보를 결합하여 완벽한 고유키를 생성합니다.
+      const cleanDateStr = String(dateTime).replace(/\+/g, '').replace(/[- :T.Z]/g, ''); 
+      const safeLotId = (lotId || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
+      const safeWaferId = waferId !== undefined ? String(waferId) : 'x';
+      
+      // 이름 앞에 map_ 접두사를 붙여 기존 wafer_ 로 시작하는 손상된 쓰레기 캐시 파일들을 모두 피합니다.
+      const cacheFileName = `map_${eqpId}_${safeLotId}_w${safeWaferId}_${cleanDateStr}_pt${pointNumber}.png`;
       const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
       if (fs.existsSync(cacheFilePath) && fs.statSync(cacheFilePath).size > 0) {
@@ -703,8 +691,6 @@ export class WaferService {
 
       const tempId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
       tempPdfPath = path.join(os.tmpdir(), `temp_wafer_${tempId}.pdf`);
-      
-      // 이번엔 확장자 없이 prefix만 지정합니다.
       expectedOutputBase = path.join(os.tmpdir(), `temp_img_${tempId}`);
 
       const response = await axios({
@@ -718,34 +704,43 @@ export class WaferService {
       });
 
       const fileBuffer = Buffer.from(response.data);
-      this.logger.log(`[PDF Download] 용량: ${fileBuffer.length} Bytes, 타겟: ${finalDownloadUrl}`);
-
       if (fileBuffer.length === 0) throw new Error(`다운로드된 파일이 0 Byte 입니다.`);
       if (fileBuffer.subarray(0, 4).toString('utf8') !== '%PDF') throw new Error(`파일이 PDF 형식이 아닙니다.`);
 
-      // 동기식 파일 저장
       fs.writeFileSync(tempPdfPath, fileBuffer);
 
       const popplerBinPath = process.env.POPPLER_BIN_PATH;
       if (!popplerBinPath) throw new Error('POPPLER_BIN_PATH 환경변수 누락');
       
-      const pdftocairoExe = path.join(popplerBinPath, 'pdftocairo.exe');
       let targetPage = Number(pointNumber) || 1;
-
       const execOptions = {
         timeout: 60000,
         cwd: popplerBinPath,
         env: { ...process.env, PATH: `${popplerBinPath};${process.env.PATH}` }
       };
 
-      // Poppler 실행 헬퍼 함수
+      const pdfinfoExe = path.join(popplerBinPath, 'pdfinfo.exe');
+      try {
+        const { stdout } = await execFileAsync(pdfinfoExe, [tempPdfPath], execOptions);
+        const pagesMatch = stdout.match(/Pages:\s+(\d+)/);
+        if (pagesMatch) {
+          const totalPages = parseInt(pagesMatch[1], 10);
+          if (targetPage > totalPages) {
+            throw new NotFoundException(`요청한 Point(${targetPage})가 PDF 총 페이지 수(${totalPages})를 초과하여 이미지가 존재하지 않습니다.`);
+          }
+        }
+      } catch (infoErr: any) {
+        if (infoErr instanceof NotFoundException) throw infoErr; 
+        this.logger.warn(`pdfinfo 검증 실패, 강제 추출 시도: ${infoErr.message}`);
+      }
+
+      const pdftocairoExe = path.join(popplerBinPath, 'pdftocairo.exe');
+
       const runPoppler = async (page: number) => {
          try {
-           // [핵심 변경 1] 버그를 일으키는 '-singlefile' 옵션 삭제!
            await execFileAsync(pdftocairoExe, [ '-png', '-f', String(page), '-l', String(page), tempPdfPath!, expectedOutputBase! ], execOptions);
          } catch (err: any) {
            const stderrMsg = err.stderr ? err.stderr.toString().trim() : '';
-           // OS 자체 에러 코드(예: 3221225781)가 뜬다면 C++ 재배포 패키지 누락 등 시스템 문제입니다.
            const crashCode = err.code || 'N/A';
            throw new Error(`[Code: ${crashCode}] [stderr: ${stderrMsg}]`);
          }
@@ -754,23 +749,30 @@ export class WaferService {
       try {
         await runPoppler(targetPage);
       } catch (err: any) {
-         this.logger.warn(`Poppler 변환 실패 (Page ${targetPage}). 1페이지로 복구 시도. 원인: ${err.message}`);
-         try {
-             await runPoppler(1);
-         } catch (fallbackErr: any) {
-             throw new Error(`Poppler 완전 실패: ${fallbackErr.message}`);
-         }
+         this.logger.warn(`Poppler 변환 실패 (Page ${targetPage}): ${err.message}`);
+         throw new NotFoundException(`Point ${targetPage} 맵 이미지를 생성할 수 없습니다.`);
       }
 
-      // [핵심 변경 2] Poppler가 마음대로 붙인 꼬리표(temp_img_123-02.png 등)를 폴더에서 직접 뒤져서 찾아냅니다.
       const tempDir = os.tmpdir();
       const filesInTemp = fs.readdirSync(tempDir);
       const basePrefix = path.basename(expectedOutputBase);
       
-      const generatedFileName = filesInTemp.find(f => f.startsWith(basePrefix) && f.endsWith('.png'));
-      
+      const generatedFileName = filesInTemp.find(f => {
+          if (!f.startsWith(basePrefix) || !f.endsWith('.png')) return false;
+          const match = f.match(/-0*(\d+)\.png$/);
+          if (match) {
+             return parseInt(match[1], 10) === targetPage;
+          }
+          return false;
+      });
+
+      const anyGenerated = filesInTemp.find(f => f.startsWith(basePrefix) && f.endsWith('.png'));
+
       if (!generatedFileName) {
-        throw new Error(`Poppler 실행은 정상 종료되었으나, PNG 파일을 찾을 수 없습니다. (Prefix: ${basePrefix})`);
+        if (anyGenerated) {
+           fs.unlinkSync(path.join(tempDir, anyGenerated)); 
+        }
+        throw new NotFoundException(`Point ${targetPage}에 대한 맵 이미지가 PDF 내에 존재하지 않습니다.`);
       }
 
       actualOutputFound = path.join(tempDir, generatedFileName);
@@ -799,7 +801,6 @@ export class WaferService {
     }
   }
 
-  // [수정] Date 객체가 문자열로 변환되면서 깨지는 버그를 원천 차단
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
@@ -809,23 +810,18 @@ export class WaferService {
     if (!eqpId || !targetTimeVal) return { exists: false, url: null };
 
     try {
-      // 1. 값의 타입에 따라 안전하게 Date 객체로 추출
       let targetDate: Date;
       if (targetTimeVal instanceof Date) {
         targetDate = targetTimeVal;
       } else {
-        // 문자열인 경우에만 URL 인코딩(+) 기호를 공백으로 복원 후 파싱
         const strVal = String(targetTimeVal).replace(/\+/g, ' ').replace('T', ' ').replace('Z', '');
         targetDate = new Date(strVal);
       }
 
-      // 날짜가 유효하지 않으면 조기 종료
       if (isNaN(targetDate.getTime())) return { exists: false, url: null };
 
-      // 2. DB(PostgreSQL)가 완벽하게 인식하는 순수 YYYY-MM-DD HH:mm:ss 문자열로 강제 변환
       const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss');
 
-      // 3. 타임존 꼬임 없이 초(second) 단위까지만 텍스트로 정확히 비교
       const results = await this.prisma.$queryRawUnsafe<any[]>(
         `SELECT file_uri, datetime FROM public.plg_wf_map 
          WHERE TRIM(eqpid) = TRIM($1)
@@ -843,7 +839,7 @@ export class WaferService {
       let candidates = results;
 
       if (lotId) {
-        const targetLot = lotId.trim().replace(/\./g, '_'); // fallback용
+        const targetLot = lotId.trim().replace(/\./g, '_'); 
         candidates = results.filter((r) => {
           const uri = getUri(r);
           if (!uri) return false;
@@ -855,12 +851,10 @@ export class WaferService {
         });
       }
 
-      // 1순위: 파일명(Lot, Wafer) 조건 매칭 성공 시 반환
       if (candidates.length > 0 && getUri(candidates[0])) {
         return { exists: true, url: getUri(candidates[0]) };
       }
 
-      // 2순위: 깐깐한 조건에서 떨어졌어도, 해당 시간에 DB에 Map이 있으면 반환 (404 방어)
       if (results.length > 0 && getUri(results[0])) {
         return { exists: true, url: getUri(results[0]) };
       }
@@ -873,7 +867,6 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
-  // [핵심 수정] 타임존 오류 수정 및 안전한 Date 객체 쿼리 주입
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
@@ -890,7 +883,6 @@ export class WaferService {
         tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
       }
 
-      // $queryRawUnsafe에 문자열이 아닌 안전한 순정 Date 객체를 그대로 전달 (타임존 문제 차단)
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
@@ -902,7 +894,7 @@ export class WaferService {
            AND "point" = $5
          ORDER BY "class" ASC`,
         eqpId,
-        targetDate,  // <--- 해결의 핵심 키!
+        targetDate,  
         lotId,
         String(waferId),
         Number(pointNumber),
@@ -1041,7 +1033,6 @@ export class WaferService {
     const targetDateStr = p.dateTime || p.servTs;
 
     if (targetDateStr) {
-      // 타임존 파괴를 막기 위해 Dayjs 포맷팅 사용
       const targetDate = this.parseSafeDate(targetDateStr);
       const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
 
