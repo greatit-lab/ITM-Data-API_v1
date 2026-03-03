@@ -13,7 +13,7 @@ import * as os from 'os';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import axios from 'axios';
-import dayjs from 'dayjs'; // 날짜/파티션 계산을 위한 안전한 라이브러리
+import dayjs from 'dayjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -143,6 +143,7 @@ export class WaferService {
     return new Date(cleanStr);
   }
 
+  // [핵심 변경] 공백(TRIM) 및 패딩(::integer) 차이 완벽 극복 & 이중 테이블 교차 검증 적용
   private async checkSpectrumExists(
     eqpId: string, 
     lotId: string, 
@@ -150,46 +151,52 @@ export class WaferService {
     dateVal: string | Date
   ): Promise<boolean> {
     try {
+      if (!eqpId || !lotId || waferId === undefined || waferId === null) return false;
+
+      const safeEqp = String(eqpId).trim();
+      const safeLot = String(lotId).trim();
+      const safeWafer = Number(waferId);
+
+      // 1. 운영(Current) 테이블 먼저 확인 (오늘 데이터 또는 스케줄러 지연으로 아직 이관 안된 데이터)
+      const mainSql = `
+        SELECT EXISTS(
+          SELECT 1 FROM public.plg_onto_spectrum
+          WHERE TRIM("eqpid") = $1
+            AND TRIM("lotid") = $2
+            AND "waferid"::integer = $3
+        ) as "exists"
+      `;
+      const mainResult = await this.prisma.$queryRawUnsafe<any[]>(mainSql, safeEqp, safeLot, safeWafer);
+      if (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true') return true;
+
+      // 2. 메인 테이블에 없다면, 과거 월별 파티션 테이블 확인
       if (!dateVal) return false;
       const targetDate = this.parseSafeDate(dateVal); 
       if (isNaN(targetDate.getTime())) return false;
 
-      const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
-      let tableName = 'public.plg_onto_spectrum';
+      const yy = dayjs(targetDate).format('YYYY');
+      const mm = dayjs(targetDate).format('MM');
+      const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
       
-      if (!isToday) {
-        const yy = dayjs(targetDate).format('YYYY');
-        const mm = dayjs(targetDate).format('MM');
-        tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
-        
-        const checkTableSql = `
-          SELECT EXISTS (
-            SELECT FROM pg_tables 
-            WHERE schemaname = 'public' 
-            AND tablename = 'plg_onto_spectrum_y${yy}m${mm}'
-          ) as "exists"
-        `;
-        const tableExists = await this.prisma.$queryRawUnsafe<any[]>(checkTableSql);
-        if (!tableExists[0]?.exists) return false;
-      }
-
-      const querySql = `
-        SELECT EXISTS(
-          SELECT 1 FROM ${tableName} 
-          WHERE "eqpid" = $1 
-            AND "lotid" = $2 
-            AND "waferid" = $3
-          LIMIT 1
-        ) as "exists"
-      `;
-      const result = await this.prisma.$queryRawUnsafe<any[]>(
-        querySql, 
-        eqpId, 
-        lotId, 
-        String(waferId)
+      const tableExists = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
+        partTable
       );
 
-      return result[0]?.exists === true || result[0]?.exists === 'true';
+      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
+        const partSql = `
+          SELECT EXISTS(
+            SELECT 1 FROM public.${partTable}
+            WHERE TRIM("eqpid") = $1
+              AND TRIM("lotid") = $2
+              AND "waferid"::integer = $3
+          ) as "exists"
+        `;
+        const partResult = await this.prisma.$queryRawUnsafe<any[]>(partSql, safeEqp, safeLot, safeWafer);
+        return partResult[0]?.exists === true || partResult[0]?.exists === 'true';
+      }
+
+      return false;
       
     } catch (error) {
       this.logger.warn(`Spectrum check failed for ${eqpId}-${lotId}:`, error);
@@ -201,8 +208,7 @@ export class WaferService {
     column: string,
     params: WaferQueryParams,
   ): Promise<string[]> {
-    const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } =
-      params;
+    const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } = params;
 
     const table = 'public.plg_wf_flat';
     let colName = column;
@@ -463,6 +469,7 @@ export class WaferService {
     }
   }
 
+  // [핵심 변경] TRIM 및 형변환(::integer)으로 데이터베이스 구조적 오류 예방
   async getSpectrumGen(params: WaferQueryParams) {
     const { lotId, waferId, pointId, eqpId, ts } = params;
     if (!lotId || !waferId || !pointId || !eqpId || !ts) return null;
@@ -484,16 +491,16 @@ export class WaferService {
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
-         WHERE "lotid" = $1 
-           AND "waferid" = $2  
+         WHERE TRIM("lotid") = TRIM($1) 
+           AND "waferid"::integer = $2  
            AND "point" = $3    
-           AND "eqpid" = $4    
+           AND TRIM("eqpid") = TRIM($4)    
            AND "ts" >= $5::timestamp - interval '2 second'
            AND "ts" <= $5::timestamp + interval '2 second'
            AND "class" = 'GEN'
          LIMIT 1`,
         lotId,
-        String(waferId),
+        Number(waferId),
         Number(pointId),
         eqpId,
         targetDate,
@@ -539,74 +546,75 @@ export class WaferService {
 
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
-    const where: Prisma.PlgWfFlatWhereInput = {
-      eqpid: eqpId || undefined,
-      servTs: lotId ? undefined : {
-        gte: s,
-        lte: e,
-      },
-      lotid: lotId ? { contains: lotId, mode: 'insensitive' } : undefined,
-      waferid: waferId ? Number(waferId) : undefined,
-      cassettercp: cassetteRcp || undefined,
-      stagercp: stageRcp || undefined,
-      stagegroup: stageGroup || undefined,
-      film: film || undefined,
-    };
+    let whereClause = 'WHERE 1=1';
+    const queryParams: any[] = [];
+    let pIdx = 1;
 
-    const uniqueGroupsPromise = this.prisma.plgWfFlat.groupBy({
-      by: [
-        'eqpid',
-        'servTs',
-        'lotid',
-        'waferid',
-        'cassettercp',
-        'stagercp',
-        'stagegroup',
-        'film',
-      ],
-      where,
-      _count: { _all: true },
-    });
+    if (eqpId) { 
+        whereClause += ` AND eqpid = $${pIdx++}`; 
+        queryParams.push(eqpId); 
+    }
+    if (!lotId) {
+        whereClause += ` AND serv_ts >= $${pIdx++} AND serv_ts <= $${pIdx++}`;
+        queryParams.push(s, e);
+    }
+    if (lotId) { 
+        whereClause += ` AND lotid ILIKE $${pIdx++}`; 
+        queryParams.push(`%${lotId}%`); 
+    }
+    if (waferId) { 
+        whereClause += ` AND waferid = $${pIdx++}`; 
+        queryParams.push(Number(waferId)); 
+    }
+    if (cassetteRcp) { 
+        whereClause += ` AND cassettercp = $${pIdx++}`; 
+        queryParams.push(cassetteRcp); 
+    }
+    if (stageRcp) { 
+        whereClause += ` AND stagercp = $${pIdx++}`; 
+        queryParams.push(stageRcp); 
+    }
+    if (stageGroup) { 
+        whereClause += ` AND stagegroup = $${pIdx++}`; 
+        queryParams.push(stageGroup); 
+    }
+    if (film) { 
+        whereClause += ` AND film = $${pIdx++}`; 
+        queryParams.push(film); 
+    }
 
-    const itemsPromise = this.prisma.plgWfFlat.findMany({
-      where,
-      take: Number(pageSize),
-      skip: Number(page) * Number(pageSize),
-      orderBy: [{ servTs: 'desc' }, { waferid: 'asc' }],
-      distinct: [
-        'eqpid',
-        'servTs',
-        'lotid',
-        'waferid',
-        'cassettercp',
-        'stagercp',
-        'stagegroup',
-        'film',
-      ],
-      select: {
-        eqpid: true,
-        lotid: true,
-        waferid: true,
-        servTs: true,
-        datetime: true,
-        cassettercp: true,
-        stagercp: true,
-        stagegroup: true,
-        film: true,
-      },
-    });
+    const countSql = `
+      WITH RankedData AS (
+        SELECT eqpid, lotid, waferid, 
+               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid ORDER BY serv_ts DESC) as rn
+        FROM public.plg_wf_flat
+        ${whereClause}
+      )
+      SELECT COUNT(*)::int as total FROM RankedData WHERE rn = 1
+    `;
+    const countResult = await this.prisma.$queryRawUnsafe<{ total: number }[]>(countSql, ...queryParams);
+    const total = Number(countResult[0]?.total || 0);
 
-    const [uniqueGroups, items] = await this.prisma.$transaction([
-      uniqueGroupsPromise,
-      itemsPromise,
-    ]);
-    const total = uniqueGroups.length;
+    const dataSql = `
+      WITH RankedData AS (
+        SELECT eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film, serv_ts as "servTs", datetime,
+               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid ORDER BY serv_ts DESC) as rn
+        FROM public.plg_wf_flat
+        ${whereClause}
+      )
+      SELECT * FROM RankedData
+      WHERE rn = 1
+      ORDER BY "servTs" DESC, waferid ASC
+      LIMIT $${pIdx++} OFFSET $${pIdx++}
+    `;
+    const dataParams = [...queryParams, Number(pageSize), Number(page) * Number(pageSize)];
+    const items = await this.prisma.$queryRawUnsafe<any[]>(dataSql, ...dataParams);
 
     const mapLookup = new Set<string>();
 
     if (items.length > 0) {
-      const eqpIds = [...new Set(items.map(i => i.eqpid))];
-      const datetimes = items.map(i => i.datetime).filter(d => d !== null);
+      const eqpIds = [...new Set(items.map((i) => i.eqpid))];
+      const datetimes = items.map((i) => i.datetime).filter((d) => d !== null);
       
       if (datetimes.length > 0) {
         const maps = await this.prisma.plgWfMap.findMany({
@@ -675,13 +683,10 @@ export class WaferService {
         finalDownloadUrl = `${baseUrl.replace(/\/$/, '')}/${dbUrl.replace(/^\//, '')}`;
       }
 
-      // [핵심 변경] 완전히 고유한 캐시 파일명 생성 로직 적용
-      // YYMMDD만 자르지 않고 전체 시분초와 Lot, Wafer 정보를 결합하여 완벽한 고유키를 생성합니다.
       const cleanDateStr = String(dateTime).replace(/\+/g, '').replace(/[- :T.Z]/g, ''); 
       const safeLotId = (lotId || 'unknown').replace(/[^a-zA-Z0-9]/g, '_');
       const safeWaferId = waferId !== undefined ? String(waferId) : 'x';
       
-      // 이름 앞에 map_ 접두사를 붙여 기존 wafer_ 로 시작하는 손상된 쓰레기 캐시 파일들을 모두 피합니다.
       const cacheFileName = `map_${eqpId}_${safeLotId}_w${safeWaferId}_${cleanDateStr}_pt${pointNumber}.png`;
       const cacheFilePath = path.join(os.tmpdir(), cacheFileName);
 
@@ -867,6 +872,7 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
+  // [핵심 변경] 차트 조회 시에도 공백/패딩 불일치로 인한 에러 방지
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
@@ -886,17 +892,17 @@ export class WaferService {
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
-         WHERE "eqpid" = $1 
+         WHERE TRIM("eqpid") = TRIM($1) 
            AND "ts" >= $2::timestamp - interval '2 second'
            AND "ts" <= $2::timestamp + interval '2 second'
-           AND "lotid" = $3 
-           AND "waferid" = $4 
+           AND TRIM("lotid") = TRIM($3) 
+           AND "waferid"::integer = $4 
            AND "point" = $5
          ORDER BY "class" ASC`,
         eqpId,
         targetDate,  
         lotId,
-        String(waferId),
+        Number(waferId),
         Number(pointNumber),
       );
 
