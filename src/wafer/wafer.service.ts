@@ -143,7 +143,6 @@ export class WaferService {
     return new Date(cleanStr);
   }
 
-  // [핵심 변경] 공백(TRIM) 및 패딩(::integer) 차이 완벽 극복 & 이중 테이블 교차 검증 적용
   private async checkSpectrumExists(
     eqpId: string, 
     lotId: string, 
@@ -157,7 +156,6 @@ export class WaferService {
       const safeLot = String(lotId).trim();
       const safeWafer = Number(waferId);
 
-      // 1. 운영(Current) 테이블 먼저 확인 (오늘 데이터 또는 스케줄러 지연으로 아직 이관 안된 데이터)
       const mainSql = `
         SELECT EXISTS(
           SELECT 1 FROM public.plg_onto_spectrum
@@ -169,7 +167,6 @@ export class WaferService {
       const mainResult = await this.prisma.$queryRawUnsafe<any[]>(mainSql, safeEqp, safeLot, safeWafer);
       if (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true') return true;
 
-      // 2. 메인 테이블에 없다면, 과거 월별 파티션 테이블 확인
       if (!dateVal) return false;
       const targetDate = this.parseSafeDate(dateVal); 
       if (isNaN(targetDate.getTime())) return false;
@@ -469,7 +466,6 @@ export class WaferService {
     }
   }
 
-  // [핵심 변경] TRIM 및 형변환(::integer)으로 데이터베이스 구조적 오류 예방
   async getSpectrumGen(params: WaferQueryParams) {
     const { lotId, waferId, pointId, eqpId, ts } = params;
     if (!lotId || !waferId || !pointId || !eqpId || !ts) return null;
@@ -529,6 +525,7 @@ export class WaferService {
     }
   }
 
+  // [핵심 변경] 레시피 조건들을 모두 PARTITION BY에 추가하여, 하나의 Wafer라도 레시피가 다르면 모두 표출되게 개선
   async getFlatData(params: WaferQueryParams) {
     const {
       eqpId,
@@ -585,8 +582,8 @@ export class WaferService {
 
     const countSql = `
       WITH RankedData AS (
-        SELECT eqpid, lotid, waferid, 
-               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid ORDER BY serv_ts DESC) as rn
+        SELECT eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film,
+               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film ORDER BY serv_ts DESC) as rn
         FROM public.plg_wf_flat
         ${whereClause}
       )
@@ -598,7 +595,7 @@ export class WaferService {
     const dataSql = `
       WITH RankedData AS (
         SELECT eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film, serv_ts as "servTs", datetime,
-               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid ORDER BY serv_ts DESC) as rn
+               ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film ORDER BY serv_ts DESC) as rn
         FROM public.plg_wf_flat
         ${whereClause}
       )
@@ -872,7 +869,6 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
-  // [핵심 변경] 차트 조회 시에도 공백/패딩 불일치로 인한 에러 방지
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
@@ -924,9 +920,63 @@ export class WaferService {
     }
   }
 
+  // [핵심 변경] 모든 통계/포인트 조회에 Parameterized 쿼리 적용 (버그 방지 및 정밀화)
+  private buildUniqueWhereParams(p: WaferQueryParams): { sql: string, params: any[] } | null {
+    if (!p.eqpId) return null;
+    let sql = `WHERE eqpid = $1`;
+    const params: any[] = [p.eqpId];
+    let pIdx = 2;
+
+    const targetDateStr = p.dateTime || p.servTs;
+
+    if (targetDateStr) {
+      const targetDate = this.parseSafeDate(targetDateStr);
+      const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
+
+      if (p.dateTime) {
+        sql += ` AND datetime >= $${pIdx}::timestamp - interval '2 second'`;
+        sql += ` AND datetime <= $${pIdx}::timestamp + interval '2 second'`;
+        params.push(cleanDateStr);
+        pIdx++;
+      } else if (p.servTs) {
+        sql += ` AND serv_ts >= $${pIdx}::timestamp - interval '2 second'`;
+        sql += ` AND serv_ts <= $${pIdx}::timestamp + interval '2 second'`;
+        params.push(cleanDateStr);
+        pIdx++;
+      }
+
+      if (p.lotId) { sql += ` AND lotid = $${pIdx++}`; params.push(String(p.lotId)); }
+      if (p.waferId !== undefined && p.waferId !== null) { sql += ` AND waferid = $${pIdx++}`; params.push(Number(p.waferId)); }
+      if (p.cassetteRcp) { sql += ` AND cassettercp = $${pIdx++}`; params.push(String(p.cassetteRcp)); }
+      if (p.stageRcp) { sql += ` AND stagercp = $${pIdx++}`; params.push(String(p.stageRcp)); }
+      if (p.stageGroup) { sql += ` AND stagegroup = $${pIdx++}`; params.push(String(p.stageGroup)); }
+      if (p.film) { sql += ` AND film = $${pIdx++}`; params.push(String(p.film)); }
+
+    } else {
+      if (!p.lotId) {
+        if (p.startDate) {
+          const { startDate: s } = this.getSafeDates(p.startDate);
+          sql += ` AND serv_ts >= $${pIdx++}`; params.push(s);
+        }
+        if (p.endDate) {
+          const { endDate: e } = this.getSafeDates(undefined, p.endDate);
+          sql += ` AND serv_ts <= $${pIdx++}`; params.push(e);
+        }
+      }
+      
+      if (p.lotId) { sql += ` AND lotid = $${pIdx++}`; params.push(String(p.lotId)); }
+      if (p.waferId !== undefined && p.waferId !== null) { sql += ` AND waferid = $${pIdx++}`; params.push(Number(p.waferId)); }
+      if (p.cassetteRcp) { sql += ` AND cassettercp = $${pIdx++}`; params.push(String(p.cassetteRcp)); }
+      if (p.stageRcp) { sql += ` AND stagercp = $${pIdx++}`; params.push(String(p.stageRcp)); }
+      if (p.stageGroup) { sql += ` AND stagegroup = $${pIdx++}`; params.push(String(p.stageGroup)); }
+      if (p.film) { sql += ` AND film = $${pIdx++}`; params.push(String(p.film)); }
+    }
+    return { sql, params };
+  }
+
   async getStatistics(params: WaferQueryParams) {
-    const whereSql = this.buildUniqueWhere(params);
-    if (!whereSql) return {};
+    const where = this.buildUniqueWhereParams(params);
+    if (!where) return {};
 
     try {
       const validColumnsResult = await this.prisma.$queryRawUnsafe<
@@ -966,8 +1016,8 @@ export class WaferService {
         .map((col) => `MAX("${col}") as "${col}_max", MIN("${col}") as "${col}_min", AVG("${col}") as "${col}_mean", STDDEV_SAMP("${col}") as "${col}_std"`)
         .join(', ');
 
-      const sql = `SELECT ${selectParts} FROM public.plg_wf_flat ${whereSql} LIMIT 1`;
-      const result = await this.prisma.$queryRawUnsafe<StatsRawResult[]>(sql);
+      const sql = `SELECT ${selectParts} FROM public.plg_wf_flat ${where.sql} LIMIT 1`;
+      const result = await this.prisma.$queryRawUnsafe<StatsRawResult[]>(sql, ...where.params);
       const row = result[0] || {};
       const statsResult: Record<string, any> = {};
 
@@ -994,13 +1044,14 @@ export class WaferService {
   async getPointData(
     params: WaferQueryParams,
   ): Promise<{ headers: string[]; data: unknown[][] }> {
-    const whereSql = this.buildUniqueWhere(params);
-    if (!whereSql) return { headers: [], data: [] };
+    const where = this.buildUniqueWhereParams(params);
+    if (!where) return { headers: [], data: [] };
 
     try {
+      const sql = `SELECT * FROM public.plg_wf_flat ${where.sql} ORDER BY point`;
       const rawData = await this.prisma.$queryRawUnsafe<
         Record<string, unknown>[]
-      >(`SELECT * FROM public.plg_wf_flat ${whereSql} ORDER BY point`);
+      >(sql, ...where.params);
 
       if (!rawData || rawData.length === 0) return { headers: [], data: [] };
 
@@ -1030,43 +1081,6 @@ export class WaferService {
       this.logger.error('Error in getPointData:', e);
       return { headers: [], data: [] };
     }
-  }
-
-  private buildUniqueWhere(p: WaferQueryParams): string | null {
-    if (!p.eqpId) return null;
-    let sql = `WHERE eqpid = '${String(p.eqpId)}'`;
-
-    const targetDateStr = p.dateTime || p.servTs;
-
-    if (targetDateStr) {
-      const targetDate = this.parseSafeDate(targetDateStr);
-      const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
-
-      sql += ` AND datetime >= '${cleanDateStr}'::timestamp - interval '2 second'`;
-      sql += ` AND datetime <= '${cleanDateStr}'::timestamp + interval '2 second'`;
-
-      if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
-      if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
-    } else {
-      if (!p.lotId) {
-        if (p.startDate) {
-          const { startDate: s } = this.getSafeDates(p.startDate);
-          sql += ` AND serv_ts >= '${s.toISOString()}'`;
-        }
-        if (p.endDate) {
-          const { endDate: e } = this.getSafeDates(undefined, p.endDate);
-          sql += ` AND serv_ts <= '${e.toISOString()}'`;
-        }
-      }
-      
-      if (p.lotId) sql += ` AND lotid = '${String(p.lotId)}'`;
-      if (p.waferId) sql += ` AND waferid = ${Number(p.waferId)}`;
-      if (p.cassetteRcp) sql += ` AND cassettercp = '${String(p.cassetteRcp)}'`;
-      if (p.stageRcp) sql += ` AND stagercp = '${String(p.stageRcp)}'`;
-      if (p.stageGroup) sql += ` AND stagegroup = '${String(p.stageGroup)}'`;
-      if (p.film) sql += ` AND film = '${String(p.film)}'`;
-    }
-    return sql;
   }
 
   async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> {
@@ -1197,13 +1211,13 @@ export class WaferService {
   }
 
   async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
-    const whereSql = this.buildUniqueWhere(params);
-    if (!whereSql) return [];
+    const where = this.buildUniqueWhereParams(params);
+    if (!where) return [];
     const metric = params.metric || 't1';
 
     try {
       const data = await this.prisma.$queryRawUnsafe<{ point: number; x: number; y: number; val: number }[]>(
-        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${whereSql}`
+        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${where.sql}`, ...where.params
       );
       if (!data.length) return [];
       const validData = data.filter((d) => d.val !== null);
@@ -1263,11 +1277,13 @@ export class WaferService {
       candidates = candidates.filter((metric) => validColumnSet.has(metric.toLowerCase()));
       if (candidates.length === 0) return [];
 
-      const whereSql = this.buildUniqueWhere({ ...params, waferId: undefined });
-      if (!whereSql) return candidates;
+      const where = this.buildUniqueWhereParams({ ...params, waferId: undefined });
+      if (!where) return candidates;
 
       const countSelects = candidates.map((col) => `COUNT("${col}") as "${col}"`).join(', ');
-      const countResults = await this.prisma.$queryRawUnsafe<Record<string, number | bigint>[]>(`SELECT ${countSelects} FROM public.plg_wf_flat ${whereSql}`);
+      const countResults = await this.prisma.$queryRawUnsafe<Record<string, number | bigint>[]>(
+        `SELECT ${countSelects} FROM public.plg_wf_flat ${where.sql}`, ...where.params
+      );
       if (!countResults || countResults.length === 0) return [];
 
       const counts = countResults[0];
@@ -1281,14 +1297,14 @@ export class WaferService {
   async getLotUniformityTrend(params: WaferQueryParams & { metric: string }): Promise<any[]> {
     const { metric, ...rest } = params;
     const targetMetric = metric || 't1';
-    const whereSql = this.buildUniqueWhere({ ...rest, waferId: undefined });
-    if (!whereSql) return [];
+    const where = this.buildUniqueWhereParams({ ...rest, waferId: undefined });
+    if (!where) return [];
 
     try {
       const results = await this.prisma.$queryRawUnsafe<any[]>(
         `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
-             FROM public.plg_wf_flat ${whereSql} 
-             ORDER BY waferid, point`
+             FROM public.plg_wf_flat ${where.sql} 
+             ORDER BY waferid, point`, ...where.params
       );
       const grouped: Record<string, any[]> = {};
       results.forEach((row) => {
