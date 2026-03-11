@@ -27,6 +27,8 @@ import { AdminModule } from './admin/admin.module';
 import { EquipmentModule } from './equipment/equipment.module';
 import { ManualModule } from './manual/manual.module';
 
+import { AgentModule } from './agent/agent.module';
+
 @Module({
   imports: [
     // ConfigModule 설정 (필요 시)
@@ -55,6 +57,7 @@ import { ManualModule } from './manual/manual.module';
     AdminModule,
     EquipmentModule,
     ManualModule,
+    AgentModule,
   ],
   controllers: [],
   providers: [PrismaService],
