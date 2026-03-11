@@ -2,6 +2,7 @@
 
 generator client {
   provider = "prisma-client-js"
+  binaryTargets = ["native", "windows"] // Windows 환경 명시
 }
 
 datasource db {
@@ -463,4 +464,38 @@ model SysManual {
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
 
   @@map("sys_manual")
+}
+
+// ==========================================
+// [New Feature] Agent Download & Plugins
+// ==========================================
+
+model SysAgentVersion {
+  id           Int      @id @default(autoincrement())
+  version      String   @db.VarChar(50)
+  releaseDate  DateTime @map("release_date") @db.Date
+  isLatest     String   @default("N") @map("is_latest") @db.Char(1) // Y: 최신버전 (상단 노출용)
+  features     String   @db.Text // 업데이트 내역 (줄바꿈 기호 \n 으로 구분하여 입력)
+  fileUrl64    String?  @map("file_url_64") @db.VarChar(200) // 64비트 다운로드 경로
+  fileUrlLegacy String? @map("file_url_legacy") @db.VarChar(200) // .NET 4.7.2 지원 다운로드 경로
+  fileSize64    String?  @map("file_size_64") @db.VarChar(50)
+  fileSizeLegacy String? @map("file_size_legacy") @db.VarChar(50)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+
+  @@map("sys_agent_version")
+}
+
+model SysAgentPlugin {
+  id          String   @id @db.VarChar(50)
+  name        String   @db.VarChar(100)
+  version     String   @db.VarChar(50)
+  description String   @db.Text
+  filename    String   @db.VarChar(200) // 다운로드 zip 경로
+  icon        String   @db.VarChar(50)  // 예: pi-clone
+  color       String   @db.VarChar(50)  // 예: text-emerald-500
+  bg          String   @db.VarChar(50)  // 예: bg-emerald-50 dark:bg-emerald-900/20
+  sortOrder   Int      @default(0) @map("sort_order")
+  isActive    String   @default("Y") @map("is_active") @db.Char(1)
+
+  @@map("sys_agent_plugin")
 }
