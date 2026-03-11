@@ -1,4 +1,4 @@
-// ITM-Data-API/src/board/dto/board.dto.ts
+// ITM-Data-API_v1/src/board/dto/board.dto.ts
 import { IsString, IsOptional, IsNotEmpty, IsEnum } from 'class-validator';
 
 // 게시글 생성 DTO
@@ -17,7 +17,7 @@ export class CreatePostDto {
 
   @IsString()
   @IsOptional()
-  @IsEnum(['QNA', 'NOTICE', 'BUG'])
+  @IsEnum(['QNA', 'NOTICE', 'BUG', 'IDEA']) // [수정] IDEA 카테고리 추가
   category?: string;
 
   @IsString()
@@ -47,7 +47,7 @@ export class CreateCommentDto {
   @IsOptional()
   parentId?: number; // 대댓글일 경우 부모 ID
 
-  // [추가] 댓글 작성 시 게시글 상태 변경 옵션 (예: 'ANSWERED')
+  // 댓글 작성 시 게시글 상태 변경 옵션 (예: 'ANSWERED')
   @IsString()
   @IsOptional()
   status?: string;
