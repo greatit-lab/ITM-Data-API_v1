@@ -6,6 +6,7 @@ import { CreatePostDto, CreateCommentDto } from './dto/board.dto';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 
+// [설정] UTC 플러그인 활성화
 dayjs.extend(utc);
 
 @Injectable()
@@ -17,6 +18,10 @@ export class BoardService {
     private alertService: AlertService,
   ) {}
 
+  /**
+   * [Helper] 현재 시간을 KST(한국 시간) 기준 Date 객체로 변환
+   * - DB 저장 시 UTC 자동 변환을 막고, 한국 시간 숫자를 그대로 저장하기 위함
+   */
   private getKstDate(): Date {
     return dayjs().utc().add(9, 'hour').toDate();
   }
@@ -101,6 +106,7 @@ export class BoardService {
 
       if (!post) throw new NotFoundException(`Post #${postId} not found`);
 
+      // 조회수 증가
       this.prisma.sysBoard.update({
         where: { postId },
         data: { views: { increment: 1 } },
@@ -142,18 +148,12 @@ export class BoardService {
   // 3. 게시글 작성
   async createPost(data: CreatePostDto) {
     try {
-      if (data.category === 'NOTICE' && data.isPopup === 'Y') {
-        await this.prisma.sysBoard.updateMany({
-          where: { category: 'NOTICE', isPopup: 'Y' },
-          data: { isPopup: 'N' }
-        });
-      }
-
       let initialStatus: string | undefined = undefined;
       if (data.category === 'NOTICE') {
         initialStatus = 'ANSWERED';
       }
 
+      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const newPost = await this.prisma.sysBoard.create({
@@ -172,7 +172,6 @@ export class BoardService {
       // [추가] 공지사항(NOTICE) 등록 시 전체 사용자에게 알림 일괄 발송
       if (newPost.category === 'NOTICE') {
         try {
-          // 모든 사용자 ID 조회
           const allUsers = await this.prisma.sysUser.findMany({ select: { loginId: true } });
           const alertData = allUsers.map(user => ({
             userId: user.loginId,
@@ -200,17 +199,7 @@ export class BoardService {
   // 4. 게시글 수정
   async updatePost(postId: number, data: any) {
     try {
-      if (data.category === 'NOTICE' && data.isPopup === 'Y') {
-        await this.prisma.sysBoard.updateMany({
-          where: { 
-            category: 'NOTICE', 
-            isPopup: 'Y',
-            postId: { not: postId } 
-          },
-          data: { isPopup: 'N' }
-        });
-      }
-
+      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       return await this.prisma.sysBoard.update({
@@ -236,16 +225,19 @@ export class BoardService {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
+      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const updated = await this.prisma.sysBoard.update({
         where: { postId },
         data: { 
           status,
+          // 상태 변경도 수정의 일종이므로 updatedAt 갱신
           updatedAt: nowKst 
         },
       });
 
+      // 알림 발송
       if ((status === 'Complete' || status === 'ANSWERED') && board.status !== status) {
         await this.alertService.createAlert(
           board.authorId,
@@ -274,31 +266,34 @@ export class BoardService {
     }
   }
 
-  // 7. 댓글 작성 (알림 발송 포함)
+  // 7. 댓글 작성
   async createComment(data: CreateCommentDto) {
     try {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId: Number(data.postId) } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
+      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const result = await this.prisma.$transaction(async (tx) => {
+        // 댓글 생성
         const comment = await tx.sysBoardComment.create({
           data: {
             postId: Number(data.postId),
             authorId: data.authorId,
             content: data.content,
             parentId: data.parentId ? Number(data.parentId) : null,
-            createdAt: nowKst,
+            createdAt: nowKst, // 댓글 시간 KST
           },
         });
 
+        // 상태 업데이트가 있는 경우 게시글도 업데이트
         if (data.status) {
           await tx.sysBoard.update({
             where: { postId: Number(data.postId) },
             data: { 
               status: data.status,
-              updatedAt: nowKst 
+              updatedAt: nowKst // 게시글 상태 변경 시에도 수정 시간 갱신
             },
           });
         }
@@ -306,7 +301,7 @@ export class BoardService {
         return comment;
       });
 
-      // 댓글 작성자가 원글 작성자가 아닐 경우 원글 작성자에게 알림 발송 (기존 정상 로직 유지)
+      // 댓글 작성자가 원글 작성자가 아닐 경우 원글 작성자에게 알림 발송
       if (board.authorId !== data.authorId) {
         await this.alertService.createAlert(
           board.authorId,
