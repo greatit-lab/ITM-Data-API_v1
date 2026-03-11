@@ -17,7 +17,7 @@ export class CreatePostDto {
 
   @IsString()
   @IsOptional()
-  @IsEnum(['QNA', 'NOTICE', 'BUG', 'IDEA']) // [수정] IDEA 카테고리 추가
+  @IsEnum(['QNA', 'NOTICE', 'BUG', 'IDEA'])
   category?: string;
 
   @IsString()
