@@ -1,4 +1,4 @@
-// ITM-Data-API/src/board/board.service.ts
+// ITM-Data-API_v1/src/board/board.service.ts
 import { Injectable, NotFoundException, Logger, InternalServerErrorException } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { AlertService } from '../alert/alert.service';
@@ -6,7 +6,6 @@ import { CreatePostDto, CreateCommentDto } from './dto/board.dto';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 
-// [설정] UTC 플러그인 활성화
 dayjs.extend(utc);
 
 @Injectable()
@@ -18,10 +17,6 @@ export class BoardService {
     private alertService: AlertService,
   ) {}
 
-  /**
-   * [Helper] 현재 시간을 KST(한국 시간) 기준 Date 객체로 변환
-   * - DB 저장 시 UTC 자동 변환을 막고, 한국 시간 숫자를 그대로 저장하기 위함
-   */
   private getKstDate(): Date {
     return dayjs().utc().add(9, 'hour').toDate();
   }
@@ -106,7 +101,6 @@ export class BoardService {
 
       if (!post) throw new NotFoundException(`Post #${postId} not found`);
 
-      // 조회수 증가
       this.prisma.sysBoard.update({
         where: { postId },
         data: { views: { increment: 1 } },
@@ -148,7 +142,6 @@ export class BoardService {
   // 3. 게시글 작성
   async createPost(data: CreatePostDto) {
     try {
-      // 팝업 공지 자동 해제 로직
       if (data.category === 'NOTICE' && data.isPopup === 'Y') {
         await this.prisma.sysBoard.updateMany({
           where: { category: 'NOTICE', isPopup: 'Y' },
@@ -161,10 +154,9 @@ export class BoardService {
         initialStatus = 'ANSWERED';
       }
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
-      return await this.prisma.sysBoard.create({
+      const newPost = await this.prisma.sysBoard.create({
         data: {
           title: data.title,
           content: data.content,
@@ -174,9 +166,31 @@ export class BoardService {
           isPopup: data.isPopup || 'N',
           status: initialStatus,
           createdAt: nowKst,
-          // [수정] 작성 시에는 updatedAt을 기록하지 않음 (NULL)
         },
       });
+
+      // [추가] 공지사항(NOTICE) 등록 시 전체 사용자에게 알림 일괄 발송
+      if (newPost.category === 'NOTICE') {
+        try {
+          // 모든 사용자 ID 조회
+          const allUsers = await this.prisma.sysUser.findMany({ select: { loginId: true } });
+          const alertData = allUsers.map(user => ({
+            userId: user.loginId,
+            type: 'NOTICE_POST',
+            message: `[새로운 공지사항] ${newPost.title}`,
+            link: `/support/qna/${newPost.postId}`,
+            isRead: false
+          }));
+          
+          if (alertData.length > 0) {
+            await this.prisma.sysAlert.createMany({ data: alertData });
+          }
+        } catch (alertError) {
+          this.logger.error(`Failed to send notice alerts: ${alertError.message}`);
+        }
+      }
+
+      return newPost;
     } catch (error) {
       this.logger.error(`Failed to createPost: ${error.message}`, error.stack);
       throw new InternalServerErrorException('게시글 작성 중 오류가 발생했습니다.');
@@ -186,7 +200,6 @@ export class BoardService {
   // 4. 게시글 수정
   async updatePost(postId: number, data: any) {
     try {
-      // 팝업 공지 자동 해제
       if (data.category === 'NOTICE' && data.isPopup === 'Y') {
         await this.prisma.sysBoard.updateMany({
           where: { 
@@ -198,7 +211,6 @@ export class BoardService {
         });
       }
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       return await this.prisma.sysBoard.update({
@@ -209,7 +221,6 @@ export class BoardService {
           category: data.category,
           isSecret: data.isSecret,
           isPopup: data.isPopup,
-          // [수정] 수정 시에만 updatedAt에 KST 시간 기록
           updatedAt: nowKst, 
         },
       });
@@ -225,19 +236,16 @@ export class BoardService {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const updated = await this.prisma.sysBoard.update({
         where: { postId },
         data: { 
           status,
-          // 상태 변경도 수정의 일종이므로 updatedAt 갱신
           updatedAt: nowKst 
         },
       });
 
-      // 알림 발송
       if ((status === 'Complete' || status === 'ANSWERED') && board.status !== status) {
         await this.alertService.createAlert(
           board.authorId,
@@ -266,34 +274,31 @@ export class BoardService {
     }
   }
 
-  // 7. 댓글 작성
+  // 7. 댓글 작성 (알림 발송 포함)
   async createComment(data: CreateCommentDto) {
     try {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId: Number(data.postId) } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const result = await this.prisma.$transaction(async (tx) => {
-        // 댓글 생성
         const comment = await tx.sysBoardComment.create({
           data: {
             postId: Number(data.postId),
             authorId: data.authorId,
             content: data.content,
             parentId: data.parentId ? Number(data.parentId) : null,
-            createdAt: nowKst, // 댓글 시간 KST
+            createdAt: nowKst,
           },
         });
 
-        // 상태 업데이트가 있는 경우 게시글도 업데이트
         if (data.status) {
           await tx.sysBoard.update({
             where: { postId: Number(data.postId) },
             data: { 
               status: data.status,
-              updatedAt: nowKst // 게시글 상태 변경 시에도 수정 시간 갱신
+              updatedAt: nowKst 
             },
           });
         }
@@ -301,11 +306,11 @@ export class BoardService {
         return comment;
       });
 
-      // 알림 발송
+      // 댓글 작성자가 원글 작성자가 아닐 경우 원글 작성자에게 알림 발송 (기존 정상 로직 유지)
       if (board.authorId !== data.authorId) {
         await this.alertService.createAlert(
           board.authorId,
-          `문의하신 게시글 [${board.title}]에 답변이 등록되었습니다.`,
+          `작성하신 게시글 [${board.title}]에 새로운 답변/댓글이 등록되었습니다.`,
           `/support/qna/${data.postId}`
         );
       }
@@ -323,7 +328,6 @@ export class BoardService {
       return await this.prisma.sysBoardComment.update({
         where: { commentId },
         data: { content },
-        // 댓글은 별도의 updated_at 컬럼이 없다면 생략
       });
     } catch (error) {
       this.logger.error(`Failed to updateComment: ${error.message}`, error.stack);
