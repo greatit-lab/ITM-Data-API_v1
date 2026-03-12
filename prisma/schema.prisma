@@ -499,3 +499,15 @@ model SysAgentPlugin {
 
   @@map("sys_agent_plugin")
 }
+
+model SysAccessLog {
+  id         Int      @id @default(autoincrement())
+  loginId    String   @map("login_id")
+  menuName   String   @map("menu_name")
+  accessUrl  String   @map("access_url")
+  accessTs   DateTime @default(now()) @map("access_ts")
+
+  @@index([accessTs])
+  @@index([loginId])
+  @@map("sys_access_logs")
+}
