@@ -1,4 +1,4 @@
-// ITM-Data-API/src/lamplife/lamplife.service.ts
+// ITM-Data-API_v1/src/lamplife/lamplife.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
@@ -20,7 +20,8 @@ export class LampLifeService {
           l.age_hour as "ageHour", 
           l.lifespan_hour as "lifespanHour", 
           l.last_changed as "lastChanged", 
-          l.serv_ts as "servTs"
+          l.serv_ts as "servTs",
+          e.prc_group as "prcGroup"  -- [수정 1] ref_equipment 테이블에서 prc_group 조회 추가
         FROM public.eqp_lamp_life l
         JOIN public.ref_equipment e ON l.eqpid = e.eqpid
         LEFT JOIN public.ref_sdwt s ON e.sdwt = s.sdwt
@@ -51,6 +52,8 @@ export class LampLifeService {
         lifespanHour: row.lifespanHour || row.lifespan_hour || 0,
         lastChanged: row.lastChanged || row.last_changed,
         servTs: row.servTs || row.serv_ts,
+        // [수정 2] 프론트엔드에서 사용할 수 있도록 매핑 (값이 없을 경우 예외처리 'UNKNOWN')
+        prc_group: row.prcGroup || row.prc_group || 'UNKNOWN', 
       }));
 
     } catch (e) {
