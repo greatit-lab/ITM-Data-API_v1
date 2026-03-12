@@ -351,4 +351,84 @@ export class AdminService {
       },
     });
   }
+
+  // ==========================================
+  // [Usage Analytics] DB 실제 저장 및 조회 로직
+  // ==========================================
+  async logAccess(data: { loginId: string; menuName: string; accessUrl: string }) {
+    return this.prisma.sysAccessLog.create({
+      data: {
+        loginId: data.loginId,
+        menuName: data.menuName,
+        accessUrl: data.accessUrl,
+      },
+    });
+  }
+
+  async getUsageAnalytics(startDate: string, endDate: string) {
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+
+    // [개선] 증감률 계산을 위한 이전 기간(Previous Period) 계산
+    const periodMs = end.getTime() - start.getTime() + 1;
+    const prevStart = new Date(start.getTime() - periodMs);
+    const prevEnd = new Date(end.getTime() - periodMs);
+
+    const currentWhere = { accessTs: { gte: start, lte: end } };
+    const prevWhere = { accessTs: { gte: prevStart, lte: prevEnd } };
+
+    // 1. KPI 데이터 (현재 기간)
+    const totalViews = await this.prisma.sysAccessLog.count({ where: currentWhere });
+    const users = await this.prisma.sysAccessLog.groupBy({ by: ['loginId'], where: currentWhere });
+    const totalUsers = users.length;
+    
+    // 1-1. KPI 데이터 (이전 기간)
+    const prevViews = await this.prisma.sysAccessLog.count({ where: prevWhere });
+    const prevUsersGrp = await this.prisma.sysAccessLog.groupBy({ by: ['loginId'], where: prevWhere });
+    const prevUsers = prevUsersGrp.length;
+
+    // 1-2. 증감률(Delta) 퍼센트 계산
+    const viewsDelta = prevViews === 0 ? (totalViews > 0 ? 100 : 0) : Math.round(((totalViews - prevViews) / prevViews) * 100);
+    const usersDelta = prevUsers === 0 ? (totalUsers > 0 ? 100 : 0) : Math.round(((totalUsers - prevUsers) / prevUsers) * 100);
+
+    const topMenuObj = await this.prisma.sysAccessLog.groupBy({
+      by: ['menuName'], _count: { menuName: true }, where: currentWhere,
+      orderBy: { _count: { menuName: 'desc' } }, take: 1,
+    });
+    const topPage = topMenuObj.length > 0 ? topMenuObj[0].menuName : '-';
+
+    // 2. 일별 트렌드
+    const dailyData = await this.prisma.$queryRaw`
+      SELECT to_char(access_ts, 'MM-DD') as date, COUNT(id)::int as views, COUNT(DISTINCT login_id)::int as users
+      FROM public.sys_access_logs
+      WHERE access_ts >= ${start} AND access_ts <= ${end}
+      GROUP BY to_char(access_ts, 'MM-DD')
+      ORDER BY date ASC
+    `;
+
+    // 3. 페이지 랭킹
+    const menuUtilization = await this.prisma.sysAccessLog.groupBy({
+      by: ['menuName'], _count: { menuName: true }, where: currentWhere,
+      orderBy: { _count: { menuName: 'desc' } }, take: 10,
+    });
+
+    // 4. 최근 로그 (최대 1000건 - 페이징/다운로드용 넉넉히)
+    const recentLogs = await this.prisma.sysAccessLog.findMany({
+      where: currentWhere,
+      orderBy: { accessTs: 'desc' },
+      take: 1000,
+    });
+
+    return {
+      kpi: { totalUsers, totalViews, topPage, viewsDelta, usersDelta },
+      dailyTrend: dailyData,
+      menuUtilization: menuUtilization.map((m) => ({ menu: m.menuName, views: m._count.menuName })),
+      recentLogs: recentLogs.map((l) => ({
+        time: new Date(l.accessTs).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' }).replace(',', ''), 
+        loginId: l.loginId,
+        menu: l.menuName,
+      })),
+    };
+  }
 }
