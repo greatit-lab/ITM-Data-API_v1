@@ -19,9 +19,9 @@ export class PerformanceService {
     startDate: string,
     endDate: string,
     eqpids?: string,
-    intervalSec: number = 300, // [수정] 5분(300초)으로 변경
+    intervalSec: number = 300, 
   ) {
-    const safeInterval = (intervalSec && !isNaN(intervalSec) && intervalSec > 0) ? intervalSec : 300; // [수정] 5분(300초)으로 변경
+    const safeInterval = (intervalSec && !isNaN(intervalSec) && intervalSec > 0) ? intervalSec : 300; 
 
     const where: Prisma.EqpPerfWhereInput = {
       servTs: {
@@ -143,17 +143,21 @@ export class PerformanceService {
       filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
     }
 
+    // [핵심 수정] ref_sdwt 테이블을 JOIN 하여 정확한 s.site 컬럼을 가져오도록 쿼리 수정
     const results = await this.prisma.$queryRaw`
       SELECT 
         to_timestamp(floor(extract(epoch from p.serv_ts) / ${interval}) * ${interval}) as timestamp,
         p.eqpid as "eqpId",
+        s.site as "site",
+        r.sdwt as "sdwt",
         MAX(p.memory_usage_mb) as "memoryUsageMB",
         MAX(i.app_ver) as "agentVersion"
       FROM public.eqp_proc_perf p
       JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+      LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
       LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
       ${filterSql}
-      GROUP BY 1, 2
+      GROUP BY 1, 2, 3, 4
       ORDER BY 1 ASC
     `;
 
