@@ -1,7 +1,7 @@
 // ITM-Data-API_v1/src/admin/admin.service.ts
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
-import { Prisma } from '@prisma/client'; // Raw Query 파라미터 바인딩을 위해 추가
+import { Prisma } from '@prisma/client';
 
 @Injectable()
 export class AdminService {
@@ -106,29 +106,17 @@ export class AdminService {
     const end = new Date(endDate);
     end.setHours(23, 59, 59, 999);
 
-    // 1. 관리자 테이블의 모든 사용자 조회 (권한명 오타 및 변형에 상관없이 테이블에 있으면 전부 차단 대상)
-    const admins = await this.prisma.cfgAdminUser.findMany({
-      select: { loginId: true }
-    });
-
-    // 2. 대소문자 차이로 인한 누락 방지 및 DB 미등록 마스터 계정 강제 포함
+    const admins = await this.prisma.cfgAdminUser.findMany({ select: { loginId: true } });
     const excludeSet = new Set<string>();
     const baseExcludes = ['admin', 'administrator', 'system', 'manager'];
     
-    admins.forEach(a => {
-      if (a.loginId) baseExcludes.push(a.loginId);
-    });
-
+    admins.forEach(a => { if (a.loginId) baseExcludes.push(a.loginId); });
     baseExcludes.forEach(id => {
-      excludeSet.add(id); // 원본
-      excludeSet.add(id.toLowerCase()); // 소문자
-      excludeSet.add(id.toUpperCase()); // 대문자
-      excludeSet.add(id.charAt(0).toUpperCase() + id.slice(1).toLowerCase()); // 첫글자 대문자 (ex: Admin)
+      excludeSet.add(id); excludeSet.add(id.toLowerCase()); excludeSet.add(id.toUpperCase());
+      excludeSet.add(id.charAt(0).toUpperCase() + id.slice(1).toLowerCase());
     });
-
     const excludeIds = Array.from(excludeSet);
 
-    // 3. 기간 계산 및 Prisma용 조회 조건 결합
     const periodMs = end.getTime() - start.getTime() + 1;
     const prevStart = new Date(start.getTime() - periodMs);
     const prevEnd = new Date(end.getTime() - periodMs);
@@ -137,36 +125,37 @@ export class AdminService {
     const currentWhere = { accessTs: { gte: start, lte: end }, ...userFilter };
     const prevWhere = { accessTs: { gte: prevStart, lte: prevEnd }, ...userFilter };
 
-    // KPI 데이터 (현재 기간)
-    const totalViews = await this.prisma.sysAccessLog.count({ where: currentWhere });
+    const totalViews = await this.prisma.sysAccessLog.count({ where: { ...currentWhere, menuName: { not: 'APP_ENTRY' } } });
+    const totalVisits = await this.prisma.sysAccessLog.count({ where: { ...currentWhere, menuName: 'APP_ENTRY' } });
     const users = await this.prisma.sysAccessLog.groupBy({ by: ['loginId'], where: currentWhere });
     const totalUsers = users.length;
     
-    // KPI 데이터 (이전 기간)
-    const prevViews = await this.prisma.sysAccessLog.count({ where: prevWhere });
+    const prevViews = await this.prisma.sysAccessLog.count({ where: { ...prevWhere, menuName: { not: 'APP_ENTRY' } } });
+    const prevVisits = await this.prisma.sysAccessLog.count({ where: { ...prevWhere, menuName: 'APP_ENTRY' } });
     const prevUsersGrp = await this.prisma.sysAccessLog.groupBy({ by: ['loginId'], where: prevWhere });
     const prevUsers = prevUsersGrp.length;
 
-    // 증감률(Delta) 계산
     const viewsDelta = prevViews === 0 ? (totalViews > 0 ? 100 : 0) : Math.round(((totalViews - prevViews) / prevViews) * 100);
+    const visitsDelta = prevVisits === 0 ? (totalVisits > 0 ? 100 : 0) : Math.round(((totalVisits - prevVisits) / prevVisits) * 100);
     const usersDelta = prevUsers === 0 ? (totalUsers > 0 ? 100 : 0) : Math.round(((totalUsers - prevUsers) / prevUsers) * 100);
 
     const topMenuObj = await this.prisma.sysAccessLog.groupBy({
-      by: ['menuName'], _count: { menuName: true }, where: currentWhere,
+      by: ['menuName'], _count: { menuName: true }, where: { ...currentWhere, menuName: { not: 'APP_ENTRY' } },
       orderBy: { _count: { menuName: 'desc' } }, take: 1,
     });
     const topPage = topMenuObj.length > 0 ? topMenuObj[0].menuName : '-';
 
-    // 4. Raw Query용 완벽한 소문자 비교 조건 (이중 락킹)
     const lowerExcludeIds = Array.from(new Set(baseExcludes.map(id => id.toLowerCase())));
     let adminCondition = Prisma.empty;
     if (lowerExcludeIds.length > 0) {
       adminCondition = Prisma.sql`AND LOWER(login_id) NOT IN (${Prisma.join(lowerExcludeIds)})`;
     }
 
-    // 전체 일별 트렌드
     const dailyData = await this.prisma.$queryRaw`
-      SELECT to_char(access_ts, 'MM-DD') as date, COUNT(id)::int as views, COUNT(DISTINCT login_id)::int as users
+      SELECT to_char(access_ts, 'MM-DD') as date, 
+             COUNT(id) FILTER (WHERE menu_name != 'APP_ENTRY')::int as views,
+             COUNT(id) FILTER (WHERE menu_name = 'APP_ENTRY')::int as visits,
+             COUNT(DISTINCT login_id)::int as users
       FROM public.sys_access_logs
       WHERE access_ts >= ${start} AND access_ts <= ${end}
       ${adminCondition}
@@ -174,39 +163,45 @@ export class AdminService {
       ORDER BY date ASC
     `;
 
-    // (신규) 페이지별 일별 트렌드
     const dailyMenuData = await this.prisma.$queryRaw`
       SELECT to_char(access_ts, 'MM-DD') as date, menu_name as menu, COUNT(id)::int as views
       FROM public.sys_access_logs
       WHERE access_ts >= ${start} AND access_ts <= ${end}
+      AND menu_name != 'APP_ENTRY'
       ${adminCondition}
       GROUP BY to_char(access_ts, 'MM-DD'), menu_name
       ORDER BY date ASC
     `;
 
-    // 페이지 랭킹
     const menuUtilization = await this.prisma.sysAccessLog.groupBy({
-      by: ['menuName'], _count: { menuName: true }, where: currentWhere,
+      by: ['menuName'], _count: { menuName: true }, where: { ...currentWhere, menuName: { not: 'APP_ENTRY' } },
       orderBy: { _count: { menuName: 'desc' } }, take: 10,
     });
 
-    // 최근 접속 로그
     const recentLogs = await this.prisma.sysAccessLog.findMany({
-      where: currentWhere,
+      where: { ...currentWhere, menuName: { not: 'APP_ENTRY' } },
       orderBy: { accessTs: 'desc' },
       take: 1000,
     });
 
     return {
-      kpi: { totalUsers, totalViews, topPage, viewsDelta, usersDelta },
+      kpi: { totalUsers, totalVisits, totalViews, topPage, viewsDelta, visitsDelta, usersDelta },
       dailyTrend: dailyData,
       dailyMenuTrend: dailyMenuData, 
       menuUtilization: menuUtilization.map((m) => ({ menu: m.menuName, views: m._count.menuName })),
-      recentLogs: recentLogs.map((l) => ({
-        time: new Date(l.accessTs).toLocaleString('sv-SE', { timeZone: 'Asia/Seoul' }).replace(',', ''), 
-        loginId: l.loginId,
-        menu: l.menuName,
-      })),
+      
+      // [핵심 변경] 런타임 환경에 관계없이 '초(Seconds)'까지 완벽하게 고정 출력하기 위한 KST 포맷팅 적용
+      recentLogs: recentLogs.map((l) => {
+        const d = new Date(l.accessTs);
+        const kstTime = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+        const timeString = kstTime.toISOString().replace('T', ' ').substring(0, 19);
+
+        return {
+          time: timeString, 
+          loginId: l.loginId,
+          menu: l.menuName,
+        };
+      }),
     };
   }
 }
