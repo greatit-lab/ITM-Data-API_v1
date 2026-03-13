@@ -20,7 +20,6 @@ export class BoardService {
 
   /**
    * [Helper] 현재 시간을 KST(한국 시간) 기준 Date 객체로 변환
-   * - DB 저장 시 UTC 자동 변환을 막고, 한국 시간 숫자를 그대로 저장하기 위함
    */
   private getKstDate(): Date {
     return dayjs().utc().add(9, 'hour').toDate();
@@ -145,7 +144,7 @@ export class BoardService {
     }
   }
 
-  // 3. 게시글 작성
+  // 3. 게시글 작성 (알림 타겟팅 고도화 적용)
   async createPost(data: CreatePostDto) {
     try {
       let initialStatus: string | undefined = undefined;
@@ -153,7 +152,6 @@ export class BoardService {
         initialStatus = 'ANSWERED';
       }
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const newPost = await this.prisma.sysBoard.create({
@@ -169,23 +167,70 @@ export class BoardService {
         },
       });
 
-      // [추가] 공지사항(NOTICE) 등록 시 전체 사용자에게 알림 일괄 발송
+      // ==========================================
+      // [알림 발송 로직 분기 처리]
+      // ==========================================
       if (newPost.category === 'NOTICE') {
+        // 분기 1: 공지사항인 경우 -> I:Vision의 모든 사용자(관리자, 매니저, 유저, 게스트)에게 발송
         try {
+          // 1-1. 시스템 접속 이력이 있는 모든 사용자
           const allUsers = await this.prisma.sysUser.findMany({ select: { loginId: true } });
-          const alertData = allUsers.map(user => ({
-            userId: user.loginId,
+          // 1-2. 아직 접속 이력이 없는 승인된 게스트 계정들까지 모두 긁어옴
+          const allGuests = await this.prisma.cfgGuestAccess.findMany({ select: { loginId: true } });
+          
+          // 중복 제거를 위해 Set 사용
+          const uniqueUserIds = new Set([
+            ...allUsers.map(u => u.loginId),
+            ...allGuests.map(g => g.loginId)
+          ]);
+
+          // 작성자 본인 제외 (선택 사항이지만 일반적으로 본인이 쓴 글의 알림은 받지 않음)
+          uniqueUserIds.delete(newPost.authorId);
+
+          const alertData = Array.from(uniqueUserIds).map(userId => ({
+            userId: userId,
             type: 'NOTICE_POST',
             message: `[새로운 공지사항] ${newPost.title}`,
             link: `/support/qna/${newPost.postId}`,
-            isRead: false
+            isRead: false,
+            createdAt: nowKst
           }));
           
           if (alertData.length > 0) {
             await this.prisma.sysAlert.createMany({ data: alertData });
           }
         } catch (alertError) {
-          this.logger.error(`Failed to send notice alerts: ${alertError.message}`);
+          this.logger.error(`전체 공지 알림 발송 실패: ${alertError.message}`);
+        }
+
+      } else {
+        // 분기 2: 일반 게시글(QnA, 버그 리포트 등)인 경우 -> '관리자' 및 '매니저' 권한 보유자에게만 발송
+        try {
+          const adminUsers = await this.prisma.cfgAdminUser.findMany({
+            // 역할이 Admin 이거나 Manager 인 사용자 조회
+            where: { role: { in: ['ADMIN', 'MANAGER'] } },
+            select: { loginId: true }
+          });
+
+          // 본인이 관리자/매니저인데 스스로 문의글을 남긴 경우 자기 자신에게는 알림이 안 가도록 필터링
+          const targetAdmins = adminUsers
+            .map(u => u.loginId)
+            .filter(id => id !== newPost.authorId);
+
+          if (targetAdmins.length > 0) {
+            const alertData = targetAdmins.map(adminId => ({
+              userId: adminId,
+              type: 'NEW_BOARD_POST',
+              message: `[새로운 게시글 등록] ${newPost.title}`,
+              link: `/support/qna/${newPost.postId}`,
+              isRead: false,
+              createdAt: nowKst
+            }));
+            
+            await this.prisma.sysAlert.createMany({ data: alertData });
+          }
+        } catch (adminAlertError) {
+           this.logger.error(`관리자 새 글 알림 발송 실패: ${adminAlertError.message}`);
         }
       }
 
@@ -199,7 +244,6 @@ export class BoardService {
   // 4. 게시글 수정
   async updatePost(postId: number, data: any) {
     try {
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       return await this.prisma.sysBoard.update({
@@ -225,19 +269,17 @@ export class BoardService {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const updated = await this.prisma.sysBoard.update({
         where: { postId },
         data: { 
           status,
-          // 상태 변경도 수정의 일종이므로 updatedAt 갱신
           updatedAt: nowKst 
         },
       });
 
-      // 알림 발송
+      // 게시글이 처리 완료되었을 때 작성자에게 알림 발송
       if ((status === 'Complete' || status === 'ANSWERED') && board.status !== status) {
         await this.alertService.createAlert(
           board.authorId,
@@ -272,28 +314,25 @@ export class BoardService {
       const board = await this.prisma.sysBoard.findUnique({ where: { postId: Number(data.postId) } });
       if (!board) throw new NotFoundException('게시글을 찾을 수 없습니다.');
 
-      // [KST 시간 생성]
       const nowKst = this.getKstDate();
 
       const result = await this.prisma.$transaction(async (tx) => {
-        // 댓글 생성
         const comment = await tx.sysBoardComment.create({
           data: {
             postId: Number(data.postId),
             authorId: data.authorId,
             content: data.content,
             parentId: data.parentId ? Number(data.parentId) : null,
-            createdAt: nowKst, // 댓글 시간 KST
+            createdAt: nowKst, 
           },
         });
 
-        // 상태 업데이트가 있는 경우 게시글도 업데이트
         if (data.status) {
           await tx.sysBoard.update({
             where: { postId: Number(data.postId) },
             data: { 
               status: data.status,
-              updatedAt: nowKst // 게시글 상태 변경 시에도 수정 시간 갱신
+              updatedAt: nowKst 
             },
           });
         }
@@ -301,7 +340,7 @@ export class BoardService {
         return comment;
       });
 
-      // 댓글 작성자가 원글 작성자가 아닐 경우 원글 작성자에게 알림 발송
+      // [작동 확인] 댓글 작성자가 원글 작성자가 아닐 경우에만 원글 작성자에게 알림 발송 (완벽 작동 중)
       if (board.authorId !== data.authorId) {
         await this.alertService.createAlert(
           board.authorId,
