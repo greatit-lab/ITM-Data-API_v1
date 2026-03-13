@@ -481,6 +481,7 @@ model SysAgentVersion {
   fileSize64    String?  @map("file_size_64") @db.VarChar(50)
   fileSizeLegacy String? @map("file_size_legacy") @db.VarChar(50)
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+  is_visible_y  String  @default("Y") @db.VarChar(1)  // 화면 노출 여부 (Y: 노출, N: 숨김)
 
   @@map("sys_agent_version")
 }
