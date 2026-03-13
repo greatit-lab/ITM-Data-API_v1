@@ -185,6 +185,7 @@ model EqpProcPerf {
   servTs         DateTime @map("serv_ts")
   processName    String   @map("process_name")
   memoryUsageMB Float?    @map("memory_usage_mb")
+  memoryCommitMB Float?   @map("memory_commit_mb")
 
   @@id([eqpid, servTs, processName])
   @@map("eqp_proc_perf")
