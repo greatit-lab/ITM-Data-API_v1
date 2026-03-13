@@ -1,9 +1,16 @@
-// ITM-Data-API/src/performance/performance.service.ts
+// ITM-Data-API_v1/src/performance/performance.service.ts
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
+
+// [완벽 방어] Prisma Raw Query가 반환하는 BigInt 타입을 NestJS가 JSON으로 직렬화할 수 있도록 전역 패치 적용
+if (typeof (BigInt.prototype as any).toJSON === 'undefined') {
+  (BigInt.prototype as any).toJSON = function () {
+    return Number(this);
+  };
+}
 
 dayjs.extend(utc);
 
@@ -112,7 +119,7 @@ export class PerformanceService {
     return results.map((row: any) => ({
       timestamp: dayjs.utc(row.servTs).format('YYYY-MM-DD HH:mm:ss'),
       processName: row.processName,
-      memoryUsageMB: row.memoryUsageMb ?? row.memoryUsageMB ?? 0,
+      memoryUsageMB: row.memoryUsageMB ?? row.memoryUsageMb ?? 0, 
     }));
   }
 
@@ -128,7 +135,7 @@ export class PerformanceService {
     const end = this.parseDate(endDate);     
 
     let filterSql = Prisma.sql`
-      WHERE p.process_name LIKE '%Agent%' 
+      WHERE (p.process_name = 'ITM_Agent' OR p.process_name LIKE '%Agent%')
         AND p.serv_ts >= ${start} 
         AND p.serv_ts <= ${end}
     `;
@@ -143,27 +150,57 @@ export class PerformanceService {
       filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
     }
 
-    // [핵심 수정] ref_sdwt 테이블을 JOIN 하여 정확한 s.site 컬럼을 가져오도록 쿼리 수정
-    const results = await this.prisma.$queryRaw`
-      SELECT 
-        to_timestamp(floor(extract(epoch from p.serv_ts) / ${interval}) * ${interval}) as timestamp,
-        p.eqpid as "eqpId",
-        s.site as "site",
-        r.sdwt as "sdwt",
-        MAX(p.memory_usage_mb) as "memoryUsageMB",
-        MAX(i.app_ver) as "agentVersion"
-      FROM public.eqp_proc_perf p
-      JOIN public.ref_equipment r ON p.eqpid = r.eqpid
-      LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-      LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
-      ${filterSql}
-      GROUP BY 1, 2, 3, 4
-      ORDER BY 1 ASC
-    `;
+    try {
+      const results = await this.prisma.$queryRaw`
+        SELECT 
+          to_timestamp(
+            (floor(extract(epoch from p.serv_ts) / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+          ) as timestamp,
+          p.eqpid as "eqpId",
+          s.site as "site",
+          r.sdwt as "sdwt",
+          MAX(p.memory_usage_mb) as "memoryUsageMB",
+          MAX(p.memory_commit_mb) as "memoryCommitMB", 
+          MAX(i.app_ver) as "agentVersion"
+        FROM public.eqp_proc_perf p
+        JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+        LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
+        LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
+        ${filterSql}
+        GROUP BY 1, 2, 3, 4
+        ORDER BY 1 ASC
+      `;
 
-    return (results as any[]).map(r => ({
-      ...r,
-      timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
-    }));
+      return (results as any[]).map(r => ({
+        ...r,
+        timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
+      }));
+
+    } catch (e) {
+      const fallbackResults = await this.prisma.$queryRaw`
+        SELECT 
+          to_timestamp(
+            (floor(extract(epoch from p.serv_ts) / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+          ) as timestamp,
+          p.eqpid as "eqpId",
+          s.site as "site",
+          r.sdwt as "sdwt",
+          MAX(p.memory_usage_mb) as "memoryUsageMB",
+          0::numeric as "memoryCommitMB", 
+          MAX(i.app_ver) as "agentVersion"
+        FROM public.eqp_proc_perf p
+        JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+        LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
+        LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
+        ${filterSql}
+        GROUP BY 1, 2, 3, 4
+        ORDER BY 1 ASC
+      `;
+
+      return (fallbackResults as any[]).map(r => ({
+        ...r,
+        timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
+      }));
+    }
   }
 }
