@@ -9,6 +9,7 @@ export class AdminService {
 
   private getKstDate(): Date {
     const now = new Date();
+    // 접속 시 DB에 KST 기준으로 Insert 하기 위함
     return new Date(now.getTime() + 9 * 60 * 60 * 1000);
   }
 
@@ -97,14 +98,28 @@ export class AdminService {
         loginId: data.loginId,
         menuName: data.menuName,
         accessUrl: data.accessUrl,
+        accessTs: this.getKstDate(), 
       },
     });
   }
 
   async getUsageAnalytics(startDate: string, endDate: string) {
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-    end.setHours(23, 59, 59, 999);
+    const start = new Date(startDate.replace(' ', 'T') + '.000Z');
+    const end = new Date(endDate.replace(' ', 'T') + '.999Z');
+
+    const generateDateRange = (sStr: string, eStr: string) => {
+      const dates: string[] = []; 
+      const curr = new Date(sStr.substring(0, 10) + 'T00:00:00.000Z');
+      const last = new Date(eStr.substring(0, 10) + 'T00:00:00.000Z');
+      while (curr <= last) {
+        const mm = String(curr.getUTCMonth() + 1).padStart(2, '0');
+        const dd = String(curr.getUTCDate()).padStart(2, '0');
+        dates.push(`${mm}-${dd}`);
+        curr.setUTCDate(curr.getUTCDate() + 1);
+      }
+      return dates;
+    };
+    const dateLabels = generateDateRange(startDate, endDate);
 
     const admins = await this.prisma.cfgAdminUser.findMany({ select: { loginId: true } });
     const excludeSet = new Set<string>();
@@ -112,7 +127,9 @@ export class AdminService {
     
     admins.forEach(a => { if (a.loginId) baseExcludes.push(a.loginId); });
     baseExcludes.forEach(id => {
-      excludeSet.add(id); excludeSet.add(id.toLowerCase()); excludeSet.add(id.toUpperCase());
+      excludeSet.add(id); 
+      excludeSet.add(id.toLowerCase()); 
+      excludeSet.add(id.toUpperCase());
       excludeSet.add(id.charAt(0).toUpperCase() + id.slice(1).toLowerCase());
     });
     const excludeIds = Array.from(excludeSet);
@@ -151,22 +168,37 @@ export class AdminService {
       adminCondition = Prisma.sql`AND LOWER(login_id) NOT IN (${Prisma.join(lowerExcludeIds)})`;
     }
 
-    const dailyData = await this.prisma.$queryRaw`
+    // [핵심 롤백 및 적용] 
+    // Raw SQL 쿼리에서는 Date 객체(${start})를 전달하지 않고 문자열(${startDate})을 전달합니다.
+    // Date 객체를 전달하면 Postgres가 DB 타임존 기준으로 00:00 시간을 09:00으로 쉬프트시켜버려 
+    // 아침 8시 데이터들이 누락되는(0조회) 원인이 됩니다.
+    const dailyData: any[] = await this.prisma.$queryRaw`
       SELECT to_char(access_ts, 'MM-DD') as date, 
              COUNT(id) FILTER (WHERE menu_name != 'APP_ENTRY')::int as views,
              COUNT(id) FILTER (WHERE menu_name = 'APP_ENTRY')::int as visits,
              COUNT(DISTINCT login_id)::int as users
       FROM public.sys_access_logs
-      WHERE access_ts >= ${start} AND access_ts <= ${end}
+      WHERE access_ts >= ${startDate}::timestamp AND access_ts <= ${endDate}::timestamp
       ${adminCondition}
       GROUP BY to_char(access_ts, 'MM-DD')
       ORDER BY date ASC
     `;
 
+    const trendMap = new Map(dailyData.map((d: any) => [d.date, d]));
+    const paddedDailyTrend = dateLabels.map(date => {
+      const existing = trendMap.get(date);
+      return {
+        date,
+        views: existing ? existing.views : 0,
+        visits: existing ? existing.visits : 0,
+        users: existing ? existing.users : 0
+      };
+    });
+
     const dailyMenuData = await this.prisma.$queryRaw`
       SELECT to_char(access_ts, 'MM-DD') as date, menu_name as menu, COUNT(id)::int as views
       FROM public.sys_access_logs
-      WHERE access_ts >= ${start} AND access_ts <= ${end}
+      WHERE access_ts >= ${startDate}::timestamp AND access_ts <= ${endDate}::timestamp
       AND menu_name != 'APP_ENTRY'
       ${adminCondition}
       GROUP BY to_char(access_ts, 'MM-DD'), menu_name
@@ -186,15 +218,13 @@ export class AdminService {
 
     return {
       kpi: { totalUsers, totalVisits, totalViews, topPage, viewsDelta, visitsDelta, usersDelta },
-      dailyTrend: dailyData,
+      dailyTrend: paddedDailyTrend, 
       dailyMenuTrend: dailyMenuData, 
       menuUtilization: menuUtilization.map((m) => ({ menu: m.menuName, views: m._count.menuName })),
       
-      // [핵심 변경] 런타임 환경에 관계없이 '초(Seconds)'까지 완벽하게 고정 출력하기 위한 KST 포맷팅 적용
       recentLogs: recentLogs.map((l) => {
         const d = new Date(l.accessTs);
-        const kstTime = new Date(d.getTime() + 9 * 60 * 60 * 1000);
-        const timeString = kstTime.toISOString().replace('T', ' ').substring(0, 19);
+        const timeString = d.toISOString().replace('T', ' ').substring(0, 19);
 
         return {
           time: timeString, 
