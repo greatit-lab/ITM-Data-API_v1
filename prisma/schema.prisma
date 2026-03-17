@@ -461,17 +461,19 @@ model SysManual {
 }
 
 model SysAgentVersion {
-  id           Int      @id @default(autoincrement())
-  version      String   @db.VarChar(50)
-  releaseDate  DateTime @map("release_date") @db.Date
-  isLatest     String   @default("N") @map("is_latest") @db.Char(1) 
-  features     String   @db.Text 
-  fileUrl64    String?  @map("file_url_64") @db.VarChar(200) 
-  fileUrlLegacy String? @map("file_url_legacy") @db.VarChar(200) 
-  fileSize64    String? @map("file_size_64") @db.VarChar(50)
-  fileSizeLegacy String? @map("file_size_legacy") @db.VarChar(50)
-  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
-  is_visible_y  String  @default("Y") @db.VarChar(1) 
+  id              Int      @id @default(autoincrement())
+  version         String   @db.VarChar(50)
+  releaseDate     DateTime @map("release_date") @db.Date
+  isLatest        String   @default("N") @map("is_latest") @db.Char(1)
+  features        String   @db.Text 
+  fileUrl64       String?  @map("file_url_64") @db.VarChar(200) 
+  fileUrlLegacy   String?  @map("file_url_legacy") @db.VarChar(200) 
+  fileUrlProxy    String?  @map("file_url_proxy") @db.VarChar(200) // [추가] Proxy용 경로
+  fileSize64      String?  @map("file_size_64") @db.VarChar(50)
+  fileSizeLegacy  String?  @map("file_size_legacy") @db.VarChar(50)
+  fileSizeProxy   String?  @map("file_size_proxy") @db.VarChar(50) // [추가] Proxy용 용량
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+  is_visible_y    String   @default("Y") @db.VarChar(1) 
 
   @@map("sys_agent_version")
 }
