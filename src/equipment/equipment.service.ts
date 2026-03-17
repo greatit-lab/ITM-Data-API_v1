@@ -7,30 +7,24 @@ import { Prisma } from '@prisma/client';
 export class EquipmentService {
   constructor(private prisma: PrismaService) {}
 
-  // 1. 인프라 관리용 목록 조회 (500 에러 해결 버전)
+  // 1. 인프라 관리용 목록 조회
   async getInfraList() {
-    // [변경 1] include: { sdwtRel: true }를 제거하여 Relation 충돌 방지
     const equipments = await this.prisma.refEquipment.findMany({
       orderBy: { eqpid: 'asc' },
     });
 
-    // [변경 2] 코드 레벨에서 SDWT 정보 안전하게 매핑 (Manual Join)
-    // 장비 데이터에 있는 sdwt 값들을 추출 (중복 제거)
     const sdwtIds = [...new Set(equipments.map((e) => e.sdwt).filter(Boolean))];
 
-    // 존재하는 SDWT 정보만 조회
     const sdwts = await this.prisma.refSdwt.findMany({
       where: { sdwt: { in: sdwtIds } },
     });
 
-    // 조회를 위한 Map 생성
     const sdwtMap = new Map(sdwts.map((s) => [s.sdwt, s]));
 
-    // [변경 3] Frontend 호환성(eqpId) 및 SDWT 정보 결합하여 반환
     return equipments.map((item) => ({
       ...item,
-      eqpId: item.eqpid, // Frontend는 CamelCase 'eqpId'를 기대함
-      sdwtRel: sdwtMap.get(item.sdwt) || null, // 데이터가 없으면 null 처리 (에러 방지)
+      eqpId: item.eqpid, 
+      sdwtRel: sdwtMap.get(item.sdwt) || null,
     }));
   }
 
@@ -58,8 +52,7 @@ export class EquipmentService {
       isNot: null,
     };
 
-    // 상세 조회는 필터링 조건이 많아 include 유지하되, try-catch로 보호 가능성 열어둠
-    // (단, 이곳은 AgentInfo가 있는 장비만 조회하므로 데이터 정합성이 높을 것으로 예상)
+    // [수정됨] cfgServer 정보도 함께 가져오도록 include 속성 추가
     const results = await this.prisma.refEquipment.findMany({
       where,
       include: {
@@ -67,6 +60,7 @@ export class EquipmentService {
         agentStatus: true,
         sdwtRel: true,
         itmInfo: true,
+        cfgServer: true, 
       },
       orderBy: { eqpid: 'asc' },
     });
@@ -75,16 +69,15 @@ export class EquipmentService {
       const info: any = eqp.agentInfo || {};
       const status: any = eqp.agentStatus || {};
       const itm: any = eqp.itmInfo || {};
+      const cfg: any = eqp.cfgServer || {}; // [추가됨]
 
-      // [수정된 부분] AgentStatus의 status 컬럼 값을 직접 참조하여 Online 여부 판단
-      // 기존 시간 차이 기반 계산법을 제거하고 DB 값 기준으로 변경
       let isOnline = false;
       if (status.status && status.status.toUpperCase() === 'ONLINE') {
         isOnline = true;
       }
 
       return {
-        eqpId: eqp.eqpid, // 매핑
+        eqpId: eqp.eqpid, 
         pcName: info.pcName || '-',
         isOnline: isOnline,
         ipAddress: info.ipAddress || '-',
@@ -106,11 +99,13 @@ export class EquipmentService {
         application: itm.application || '-',
         version: itm.version || '-',
         dbVersion: itm.dbVersion || '-',
+        useProxy: cfg.useProxy || 'N', // [추가됨] 프록시 여부 매핑
+        proxyIp: cfg.proxyIp || '-',   // [추가됨] 프록시 IP 매핑
       };
     });
   }
 
-  // 3. 장비 ID 목록 조회 (Dropdown 용)
+  // 3. 장비 ID 목록 조회
   async getEqpIds(params: { site?: string; sdwt?: string; type?: string }) {
     const { site, sdwt, type } = params;
     const where: Prisma.RefEquipmentWhereInput = {};
@@ -145,8 +140,6 @@ export class EquipmentService {
   async getEquipment(eqpId: string) {
     const eqp = await this.prisma.refEquipment.findUnique({
       where: { eqpid: eqpId },
-      // 단일 조회 시에도 include가 실패할 수 있으므로, 필요시 getInfraList처럼 분리 가능
-      // 현재는 유지
       include: { sdwtRel: true },
     });
 
