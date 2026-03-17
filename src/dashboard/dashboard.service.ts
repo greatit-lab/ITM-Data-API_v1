@@ -22,6 +22,8 @@ interface AgentStatusRawResult {
   today_alarm_count: number;
   last_perf_serv_ts: Date | null;
   last_perf_eqp_ts: Date | null;
+  use_proxy: string | null; // [추가됨] 내부망 프록시 여부
+  proxy_ip: string | null;  // [추가됨] 내부망 IP
 }
 
 @Injectable()
@@ -198,7 +200,7 @@ export class DashboardService {
         whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${safeSite})`;
       }
 
-      // 복잡한 조인을 위한 Raw Query 실행
+      // [변경됨] cfg_server (cs)를 조인하여 use_proxy 와 proxy_ip 를 불러옵니다.
       const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
         SELECT 
             a.eqpid, 
@@ -211,10 +213,13 @@ export class DashboardService {
             a.type, a.ip_address, a.os, a.system_type, a.locale, a.timezone,
             COALESCE(e.alarm_count, 0)::int AS today_alarm_count,
             p.serv_ts AS last_perf_serv_ts,
-            p.ts AS last_perf_eqp_ts
+            p.ts AS last_perf_eqp_ts,
+            cs.use_proxy,
+            cs.proxy_ip
         FROM public.agent_info a
         JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.agent_status s ON a.eqpid = s.eqpid
+        LEFT JOIN public.cfg_server cs ON a.eqpid = cs.eqpid
         LEFT JOIN (
             SELECT eqpid, cpu_usage, mem_usage, serv_ts, ts, 
                   ROW_NUMBER() OVER(PARTITION BY eqpid ORDER BY serv_ts DESC) as rn
@@ -256,6 +261,8 @@ export class DashboardService {
           timezone: r.timezone || '',
           todayAlarmCount: r.today_alarm_count,
           clockDrift: clockDrift,
+          useProxy: r.use_proxy || 'N', // [추가됨] 프록시 사용 여부 매핑
+          proxyIp: r.proxy_ip || '',    // [추가됨] 프록시 IP 매핑
         };
       });
     } catch (error) {
