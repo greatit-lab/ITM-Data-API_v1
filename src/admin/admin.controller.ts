@@ -12,10 +12,11 @@ export class AdminController {
   @Post('admins') async addAdmin(@Body() body: any) { return this.adminService.addAdmin(body); }
   @Delete('admins/:loginId') async deleteAdmin(@Param('loginId') loginId: string) { return this.adminService.deleteAdmin(loginId); }
 
-  @Get('guest/access') async getAllAccessCodes() { return this.adminService.getAllAccessCodes(); }
-  @Post('guest/access') async createAccessCode(@Body() body: any) { return this.adminService.createAccessCode(body); }
-  @Put('access-codes/:compid') async updateAccessCode(@Param('compid') compid: string, @Body() body: any) { return this.adminService.updateAccessCode(compid, body); }
-  @Delete('guest/access/:compid') async deleteAccessCode(@Param('compid') compid: string) { return this.adminService.deleteAccessCode(compid); }
+  // [수정됨] Access Codes 관련 라우트를 직관적으로 통일하고 파라미터를 PK인 deptid로 변경
+  @Get('access-codes') async getAllAccessCodes() { return this.adminService.getAllAccessCodes(); }
+  @Post('access-codes') async createAccessCode(@Body() body: any) { return this.adminService.createAccessCode(body); }
+  @Put('access-codes/:deptid') async updateAccessCode(@Param('deptid') deptid: string, @Body() body: any) { return this.adminService.updateAccessCode(deptid, body); }
+  @Delete('access-codes/:deptid') async deleteAccessCode(@Param('deptid') deptid: string) { return this.adminService.deleteAccessCode(deptid); }
 
   @Get('guests') async getAllGuests() { return this.adminService.getAllGuests(); }
   @Post('guests') async addGuest(@Body() body: any) { return this.adminService.addGuest(body); }
@@ -41,9 +42,6 @@ export class AdminController {
   @Get('servers') async getCfgServers() { return this.adminService.getCfgServers(); }
   @Put('servers/:eqpid') async updateCfgServer(@Param('eqpid') eqpid: string, @Body() body: any) { return this.adminService.updateCfgServer(eqpid, body); }
 
-  // ==========================================
-  // [Usage Analytics] 접속 로그 및 통계 (추가됨)
-  // ==========================================
   @Post('access-log')
   async logAccess(@Body() body: { loginId: string; menuName: string; accessUrl: string }) {
     return this.adminService.logAccess(body);
