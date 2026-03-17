@@ -26,13 +26,14 @@ model RefEquipment {
   prcGroup    String?   @map("prc_group") @db.VarChar(50)
   bay         String?   @db.VarChar(50)
   
-  lastUpdate DateTime? @default(now()) @map("last_update") @db.Timestamp(0)
+  lastUpdate DateTime?  @default(now()) @map("last_update") @db.Timestamp(0)
 
   // Relations
   sdwtRel    RefSdwt    @relation(fields: [sdwt], references: [sdwt])
   agentInfo  AgentInfo?
   agentStatus AgentStatus?
   itmInfo    ItmInfo?
+  cfgServer  CfgServer? // CfgServer와의 관계
 
   plgErrors  PlgError[]
   eqpPerfs   EqpPerf[]
@@ -65,10 +66,10 @@ model AgentInfo {
   type        String?
   ipAddress   String? @map("ip_address")
   os          String?
-  systemType String? @map("system_type")
+  systemType String?  @map("system_type")
   locale      String?
   timezone    String?
-  macAddress String? @map("mac_address")
+  macAddress String?  @map("mac_address")
   cpu         String?
   memory      String?
   disk        String?
@@ -237,10 +238,10 @@ model ErrSeverityMap {
 // ==========================================
 
 model RefAccessCode {
-  compid      String    @id @map("compid") @db.VarChar(50) 
-  compName    String?  @map("comp_name") @db.VarChar(100)
-  deptid      String?  @map("deptid") @db.VarChar(50)
-  deptName    String?  @map("dept_name") @db.VarChar(100)
+  compid      String?   @map("compid") @db.VarChar(50) 
+  compName    String?   @map("comp_name") @db.VarChar(100)
+  deptid      String    @id @map("deptid") @db.VarChar(50) // [수정] PK 변경
+  deptName    String?   @map("dept_name") @db.VarChar(100)
   description String?  @db.VarChar(100)
   isActive    String    @default("Y") @map("is_active") @db.Char(1)
   
@@ -252,15 +253,15 @@ model RefAccessCode {
 model RefMenu {
   menuId      Int      @id @default(autoincrement()) @map("menu_id")
   label       String   @db.VarChar(50)
-  routerPath String? @map("router_path") @db.VarChar(100)
+  routerPath String?  @map("router_path") @db.VarChar(100)
   icon        String? @db.VarChar(50)
 
-  parentId Int?      @map("parent_id")
+  parentId Int?       @map("parent_id")
   parent    RefMenu?  @relation("MenuHierarchy", fields: [parentId], references: [menuId])
   children RefMenu[] @relation("MenuHierarchy")
 
   sortOrder Int @default(0) @map("sort_order")
-  statusTag String? @map("status_tag") @db.VarChar(10) 
+  statusTag String?   @map("status_tag") @db.VarChar(10) 
   isVisible String @default("Y") @map("is_visible") @db.Char(1)
 
   roleMappings CfgMenuRole[]
@@ -280,7 +281,7 @@ model CfgMenuRole {
 model CfgAdminUser {
   loginId     String     @id @map("login_id") @db.VarChar(50)
   role        String     @default("MANAGER") @db.VarChar(20)
-  assignedBy String?    @map("assigned_by") @db.VarChar(50)
+  assignedBy String?     @map("assigned_by") @db.VarChar(50)
   
   assignedAt DateTime @default(now()) @map("assigned_at") @db.Timestamp(0)
 
@@ -289,11 +290,11 @@ model CfgAdminUser {
 
 model CfgGuestAccess {
   loginId      String    @id @map("login_id") @db.VarChar(50)
-  deptCode     String?  @map("dept_code") @db.VarChar(50)
+  deptCode     String?   @map("dept_code") @db.VarChar(50)
   deptName     String?  @map("dept_name") @db.VarChar(100)
   
   grantedRole String    @default("GUEST") @map("granted_role") @db.VarChar(20)
-  reason      String?  @db.VarChar(100)
+  reason      String?   @db.VarChar(100)
 
   validUntil  DateTime @map("valid_until") @db.Timestamp(0)
   createdAt   DateTime @default(now()) @map("created_at") @db.Timestamp(0)
@@ -308,7 +309,7 @@ model CfgGuestRequest {
   deptName     String?    @map("dept_name") @db.VarChar(100)
   reason       String?    @db.VarChar(200)
   status       String     @default("PENDING") @db.VarChar(20) 
-  processedBy String?    @map("processed_by") @db.VarChar(50)
+  processedBy String?     @map("processed_by") @db.VarChar(50)
   processedAt DateTime? @map("processed_at") @db.Timestamp(0)
   createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamp(0)
 
@@ -353,7 +354,7 @@ model CfgNewServer {
   newFtpUser   String? @map("new_ftp_user") @db.VarChar(100)
   newFtpPw     String? @map("new_ftp_pw") @db.VarChar(100)
   newFtpPort   Int      @default(21) @map("new_ftp_port")
-  description String? @db.VarChar(255)
+  description String?  @db.VarChar(255)
 
   @@map("cfg_new_server")
 }
@@ -362,9 +363,13 @@ model CfgServer {
   eqpid        String    @id @db.VarChar(50)
   agentDbHost  String?   @map("agent_db_host") @db.VarChar(255)
   agentFtpHost String?   @map("agent_ftp_host") @db.VarChar(255)
+  useProxy     String?   @map("use_proxy") @db.VarChar(1)      // 내부망 프록시 사용 여부
+  proxyIp      String?   @map("proxy_ip") @db.VarChar(255)     // 내부망 통신 IP
   updateFlag   String    @default("no") @map("update_flag") @db.VarChar(10)
   update       DateTime? @map("update") @db.Timestamp(0)
   
+  equipment    RefEquipment @relation(fields: [eqpid], references: [eqpid])
+
   @@map("cfg_server")
 }
 
@@ -372,33 +377,30 @@ model CfgServer {
 // [New Feature] Community / Support (Q&A & Manual)
 // ==========================================
 
-// 1. 게시판 (Q&A, 공지 등)
 model SysBoard {
   postId       Int       @id @default(autoincrement()) @map("post_id")
-  category     String    @default("QNA") @db.VarChar(20) // QNA, NOTICE, BUG
+  category     String    @default("QNA") @db.VarChar(20) 
   
   title        String    @db.VarChar(200)
-  content      String    @db.Text // [PostgreSQL] Text 타입은 1GB까지 저장 가능 (OK)
+  content      String    @db.Text 
   
   authorId     String    @map("author_id") @db.VarChar(50)
   author       SysUser   @relation(fields: [authorId], references: [loginId])
   
   views        Int       @default(0)
-  isSecret     String    @default("N") @map("is_secret") @db.Char(1) // 비밀글 여부
-  // [추가] 팝업 설정 여부 (Y: 팝업 띄움, N: 일반글)
+  isSecret     String    @default("N") @map("is_secret") @db.Char(1) 
   isPopup      String    @default("N") @map("is_popup") @db.Char(1) 
-  status       String    @default("OPEN") @db.VarChar(20) // OPEN, ANSWERED, CLOSED
+  status       String    @default("OPEN") @db.VarChar(20) 
   
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
   updatedAt    DateTime? @map("updated_at") @db.Timestamp(0)
 
   comments     SysBoardComment[]
-  files        SysFile[] // 게시글에 포함된 파일들
+  files        SysFile[] 
 
   @@map("sys_board")
 }
 
-// 2. 댓글 (Q&A 답변용)
 model SysBoardComment {
   commentId    Int       @id @default(autoincrement()) @map("comment_id")
   
@@ -410,24 +412,21 @@ model SysBoardComment {
   
   content      String    @db.Text
   
-  parentId     Int?      @map("parent_id") // 대댓글 기능용 (선택)
+  parentId     Int?      @map("parent_id") 
   
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
   @@map("sys_board_comment")
 }
 
-// 3. 파일/이미지 관리 (에디터 붙여넣기 대응)
 model SysFile {
-  fileId       String    @id @default(uuid()) @map("file_id") // UUID 사용
+  fileId       String    @id @default(uuid()) @map("file_id") 
   fileName     String    @map("file_name") @db.VarChar(200)
-  fileType     String?   @map("file_type") @db.VarChar(50) // image/png, application/pdf etc
+  fileType     String?   @map("file_type") @db.VarChar(50) 
   fileSize     Int?      @map("file_size")
   
-  // 저장 경로 또는 URL (로컬 저장 시 상대 경로)
   filePath     String    @map("file_path") @db.VarChar(500) 
   
-  // 게시글과 연동 (어떤 글에 포함된 이미지인지)
   postId       Int?      @map("post_id")
   post         SysBoard? @relation(fields: [postId], references: [postId], onDelete: SetNull)
 
@@ -436,30 +435,24 @@ model SysFile {
   @@map("sys_file")
 }
 
-// ==========================================
-// [New Feature] System Alerts (알림)
-// ==========================================
-
 model SysAlert {
   id         Int       @id @default(autoincrement())
-  userId     String    @map("user_id") // 알림 받을 사용자 ID
-  type       String    // 알림 유형 (예: 'BOARD_REPLY')
-  message    String    // 알림 내용
-  link       String?   // 클릭 시 이동할 링크
+  userId     String    @map("user_id") 
+  type       String    
+  message    String    
+  link       String?   
   isRead     Boolean   @default(false) @map("is_read")
   createdAt DateTime @default(now()) @map("created_at")
 
   @@map("sys_alert")
 }
 
-// [New Feature] User Manual Management
-// [중요] PostgreSQL에서 @db.Text는 대용량(1GB)을 지원하므로 이미지 다수 포함 가능
 model SysManual {
   id           String    @id @map("section_id") @db.VarChar(255)
   title        String    @db.VarChar(100)
   subtitle     String?   @db.VarChar(200)
   icon         String?   @db.VarChar(50)
-  content      String    @db.Text  // [확인] Postgres Text 타입 (Unlimited)
+  content      String    @db.Text  
   imageUrl     String?   @map("image_url") @db.VarChar(500)
   sortOrder    Int       @default(0) @map("sort_order")
   updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
@@ -467,22 +460,18 @@ model SysManual {
   @@map("sys_manual")
 }
 
-// ==========================================
-// [New Feature] Agent Download & Plugins
-// ==========================================
-
 model SysAgentVersion {
   id           Int      @id @default(autoincrement())
   version      String   @db.VarChar(50)
   releaseDate  DateTime @map("release_date") @db.Date
-  isLatest     String   @default("N") @map("is_latest") @db.Char(1) // Y: 최신버전 (상단 노출용)
-  features     String   @db.Text // 업데이트 내역 (줄바꿈 기호 \n 으로 구분하여 입력)
-  fileUrl64    String?  @map("file_url_64") @db.VarChar(200) // 64비트 다운로드 경로
-  fileUrlLegacy String? @map("file_url_legacy") @db.VarChar(200) // .NET 4.7.2 지원 다운로드 경로
-  fileSize64    String?  @map("file_size_64") @db.VarChar(50)
+  isLatest     String   @default("N") @map("is_latest") @db.Char(1) 
+  features     String   @db.Text 
+  fileUrl64    String?  @map("file_url_64") @db.VarChar(200) 
+  fileUrlLegacy String? @map("file_url_legacy") @db.VarChar(200) 
+  fileSize64    String? @map("file_size_64") @db.VarChar(50)
   fileSizeLegacy String? @map("file_size_legacy") @db.VarChar(50)
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
-  is_visible_y  String  @default("Y") @db.VarChar(1)  // 화면 노출 여부 (Y: 노출, N: 숨김)
+  is_visible_y  String  @default("Y") @db.VarChar(1) 
 
   @@map("sys_agent_version")
 }
@@ -492,10 +481,10 @@ model SysAgentPlugin {
   name        String   @db.VarChar(100)
   version     String   @db.VarChar(50)
   description String   @db.Text
-  filename    String   @db.VarChar(200) // 다운로드 zip 경로
-  icon        String   @db.VarChar(50)  // 예: pi-clone
-  color       String   @db.VarChar(50)  // 예: text-emerald-500
-  bg          String   @db.VarChar(50)  // 예: bg-emerald-50 dark:bg-emerald-900/20
+  filename    String   @db.VarChar(200) 
+  icon        String   @db.VarChar(50)  
+  color       String   @db.VarChar(50)  
+  bg          String   @db.VarChar(50)  
   sortOrder   Int      @default(0) @map("sort_order")
   isActive    String   @default("Y") @map("is_active") @db.Char(1)
 
