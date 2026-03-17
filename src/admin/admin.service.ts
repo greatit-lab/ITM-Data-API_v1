@@ -30,9 +30,25 @@ export class AdminService {
       select: { compid: true, compName: true, deptid: true, deptName: true, description: true, isActive: true, updatedAt: true },
     });
   }
-  async createAccessCode(data: any) { return this.prisma.refAccessCode.create({ data: { compid: data.compid, compName: data.compName, deptid: data.deptid, deptName: data.deptName, description: data.description, isActive: 'Y', updatedAt: this.getKstDate() } }); }
-  async updateAccessCode(compid: string, data: any) { return this.prisma.refAccessCode.update({ where: { compid }, data: { compName: data.compName, deptid: data.deptid, deptName: data.deptName, description: data.description, isActive: data.isActive, updatedAt: this.getKstDate() } }); }
-  async deleteAccessCode(compid: string) { return this.prisma.refAccessCode.delete({ where: { compid } }); }
+  
+  async createAccessCode(data: any) { 
+    return this.prisma.refAccessCode.create({ 
+      data: { compid: data.compid, compName: data.compName, deptid: data.deptid, deptName: data.deptName, description: data.description, isActive: 'Y', updatedAt: this.getKstDate() } 
+    }); 
+  }
+  
+  // [수정됨] PK인 deptid 기준으로 업데이트
+  async updateAccessCode(deptid: string, data: any) { 
+    return this.prisma.refAccessCode.update({ 
+      where: { deptid }, 
+      data: { compid: data.compid, compName: data.compName, deptName: data.deptName, description: data.description, isActive: data.isActive, updatedAt: this.getKstDate() } 
+    }); 
+  }
+  
+  // [수정됨] PK인 deptid 기준으로 삭제
+  async deleteAccessCode(deptid: string) { 
+    return this.prisma.refAccessCode.delete({ where: { deptid } }); 
+  }
 
   async getAllGuests() { return this.prisma.cfgGuestAccess.findMany({ orderBy: { createdAt: 'desc' } }); }
   async addGuest(data: any) { return this.prisma.cfgGuestAccess.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, reason: data.reason, validUntil: new Date(data.validUntil), grantedRole: 'GUEST', createdAt: this.getKstDate() } }); }
@@ -89,9 +105,6 @@ export class AdminService {
   }
   async updateCfgServer(eqpid: string, data: any) { return this.prisma.cfgServer.update({ where: { eqpid }, data: { agentDbHost: data.agentDbHost, agentFtpHost: data.agentFtpHost, updateFlag: data.updateFlag } }); }
 
-  // ==========================================
-  // [Usage Analytics] 접속 로그 및 통계
-  // ==========================================
   async logAccess(data: { loginId: string; menuName: string; accessUrl: string }) {
     return this.prisma.sysAccessLog.create({
       data: {
@@ -168,10 +181,6 @@ export class AdminService {
       adminCondition = Prisma.sql`AND LOWER(login_id) NOT IN (${Prisma.join(lowerExcludeIds)})`;
     }
 
-    // [핵심 롤백 및 적용] 
-    // Raw SQL 쿼리에서는 Date 객체(${start})를 전달하지 않고 문자열(${startDate})을 전달합니다.
-    // Date 객체를 전달하면 Postgres가 DB 타임존 기준으로 00:00 시간을 09:00으로 쉬프트시켜버려 
-    // 아침 8시 데이터들이 누락되는(0조회) 원인이 됩니다.
     const dailyData: any[] = await this.prisma.$queryRaw`
       SELECT to_char(access_ts, 'MM-DD') as date, 
              COUNT(id) FILTER (WHERE menu_name != 'APP_ENTRY')::int as views,
