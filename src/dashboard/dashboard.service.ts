@@ -46,7 +46,7 @@ export class DashboardService {
   // 1. 대시보드 요약 정보 조회
   async getSummary(site?: string, sdwt?: string) {
     try {
-      // [개선] 빈 문자열 파라미터 처리 (빈 문자열이면 undefined로 변환하여 필터 무시)
+      // 빈 문자열 파라미터 처리 (빈 문자열이면 undefined로 변환하여 필터 무시)
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
 
@@ -68,7 +68,6 @@ export class DashboardService {
         versions.length > 0 ? versions[versions.length - 1] : '';
 
       // (2) 장비 필터 조건 생성
-      // [주의] safeSite, safeSdwt가 undefined이면 조건에서 제외됨 -> 전체 조회
       const equipmentWhere: Prisma.RefEquipmentWhereInput = {
         sdwtRel: {
           isUse: 'Y',
@@ -85,6 +84,13 @@ export class DashboardService {
 
       // (3) 주요 카운트 조회
       
+      // [핵심 변경] cfgServer 쿼리에서 사용할 대상 장비(eqpid) 목록을 필터 기반으로 먼저 추출합니다.
+      const targetEqps = await this.prisma.refEquipment.findMany({
+        where: equipmentWhere,
+        select: { eqpid: true }
+      });
+      const eqpIds = targetEqps.map(e => e.eqpid);
+
       // 전체 장비 수 (Agent 정보가 있는 장비 대상)
       const totalEqp = await this.prisma.refEquipment.count({ 
         where: { 
@@ -93,12 +99,17 @@ export class DashboardService {
         } 
       });
 
-      // 전체 서버 설정 수
-      const totalServers = await this.prisma.cfgServer.count();
+      // [핵심 변경] 전체 서버 설정 수 (필터링된 eqpIds 범위 내에서만 카운트)
+      const totalServers = await this.prisma.cfgServer.count({
+        where: { eqpid: { in: eqpIds } }
+      });
 
-      // 활성 서버 수 (최근 10분 내 업데이트)
+      // [핵심 변경] 활성 서버 수 (최근 10분 내 업데이트 & 필터링된 eqpIds 범위 내에서만 카운트)
       const activeServers = await this.prisma.cfgServer.count({
-        where: { update: { gte: tenMinutesAgo } }
+        where: { 
+          update: { gte: tenMinutesAgo },
+          eqpid: { in: eqpIds }
+        }
       });
 
       // 전체 SDWT 수
@@ -175,7 +186,6 @@ export class DashboardService {
   // 2. Agent 상태 목록 조회 (Raw Query)
   async getAgentStatus(site?: string, sdwt?: string) {
     try {
-      // [개선] 빈 문자열 파라미터 안전 처리
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
 
