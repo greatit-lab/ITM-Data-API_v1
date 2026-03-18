@@ -1,4 +1,4 @@
-// ITM-Data-API/src/wafer/wafer.service.ts
+// ITM-Data-API_v1/src/wafer/wafer.service.ts
 import {
   Injectable,
   InternalServerErrorException,
@@ -143,15 +143,12 @@ export class WaferService {
     return new Date(cleanStr);
   }
 
-  // [핵심 헬퍼] 대상 Lot의 측정 일자를 역추적하여 올바른 월별 파티션 테이블(yYYYYmMM)을 반환합니다.
   private async resolveSpectrumTableName(params: { eqpId?: string, lotId?: string, endDate?: string | Date, ts?: string | Date }): Promise<string> {
     let targetDate = new Date();
     
-    // 1. 단일 스펙트럼 조회 시 명확한 타임스탬프가 있는 경우
     if (params.ts) {
       targetDate = this.parseSafeDate(params.ts);
     } 
-    // 2. Lot ID가 주어졌을 때 plg_wf_flat에서 해당 Lot의 실제 구동 일자(MAX serv_ts)를 추출
     else if (params.lotId && params.eqpId) {
       try {
         const res = await this.prisma.$queryRawUnsafe<any[]>(
@@ -167,16 +164,13 @@ export class WaferService {
         if (params.endDate) targetDate = this.parseSafeDate(params.endDate);
       }
     } 
-    // 3. 그 외에는 사용자가 선택한 End Date 기준 적용
     else if (params.endDate) {
       targetDate = this.parseSafeDate(params.endDate);
     }
 
-    // 오늘 날짜인 경우 Base 테이블 쿼리
     const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
     if (isToday) return 'public.plg_onto_spectrum';
 
-    // 오늘이 아닐 경우 월별 파티션 테이블(예: plg_onto_spectrum_y2026m03) 조립
     const yy = dayjs(targetDate).format('YYYY');
     const mm = dayjs(targetDate).format('MM');
     const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
@@ -191,7 +185,6 @@ export class WaferService {
       }
     } catch(e) {}
     
-    // 폴백 (파티션이 없으면 기본 테이블을 조회)
     return 'public.plg_onto_spectrum';
   }
 
@@ -322,9 +315,9 @@ export class WaferService {
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
-    // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
     const tableName = await this.resolveSpectrumTableName(params);
 
+    // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
     let sql = `
       SELECT DISTINCT s.point
       FROM ${tableName} s
@@ -333,6 +326,7 @@ export class WaferService {
         AND TRIM(s.lotid) = TRIM(f.lotid)
         AND s.waferid::integer = f.waferid
         AND s.point = f.point
+        AND s.ts = f.datetime
       WHERE 1=1
     `;
 
@@ -417,12 +411,12 @@ export class WaferService {
     if (!dynamicColumns.includes('gof')) dynamicColumns.push('gof');
     dynamicColumns = [...new Set(dynamicColumns)];
 
-    // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
     const tableName = await this.resolveSpectrumTableName(params);
 
     const queryParams: (string | number | Date)[] = [];
     const selectColumns = dynamicColumns.map((col) => `f."${col}"`).join(', ');
 
+    // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
     let sql = `
       SELECT DISTINCT ON (s."waferid")
         s."waferid", s."wavelengths", s."values", s."ts", s."eqpid",
@@ -430,9 +424,11 @@ export class WaferService {
         ${selectColumns}
       FROM ${tableName} s
       JOIN public.plg_wf_flat f 
-        ON TRIM(s.lotid) = TRIM(f.lotid) 
+        ON TRIM(s.eqpid) = TRIM(f.eqpid) 
+        AND TRIM(s.lotid) = TRIM(f.lotid) 
         AND s.waferid::integer = f."waferid"
         AND s."point" = f."point"
+        AND s."ts" = f."datetime"
       WHERE s."lotid" = $1
         AND s."point" = $2
         AND s."class" = 'EXP'
@@ -477,7 +473,7 @@ export class WaferService {
       queryParams.push(e);
     }
 
-    sql += ` ORDER BY s."waferid" ASC, f."serv_ts" DESC`;
+    sql += ` ORDER BY s."waferid" ASC, s."ts" DESC, f."serv_ts" DESC`;
 
     try {
       const results = await this.prisma.$queryRawUnsafe<
@@ -509,7 +505,7 @@ export class WaferService {
         });
 
         return {
-          name: `W${row.waferid}`,
+          name: `Slot #${row.waferid}`,
           waferId: Number(row.waferid),
           pointId: Number(pointId),
           meta: meta,
@@ -530,9 +526,9 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
       const tableName = await this.resolveSpectrumTableName({ ts });
 
+      // [수정됨] 100% 정확한 시간 일치 검색
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
@@ -540,9 +536,9 @@ export class WaferService {
            AND "waferid"::integer = $2  
            AND "point" = $3    
            AND TRIM("eqpid") = TRIM($4)    
-           AND "ts" >= $5::timestamp - interval '2 second'
-           AND "ts" <= $5::timestamp + interval '2 second'
+           AND "ts" = $5::timestamp
            AND "class" = 'GEN'
+         ORDER BY "ts" DESC
          LIMIT 1`,
         lotId,
         Number(waferId),
@@ -562,7 +558,7 @@ export class WaferService {
       }
 
       return {
-        name: `Model (W${waferId})`,
+        name: `Model (Slot #${waferId})`,
         type: 'line',
         lineStyle: { type: 'dashed', width: 2, color: '#ef4444' },
         data: dataPoints,
@@ -923,19 +919,18 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
       const tableName = await this.resolveSpectrumTableName({ ts });
 
+      // [수정됨] 100% 정확한 시간 일치 매핑
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
          WHERE TRIM("eqpid") = TRIM($1) 
-           AND "ts" >= $2::timestamp - interval '2 second'
-           AND "ts" <= $2::timestamp + interval '2 second'
+           AND "ts" = $2::timestamp
            AND TRIM("lotid") = TRIM($3) 
            AND "waferid"::integer = $4 
            AND "point" = $5
-         ORDER BY "class" ASC`,
+         ORDER BY "class" ASC, "ts" DESC`,
         eqpId,
         targetDate,  
         lotId,
@@ -973,14 +968,13 @@ export class WaferService {
       const targetDate = this.parseSafeDate(targetDateStr);
       const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
 
+      // [수정됨] 100% 정확한 시간 일치 매핑
       if (p.dateTime) {
-        sql += ` AND datetime >= $${pIdx}::timestamp - interval '2 second'`;
-        sql += ` AND datetime <= $${pIdx}::timestamp + interval '2 second'`;
+        sql += ` AND datetime = $${pIdx}::timestamp`;
         params.push(cleanDateStr);
         pIdx++;
       } else if (p.servTs) {
-        sql += ` AND serv_ts >= $${pIdx}::timestamp - interval '2 second'`;
-        sql += ` AND serv_ts <= $${pIdx}::timestamp + interval '2 second'`;
+        sql += ` AND serv_ts = $${pIdx}::timestamp`;
         params.push(cleanDateStr);
         pIdx++;
       }
@@ -1195,7 +1189,6 @@ export class WaferService {
     if (!eqpId || !startDate || !endDate) return [];
 
     try {
-      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
       const tableName = await this.resolveSpectrumTableName(params);
 
       const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
@@ -1205,15 +1198,17 @@ export class WaferService {
       if (stageGroup) { filterClause += ` AND f.stagegroup = $${queryParams.length + 1}`; queryParams.push(stageGroup); }
       if (film) { filterClause += ` AND f.film = $${queryParams.length + 1}`; queryParams.push(film); }
 
+      // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
       const sql = `
         SELECT s.ts, s.lotid, s.waferid, s.point, s.wavelengths, s."values"
         FROM ${tableName} s
         JOIN public.plg_wf_flat f 
-          ON s.eqpid = f.eqpid 
-          AND s.lotid = f.lotid 
+          ON TRIM(s.eqpid) = TRIM(f.eqpid) 
+          AND TRIM(s.lotid) = TRIM(f.lotid) 
           AND s.waferid::integer = f.waferid
           AND s.point = f.point
-        WHERE s.eqpid = $1
+          AND s.ts = f.datetime
+        WHERE TRIM(s.eqpid) = TRIM($1)
           AND s.ts >= $2
           AND s.ts <= $3
           ${filterClause}
@@ -1278,7 +1273,6 @@ export class WaferService {
     if (!eqpId || !lotId || !pointId) return null;
 
     try {
-      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
       const tableName = await this.resolveSpectrumTableName(params);
 
       const bestGofSql = `
