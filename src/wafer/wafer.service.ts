@@ -143,6 +143,58 @@ export class WaferService {
     return new Date(cleanStr);
   }
 
+  // [핵심 헬퍼] 대상 Lot의 측정 일자를 역추적하여 올바른 월별 파티션 테이블(yYYYYmMM)을 반환합니다.
+  private async resolveSpectrumTableName(params: { eqpId?: string, lotId?: string, endDate?: string | Date, ts?: string | Date }): Promise<string> {
+    let targetDate = new Date();
+    
+    // 1. 단일 스펙트럼 조회 시 명확한 타임스탬프가 있는 경우
+    if (params.ts) {
+      targetDate = this.parseSafeDate(params.ts);
+    } 
+    // 2. Lot ID가 주어졌을 때 plg_wf_flat에서 해당 Lot의 실제 구동 일자(MAX serv_ts)를 추출
+    else if (params.lotId && params.eqpId) {
+      try {
+        const res = await this.prisma.$queryRawUnsafe<any[]>(
+          `SELECT MAX(serv_ts) as max_ts FROM public.plg_wf_flat WHERE TRIM(eqpid) = TRIM($1) AND TRIM(lotid) = TRIM($2)`,
+          params.eqpId, params.lotId
+        );
+        if (res[0]?.max_ts) {
+          targetDate = new Date(res[0].max_ts);
+        } else if (params.endDate) {
+          targetDate = this.parseSafeDate(params.endDate);
+        }
+      } catch(e) {
+        if (params.endDate) targetDate = this.parseSafeDate(params.endDate);
+      }
+    } 
+    // 3. 그 외에는 사용자가 선택한 End Date 기준 적용
+    else if (params.endDate) {
+      targetDate = this.parseSafeDate(params.endDate);
+    }
+
+    // 오늘 날짜인 경우 Base 테이블 쿼리
+    const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
+    if (isToday) return 'public.plg_onto_spectrum';
+
+    // 오늘이 아닐 경우 월별 파티션 테이블(예: plg_onto_spectrum_y2026m03) 조립
+    const yy = dayjs(targetDate).format('YYYY');
+    const mm = dayjs(targetDate).format('MM');
+    const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
+
+    try {
+      const tableExists = await this.prisma.$queryRawUnsafe<any[]>(
+        `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
+        partTable
+      );
+      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
+        return `public.${partTable}`;
+      }
+    } catch(e) {}
+    
+    // 폴백 (파티션이 없으면 기본 테이블을 조회)
+    return 'public.plg_onto_spectrum';
+  }
+
   private async checkSpectrumExists(
     eqpId: string, 
     lotId: string, 
@@ -270,9 +322,12 @@ export class WaferService {
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
+    // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+    const tableName = await this.resolveSpectrumTableName(params);
+
     let sql = `
       SELECT DISTINCT s.point
-      FROM public.plg_onto_spectrum s
+      FROM ${tableName} s
       JOIN public.plg_wf_flat f 
         ON TRIM(s.eqpid) = TRIM(f.eqpid)
         AND TRIM(s.lotid) = TRIM(f.lotid)
@@ -362,6 +417,9 @@ export class WaferService {
     if (!dynamicColumns.includes('gof')) dynamicColumns.push('gof');
     dynamicColumns = [...new Set(dynamicColumns)];
 
+    // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+    const tableName = await this.resolveSpectrumTableName(params);
+
     const queryParams: (string | number | Date)[] = [];
     const selectColumns = dynamicColumns.map((col) => `f."${col}"`).join(', ');
 
@@ -370,7 +428,7 @@ export class WaferService {
         s."waferid", s."wavelengths", s."values", s."ts", s."eqpid",
         f."serv_ts", f."lotid",
         ${selectColumns}
-      FROM public.plg_onto_spectrum s
+      FROM ${tableName} s
       JOIN public.plg_wf_flat f 
         ON TRIM(s.lotid) = TRIM(f.lotid) 
         AND s.waferid::integer = f."waferid"
@@ -472,17 +530,8 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      const now = new Date();
-      const tYear = targetDate.getFullYear();
-      const tMonth = targetDate.getMonth();
-      const cYear = now.getFullYear();
-      const cMonth = now.getMonth();
-
-      let tableName = 'public.plg_onto_spectrum';
-      if (tYear !== cYear || tMonth !== cMonth) {
-        const mm = String(tMonth + 1).padStart(2, '0');
-        tableName = `public.plg_onto_spectrum_y${tYear}m${mm}`;
-      }
+      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+      const tableName = await this.resolveSpectrumTableName({ ts });
 
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
@@ -525,7 +574,6 @@ export class WaferService {
     }
   }
 
-  // [핵심 변경] 레시피 조건들을 모두 PARTITION BY에 추가하여, 하나의 Wafer라도 레시피가 다르면 모두 표출되게 개선
   async getFlatData(params: WaferQueryParams) {
     const {
       eqpId,
@@ -875,15 +923,8 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
-      
-      let tableName = 'public.plg_onto_spectrum';
-      
-      if (!isToday) {
-        const yy = dayjs(targetDate).format('YYYY');
-        const mm = dayjs(targetDate).format('MM');
-        tableName = `public.plg_onto_spectrum_y${yy}m${mm}`;
-      }
+      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+      const tableName = await this.resolveSpectrumTableName({ ts });
 
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
@@ -920,7 +961,6 @@ export class WaferService {
     }
   }
 
-  // [핵심 변경] 모든 통계/포인트 조회에 Parameterized 쿼리 적용 (버그 방지 및 정밀화)
   private buildUniqueWhereParams(p: WaferQueryParams): { sql: string, params: any[] } | null {
     if (!p.eqpId) return null;
     let sql = `WHERE eqpid = $1`;
@@ -1155,6 +1195,9 @@ export class WaferService {
     if (!eqpId || !startDate || !endDate) return [];
 
     try {
+      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+      const tableName = await this.resolveSpectrumTableName(params);
+
       const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
       const queryParams: (string | number | Date)[] = [eqpId, s, e];
       let filterClause = '';
@@ -1164,7 +1207,7 @@ export class WaferService {
 
       const sql = `
         SELECT s.ts, s.lotid, s.waferid, s.point, s.wavelengths, s."values"
-        FROM public.plg_onto_spectrum s
+        FROM ${tableName} s
         JOIN public.plg_wf_flat f 
           ON s.eqpid = f.eqpid 
           AND s.lotid = f.lotid 
@@ -1235,6 +1278,9 @@ export class WaferService {
     if (!eqpId || !lotId || !pointId) return null;
 
     try {
+      // [수정됨] 하드코딩된 테이블명 대신 동적 파티션 테이블명 매핑
+      const tableName = await this.resolveSpectrumTableName(params);
+
       const bestGofSql = `
             SELECT waferid FROM public.plg_wf_flat
             WHERE eqpid = $1 AND lotid = $2 AND point = $3
@@ -1251,7 +1297,7 @@ export class WaferService {
       if (!bestData || bestData.length === 0) return null;
 
       const spectrumSql = `
-            SELECT wavelengths, "values" FROM public.plg_onto_spectrum
+            SELECT wavelengths, "values" FROM ${tableName}
             WHERE eqpid = $1 AND lotid = $2 AND waferid = $3 AND point = $4 AND class = 'EXP' 
             ORDER BY ts DESC LIMIT 1
         `;
