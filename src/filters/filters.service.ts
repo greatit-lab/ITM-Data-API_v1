@@ -7,39 +7,49 @@ import { Prisma } from '@prisma/client';
 export class FiltersService {
   constructor(private prisma: PrismaService) {}
 
-  // 1. Site 목록 조회 (RefSdwt 테이블 기준)
+  // 1. Site 목록 조회 (RefSdwt 테이블 기준, id 오름차순 정렬)
   async getSites() {
-    // [수정] site는 필수 컬럼이므로 { not: null } 체크 제거
-    const results = await this.prisma.refSdwt.findMany({
-      select: { site: true },
+    // Prisma의 groupBy를 사용하여 site별로 가장 작은 id(최초 생성 순서)를 찾고 그 기준으로 정렬합니다.
+    const results = await this.prisma.refSdwt.groupBy({
+      by: ['site'],
       where: { 
-        isUse: 'Y' // 사용 여부만 체크
+        isUse: 'Y' 
       },
-      distinct: ['site'], // DISTINCT site
-      orderBy: { site: 'asc' },
+      _min: {
+        id: true, // 그룹 내에서 가장 작은 id 값 찾기
+      },
+      orderBy: {
+        _min: {
+          id: 'asc', // 가장 작은 id를 기준으로 오름차순 정렬
+        },
+      },
     });
 
-    // 객체 배열 -> 문자열 배열 변환
     return results.map((r) => r.site);
   }
 
-  // 2. SDWT 목록 조회 (RefSdwt 테이블 기준)
+  // 2. SDWT 목록 조회 (RefSdwt 테이블 기준, id 오름차순 정렬)
   async getSdwts(site?: string) {
-    // [수정] sdwt는 필수 컬럼이므로 { not: null } 체크 제거
     const where: Prisma.RefSdwtWhereInput = { 
       isUse: 'Y' 
     };
     
-    // Site가 선택된 경우 해당 Site에 속한 SDWT만 조회
     if (site) {
       where.site = site;
     }
 
-    const results = await this.prisma.refSdwt.findMany({
-      select: { sdwt: true },
+    // Prisma의 groupBy를 사용하여 sdwt별로 가장 작은 id를 찾고 그 기준으로 정렬합니다.
+    const results = await this.prisma.refSdwt.groupBy({
+      by: ['sdwt'],
       where: where,
-      distinct: ['sdwt'], // DISTINCT sdwt
-      orderBy: { sdwt: 'asc' },
+      _min: {
+        id: true, // 그룹 내에서 가장 작은 id 값 찾기
+      },
+      orderBy: {
+        _min: {
+          id: 'asc', // 가장 작은 id를 기준으로 오름차순 정렬
+        },
+      },
     });
 
     return results.map((r) => r.sdwt);
