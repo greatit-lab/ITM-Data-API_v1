@@ -131,13 +131,12 @@ export class PerformanceService {
     eqpid?: string,
     interval: number = 60,
   ) {
-    const start = this.parseDate(startDate); 
-    const end = this.parseDate(endDate);     
-
+    // [수정] 광범위한 '%agent%' 와일드카드 제거 (SQLAgent, ZabbixAgent 등 타 프로세스 오탐지 원천 차단)
+    // 실제 ITM Agent의 실행 파일명으로 사용될 수 있는 명확한 패턴만 엄격하게 매핑
     let filterSql = Prisma.sql`
-      WHERE (p.process_name = 'ITM_Agent' OR p.process_name LIKE '%Agent%')
-        AND p.serv_ts >= ${start} 
-        AND p.serv_ts <= ${end}
+      WHERE (p.process_name ILIKE 'ITM_Agent' OR p.process_name ILIKE 'ITMAgent' OR p.process_name ILIKE 'ITM-Agent')
+        AND p.serv_ts >= CAST(${startDate} AS TIMESTAMP)
+        AND p.serv_ts <= CAST(${endDate} AS TIMESTAMP)
     `;
 
     if (eqpid) {
@@ -154,8 +153,8 @@ export class PerformanceService {
       const results = await this.prisma.$queryRaw`
         SELECT 
           to_timestamp(
-            (floor(extract(epoch from p.serv_ts) / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
-          ) as timestamp,
+            (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+          ) AT TIME ZONE 'UTC' as timestamp,
           p.eqpid as "eqpId",
           s.site as "site",
           r.sdwt as "sdwt",
@@ -163,9 +162,9 @@ export class PerformanceService {
           MAX(p.memory_commit_mb) as "memoryCommitMB", 
           MAX(i.app_ver) as "agentVersion"
         FROM public.eqp_proc_perf p
-        JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+        LEFT JOIN public.ref_equipment r ON p.eqpid = r.eqpid
         LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-        LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
+        LEFT JOIN public.agent_info i ON p.eqpid = i.eqpid
         ${filterSql}
         GROUP BY 1, 2, 3, 4
         ORDER BY 1 ASC
@@ -180,8 +179,8 @@ export class PerformanceService {
       const fallbackResults = await this.prisma.$queryRaw`
         SELECT 
           to_timestamp(
-            (floor(extract(epoch from p.serv_ts) / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
-          ) as timestamp,
+            (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+          ) AT TIME ZONE 'UTC' as timestamp,
           p.eqpid as "eqpId",
           s.site as "site",
           r.sdwt as "sdwt",
@@ -189,9 +188,9 @@ export class PerformanceService {
           0::numeric as "memoryCommitMB", 
           MAX(i.app_ver) as "agentVersion"
         FROM public.eqp_proc_perf p
-        JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+        LEFT JOIN public.ref_equipment r ON p.eqpid = r.eqpid
         LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-        LEFT JOIN public.agent_info i ON r.eqpid = i.eqpid
+        LEFT JOIN public.agent_info i ON p.eqpid = i.eqpid
         ${filterSql}
         GROUP BY 1, 2, 3, 4
         ORDER BY 1 ASC
