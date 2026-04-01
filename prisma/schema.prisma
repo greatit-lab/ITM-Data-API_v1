@@ -504,3 +504,17 @@ model SysAccessLog {
   @@index([loginId])
   @@map("sys_access_logs")
 }
+
+model SysStorageHistory {
+  id          BigInt    @id @default(autoincrement())
+  checkDate   DateTime  @map("check_date") @db.Date
+  tableName   String    @map("table_name") @db.VarChar(100)
+  sizeBytes   BigInt?   @default(0) @map("size_bytes")
+  rowCount    BigInt?   @default(0) @map("row_count")
+  storageType String?   @default("DB") @map("storage_type") @db.VarChar(20)
+  createdAt   DateTime? @default(now()) @map("created_at") @db.Timestamp(6)
+
+  @@unique([checkDate, tableName])
+  @@index([checkDate])
+  @@map("sys_storage_history")
+}
