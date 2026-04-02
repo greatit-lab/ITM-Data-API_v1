@@ -54,9 +54,6 @@ export class AdminController {
     return this.adminService.getUsageAnalytics(startDate, endDate);
   }
 
-  // =======================================================================
-  // [완전 교체됨] 프론트엔드 요구 규격에 맞춘 스토리지 상세 데이터 API
-  // =======================================================================
   @Get('storage-usage')
   async getStorageUsage(
     @Query('startDate') startDate: string,
@@ -64,15 +61,5 @@ export class AdminController {
     @Query('interval') interval: string,
   ) {
     return this.adminService.getStorageUsage(startDate, endDate, interval);
-  }
-
-  // =======================================================================
-  // [신규 추가] 누락된 스토리지 용량 기록을 즉시 실행하는 수동 동기화 API
-  // =======================================================================
-  @Post('storage-sync')
-  async syncStorageNow() {
-    // 기존에 00:01에 돌던 스케줄러 함수를 강제로 즉시 실행시킵니다.
-    await this.adminService.recordDailyStorageSize();
-    return { success: true, message: 'Storage size manually synced successfully.' };
   }
 }
