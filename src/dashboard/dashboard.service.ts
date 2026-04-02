@@ -22,8 +22,8 @@ interface AgentStatusRawResult {
   today_alarm_count: number;
   last_perf_serv_ts: Date | null;
   last_perf_eqp_ts: Date | null;
-  use_proxy: string | null; // [추가됨] 내부망 프록시 여부
-  proxy_ip: string | null;  // [추가됨] 내부망 IP
+  use_proxy: string | null; 
+  proxy_ip: string | null;  
 }
 
 @Injectable()
@@ -48,13 +48,11 @@ export class DashboardService {
   // 1. 대시보드 요약 정보 조회
   async getSummary(site?: string, sdwt?: string) {
     try {
-      // 빈 문자열 파라미터 처리 (빈 문자열이면 undefined로 변환하여 필터 무시)
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
 
       this.logger.debug(`getSummary called with - site: ${safeSite}, sdwt: ${safeSdwt}`);
 
-      // (1) 최신 Agent 버전 계산
       const distinctVersions = await this.prisma.agentInfo.findMany({
         distinct: ['appVer'],
         select: { appVer: true },
@@ -69,7 +67,6 @@ export class DashboardService {
       const latestAgentVersion =
         versions.length > 0 ? versions[versions.length - 1] : '';
 
-      // (2) 장비 필터 조건 생성
       const equipmentWhere: Prisma.RefEquipmentWhereInput = {
         sdwtRel: {
           isUse: 'Y',
@@ -78,22 +75,30 @@ export class DashboardService {
         ...(safeSdwt ? { sdwt: safeSdwt } : {}),
       };
 
-      // 시간 기준점 설정
+      // =======================================================================
+      // [핵심 변경 1] 타임존 오지랖 방지 (KST 기준 문자열 추출 후 UTC 강제 래핑)
+      // Prisma가 로컬 시간대를 UTC로 변환하여 전날 데이터가 섞이는 것을 차단합니다.
+      // =======================================================================
       const now = new Date();
-      const tenMinutesAgo = new Date(now.getTime() - 10 * 60 * 1000);
-      const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-
-      // (3) 주요 카운트 조회
+      const kstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000); // 명시적 KST 변환
       
-      // [핵심 변경] cfgServer 쿼리에서 사용할 대상 장비(eqpid) 목록을 필터 기반으로 먼저 추출합니다.
+      const todayStr = kstNow.toISOString().split('T')[0];
+      const startOfToday = new Date(`${todayStr}T00:00:00.000Z`);
+
+      const tenMinAgoKst = new Date(kstNow.getTime() - 10 * 60 * 1000);
+      const tenMinAgoStr = tenMinAgoKst.toISOString().substring(0, 19);
+      const tenMinutesAgo = new Date(`${tenMinAgoStr}.000Z`);
+
+      const oneHourAgoKst = new Date(kstNow.getTime() - 60 * 60 * 1000);
+      const oneHourAgoStr = oneHourAgoKst.toISOString().substring(0, 19);
+      const oneHourAgo = new Date(`${oneHourAgoStr}.000Z`);
+
       const targetEqps = await this.prisma.refEquipment.findMany({
         where: equipmentWhere,
         select: { eqpid: true }
       });
       const eqpIds = targetEqps.map(e => e.eqpid);
 
-      // 전체 장비 수 (Agent 정보가 있는 장비 대상)
       const totalEqp = await this.prisma.refEquipment.count({ 
         where: { 
           ...equipmentWhere,
@@ -101,12 +106,10 @@ export class DashboardService {
         } 
       });
 
-      // [핵심 변경] 전체 서버 설정 수 (필터링된 eqpIds 범위 내에서만 카운트)
       const totalServers = await this.prisma.cfgServer.count({
         where: { eqpid: { in: eqpIds } }
       });
 
-      // [핵심 변경] 활성 서버 수 (최근 10분 내 업데이트 & 필터링된 eqpIds 범위 내에서만 카운트)
       const activeServers = await this.prisma.cfgServer.count({
         where: { 
           update: { gte: tenMinutesAgo },
@@ -114,7 +117,6 @@ export class DashboardService {
         }
       });
 
-      // 전체 SDWT 수
       const totalSdwts = await this.prisma.refSdwt.count({
         where: { 
           isUse: 'Y', 
@@ -122,7 +124,6 @@ export class DashboardService {
         }
       });
 
-      // (4) 에러 통계 조회
       let todayErrorCount = 0;
       let todayErrorTotalCount = 0;
       let newAlarmCount = 0;
@@ -131,13 +132,13 @@ export class DashboardService {
         const [totalError, recentError] = await Promise.all([
           this.prisma.plgError.count({
             where: {
-              timeStamp: { gte: startOfToday },
+              timeStamp: { gte: startOfToday }, // 강제 보정된 KST 자정값 투입
               equipment: equipmentWhere,
             },
           }),
           this.prisma.plgError.count({
             where: { 
-              timeStamp: { gte: oneHourAgo }, 
+              timeStamp: { gte: oneHourAgo }, // 강제 보정된 KST 1시간전 투입
               equipment: equipmentWhere 
             },
           }),
@@ -146,7 +147,6 @@ export class DashboardService {
         todayErrorTotalCount = totalError;
         newAlarmCount = recentError;
 
-        // 에러 발생 장비 수 (Distinct Count)
         if (todayErrorTotalCount > 0) {
            const errorEqps = await this.prisma.plgError.findMany({
              where: {
@@ -163,7 +163,6 @@ export class DashboardService {
         this.logger.warn("Error stats query failed:", err);
       }
 
-      // 비활성 에이전트 수 계산
       const inactiveAgentCount = Math.max(0, totalEqp - activeServers);
 
       return {
@@ -191,7 +190,6 @@ export class DashboardService {
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
 
-      // 동적 WHERE 절 구성
       let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
 
       if (safeSdwt) {
@@ -200,7 +198,14 @@ export class DashboardService {
         whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${safeSite})`;
       }
 
-      // [변경됨] cfg_server (cs)를 조인하여 use_proxy 와 proxy_ip 를 불러옵니다.
+      // =======================================================================
+      // [핵심 변경 2] Raw Query에서의 CURRENT_DATE 보정
+      // DB 서버의 타임존에 따라 CURRENT_DATE가 전날을 가리키는 현상을 방지하기 위해,
+      // 백엔드에서 KST 문자열을 직접 추출하여 파라미터로 주입합니다.
+      // =======================================================================
+      const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+      const todayDateStr = kstNow.toISOString().split('T')[0];
+
       const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
         SELECT 
             a.eqpid, 
@@ -229,14 +234,13 @@ export class DashboardService {
         LEFT JOIN (
             SELECT eqpid, COUNT(*) AS alarm_count 
             FROM public.plg_error 
-            WHERE time_stamp >= CURRENT_DATE
+            WHERE time_stamp >= CAST(${todayDateStr} AS TIMESTAMP)
             GROUP BY eqpid
         ) e ON a.eqpid = e.eqpid
         ${whereCondition}
         ORDER BY a.eqpid ASC;
       `;
 
-      // 결과 매핑 및 Time Drift 계산
       return results.map((r) => {
         let clockDrift: number | null = null;
         if (r.last_perf_serv_ts && r.last_perf_eqp_ts) {
@@ -261,8 +265,8 @@ export class DashboardService {
           timezone: r.timezone || '',
           todayAlarmCount: r.today_alarm_count,
           clockDrift: clockDrift,
-          useProxy: r.use_proxy || 'N', // [추가됨] 프록시 사용 여부 매핑
-          proxyIp: r.proxy_ip || '',    // [추가됨] 프록시 IP 매핑
+          useProxy: r.use_proxy || 'N', 
+          proxyIp: r.proxy_ip || '',    
         };
       });
     } catch (error) {
