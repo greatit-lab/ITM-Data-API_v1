@@ -17,22 +17,40 @@ export class ErrorService {
 
   constructor(private prisma: PrismaService) {}
 
-  // [Helper] 날짜 파싱 및 기본값 설정
+  // [핵심 수정 1] Prisma 타임존 오지랖 방지: 순수 문자열 추출 후 UTC(Z)로 강제 래핑
   private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
-    const now = new Date();
-    
-    let startDate = start ? new Date(start) : new Date();
-    if (isNaN(startDate.getTime()) || !start) {
-        startDate = new Date();
-        startDate.setDate(startDate.getDate() - 7);
-    }
-    startDate.setHours(0, 0, 0, 0);
+    const extractDateStr = (d?: string | Date, isStart: boolean = false): string => {
+      if (!d) {
+        // 기본값: 서버의 KST 시간 기준 오늘/7일전
+        const temp = new Date();
+        const kstTime = new Date(temp.getTime() + 9 * 60 * 60 * 1000);
+        if (isStart) kstTime.setDate(kstTime.getDate() - 7);
+        return kstTime.toISOString().split('T')[0];
+      }
+      
+      const dStr = typeof d === 'string' ? d : d.toISOString();
+      
+      // '2026-04-02' 형태면 그대로 반환
+      if (dStr.length === 10) return dStr;
+      
+      // '2026-04-01T15:00:00.000Z' 형태면, KST로 변환해 사용자가 실제 의도한 날짜 문자열 도출
+      if (dStr.includes('T')) {
+        const parsed = new Date(dStr);
+        if(!isNaN(parsed.getTime())) {
+            const kstDate = new Date(parsed.getTime() + 9 * 60 * 60 * 1000);
+            return kstDate.toISOString().split('T')[0];
+        }
+      }
+      
+      return dStr.substring(0, 10);
+    };
 
-    let endDate = end ? new Date(end) : now;
-    if (isNaN(endDate.getTime())) {
-        endDate = now;
-    }
-    endDate.setHours(23, 59, 59, 999);
+    const startStr = extractDateStr(start, true);
+    const endStr = extractDateStr(end, false);
+
+    // Prisma가 2026-04-02 00:00:00 문자열을 DB에 '그대로' 던지도록 유도
+    const startDate = new Date(`${startStr}T00:00:00.000Z`);
+    const endDate = new Date(`${endStr}T23:59:59.999Z`);
 
     return { startDate, endDate };
   }
@@ -140,6 +158,7 @@ export class ErrorService {
       }
     }
 
+    // [핵심 수정 2] DB 데이터가 이미 로컬 시간 기준이므로 INTERVAL 보정을 제거
     const sql = `
       SELECT DATE(e.time_stamp) as date, COUNT(*)::int as count
       FROM public.plg_error e
@@ -162,7 +181,7 @@ export class ErrorService {
     }
   }
 
-  // 3. [수정] 에러 목록 조회 (필드 매핑 강화)
+  // 3. 에러 목록 조회
   async getErrorList(params: ErrorQueryParams & { page?: number, pageSize?: number }) {
     const { site, sdwt, eqpId, start, end, page = 0, pageSize = 50 } = params;
     const { startDate, endDate } = this.getSafeDates(start, end);
@@ -183,7 +202,6 @@ export class ErrorService {
     }
 
     try {
-      // 페이지네이션 값 안전 변환
       const take = Number(pageSize) || 50;
       const skip = (Number(page) || 0) * take;
 
@@ -197,16 +215,23 @@ export class ErrorService {
         }),
       ]);
 
-      // [핵심] 프론트엔드 DataTable 필드명과 정확히 일치하도록 매핑
-      const mappedItems = items.map((item: any) => ({
-        eqpId: item.eqpid,           // Frontend: eqpId
-        errorId: item.errorId,       // Frontend: errorId
-        errorLabel: item.errorLabel, // Frontend: errorLabel
-        errorDesc: item.errorDesc,   // Frontend: errorDesc
-        timeStamp: item.timeStamp,   // Frontend: timeStamp
-        extraMessage1: item.extraMessage1,
-        extraMessage2: item.extraMessage2,
-      }));
+      // [핵심 수정 3] 프론트엔드가 날짜를 잘못 변환하지 못하도록, 백엔드에서 명시적 String 처리
+      const mappedItems = items.map((item: any) => {
+        // item.timeStamp 객체를 YYYY-MM-DD HH:mm:ss 문자열로 하드코딩 변환
+        const formattedDate = item.timeStamp 
+          ? new Date(item.timeStamp).toISOString().replace('T', ' ').substring(0, 19)
+          : null;
+
+        return {
+          eqpId: item.eqpid,
+          errorId: item.errorId,
+          errorLabel: item.errorLabel,
+          errorDesc: item.errorDesc,
+          timeStamp: formattedDate, // Date 객체 대신 문자열 전달
+          extraMessage1: item.extraMessage1,
+          extraMessage2: item.extraMessage2,
+        };
+      });
 
       return { totalItems: total, items: mappedItems };
     } catch (e) {
