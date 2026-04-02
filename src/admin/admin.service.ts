@@ -12,11 +12,10 @@ export class AdminService {
 
   constructor(private prisma: PrismaService) {}
 
-  // [수정됨] 밀리초를 0으로 강제 초기화하여 DB 삽입 시 꼬리표가 붙지 않도록 처리
   private getKstDate(): Date {
     const now = new Date();
     const kstDate = new Date(now.getTime() + 9 * 60 * 60 * 1000);
-    kstDate.setMilliseconds(0); // 밀리초 절사
+    kstDate.setMilliseconds(0);
     return kstDate;
   }
 
@@ -46,18 +45,15 @@ export class AdminService {
   }
 
   // =======================================================================
-  // [스케줄러] 매일 00:01에 S3 파일서버 및 DB 테이블 물리적 용량 자동 스냅샷
+  // [스케줄러] 매일 00:01 실행
   // =======================================================================
   @Cron('0 1 0 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
-    this.logger.log('Starting daily storage size recording (Files & DB)...');
+    this.logger.log('Starting daily storage size recording (Cron)...');
     const kstNow = this.getKstDate();
-    
-    // [수정됨] 자정에 실행된 스냅샷을 '전날(어제)' 날짜로 귀속하여 DB에 저장합니다.
-    // 예: 4월 2일 00:01 실행 -> 4월 1일로 기록
     const checkDate = new Date(Date.UTC(kstNow.getFullYear(), kstNow.getMonth(), kstNow.getDate() - 1));
 
-    // 1. Upload API 연동 (오브젝트 스토리지 파일 용량 수집)
+    // 1. Upload API 연동 (오브젝트 스토리지) - [FILE 타입: 일일 증가량(Delta) 기록]
     try {
       const uploadApiUrl = process.env.UPLOAD_API_URL || 'http://127.0.0.1:8082';
       const targetUrl = `${uploadApiUrl}/api/FileUpload/size`;
@@ -65,18 +61,29 @@ export class AdminService {
       const data = await this.fetchUploadApiSize(targetUrl);
 
       if (data && data.success) {
+        const currentTotalBytes = Number(data.sizeBytes); 
+
+        // DB에 기록된 FILE 타입의 '모든 일일 증가량 합계(누적)' 조회
+        const sumResult = await this.prisma.sysStorageHistory.aggregate({
+          _sum: { sizeBytes: true },
+          where: { storageType: 'FILE' }
+        });
+        const previousTotalBytes = Number(sumResult._sum.sizeBytes || 0);
+
+        // 현재 총용량 - 과거 DB 누적 용량 = 어제 하루 동안의 순수 증가량
+        const dailyIncrementBytes = currentTotalBytes - previousTotalBytes;
+
         await this.prisma.sysStorageHistory.upsert({
           where: { checkDate_tableName: { checkDate: checkDate, tableName: 'OBJECT_STORE_TOTAL' } },
-          update: { sizeBytes: data.sizeBytes },
-          create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: data.sizeBytes, storageType: 'FILE', createdAt: kstNow },
+          update: { sizeBytes: dailyIncrementBytes },
+          create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: dailyIncrementBytes, storageType: 'FILE', createdAt: kstNow },
         });
-        this.logger.log(`File storage size recorded successfully for date: ${checkDate.toISOString().split('T')[0]}`);
       }
     } catch (error: any) {
-      this.logger.error(`[Upload API Error] Failed to connect: ${error.message}. Please check UPLOAD_API_URL in .env`);
+      this.logger.error(`[Upload API Error] Failed to connect: ${error.message}`);
     }
 
-    // 2. DB 물리적 테이블 크기 측정
+    // 2. DB 물리적 테이블 크기 측정 - [DB 타입: 총 스냅샷(Snapshot) 용량 기록]
     try {
       const dbTables: any[] = await this.prisma.$queryRaw`
         SELECT
@@ -86,6 +93,13 @@ export class AdminService {
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
+          AND EXISTS (
+            SELECT 1 
+            FROM information_schema.columns col 
+            WHERE col.table_schema = n.nspname 
+              AND col.table_name = c.relname 
+              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
+          )
       `;
 
       for (const t of dbTables) {
@@ -102,14 +116,13 @@ export class AdminService {
           },
         });
       }
-      this.logger.log(`DB table sizes recorded successfully for date: ${checkDate.toISOString().split('T')[0]}`);
     } catch (error: any) {
-      this.logger.error(`[DB Cron Error] ${error.message}`);
+      this.logger.error(`[DB Query Error] ${error.message}`);
     }
   }
 
   // =======================================================================
-  // [조회 API] 프론트엔드로 전달할 실시간 및 트렌드 데이터 취합
+  // [조회 API] 프론트엔드로 전달할 트렌드 데이터 취합
   // =======================================================================
   async getStorageUsage(startDate: string, endDate: string, interval: string) {
     const start = new Date(`${startDate}T00:00:00.000Z`);
@@ -118,7 +131,7 @@ export class AdminService {
     let totalDbUsageMB = 0;
     let tableDetails: any[] = [];
     
-    // 1. PostgreSQL 물리 테이블 용량 실시간 조회
+    // 1. PostgreSQL 물리 테이블 실시간 용량 조회
     try {
       const dbTables: any[] = await this.prisma.$queryRaw`
         SELECT
@@ -128,6 +141,13 @@ export class AdminService {
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
+          AND EXISTS (
+            SELECT 1 
+            FROM information_schema.columns col 
+            WHERE col.table_schema = n.nspname 
+              AND col.table_name = c.relname 
+              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
+          )
         ORDER BY pg_total_relation_size(c.oid) DESC
       `;
 
@@ -155,12 +175,12 @@ export class AdminService {
         throw new Error('API returned false');
       }
     } catch (error: any) {
-      this.logger.warn(`[File Storage Warning] Real-time fetch failed (${error.message}). Checking DB History fallback.`);
-      const latestObj = await this.prisma.sysStorageHistory.findFirst({
-        where: { storageType: 'FILE' },
-        orderBy: { checkDate: 'desc' }
+      this.logger.warn(`[File Storage Warning] Real-time fetch failed. Checking DB History fallback.`);
+      const fallbackSum = await this.prisma.sysStorageHistory.aggregate({
+        _sum: { sizeBytes: true },
+        where: { storageType: 'FILE' }
       });
-      totalObjectStorageMB = latestObj ? Number(latestObj.sizeBytes) / (1024 * 1024) : 0;
+      totalObjectStorageMB = Number(fallbackSum._sum.sizeBytes || 0) / (1024 * 1024);
     }
 
     // 3. 차트용 트렌드 분석
@@ -173,26 +193,33 @@ export class AdminService {
         orderBy: { checkDate: 'asc' }
       });
 
-      const dateMap = new Map<string, { cumDbBytes: number, cumObjBytes: number }>();
+      // 날짜별로 DB 총용량과 FILE 증가량을 그룹화
+      const dateMap = new Map<string, { dbBytes: number, objBytes: number }>();
       histories.forEach(h => {
         const dateStr = h.checkDate.toISOString().split('T')[0];
-        if (!dateMap.has(dateStr)) dateMap.set(dateStr, { cumDbBytes: 0, cumObjBytes: 0 });
+        if (!dateMap.has(dateStr)) dateMap.set(dateStr, { dbBytes: 0, objBytes: 0 });
         const data = dateMap.get(dateStr)!;
-        if (h.storageType === 'FILE') data.cumObjBytes += Number(h.sizeBytes);
-        else data.cumDbBytes += Number(h.sizeBytes);
+        
+        if (h.storageType === 'FILE') {
+          data.objBytes += Number(h.sizeBytes); // FILE은 당일 기록된 증가량
+        } else {
+          data.dbBytes += Number(h.sizeBytes);  // DB는 당일 기록된 총용량 (절대 빼지 않음)
+        }
       });
 
       const trendDates = Array.from(dateMap.keys()).sort();
-      let prevDbMB = 0; let prevObjMB = 0;
+      let runningCumObjMB = 0;
 
+      // FILE 데이터의 경우 '증가량'을 저장하므로, 차트 시작일 이전의 과거 누적합을 먼저 구함
       if (trendDates.length > 0) {
         const firstDate = new Date(trendDates[0]);
-        firstDate.setUTCDate(firstDate.getUTCDate() - 1);
-        const prevData = await this.prisma.sysStorageHistory.groupBy({ by: ['storageType'], where: { checkDate: firstDate }, _sum: { sizeBytes: true } });
-        prevData.forEach(p => {
-          if (p.storageType === 'FILE') prevObjMB = Number(p._sum.sizeBytes || 0) / (1024 * 1024);
-          else prevDbMB += Number(p._sum.sizeBytes || 0) / (1024 * 1024);
+        firstDate.setUTCDate(firstDate.getUTCDate() - 1); 
+
+        const prevObjSum = await this.prisma.sysStorageHistory.aggregate({
+          _sum: { sizeBytes: true },
+          where: { storageType: 'FILE', checkDate: { lte: firstDate } }
         });
+        runningCumObjMB = Number(prevObjSum._sum.sizeBytes || 0) / (1024 * 1024);
       }
 
       const monthlyMap = new Map<string, any>();
@@ -200,22 +227,31 @@ export class AdminService {
       for (let i = 0; i < trendDates.length; i++) {
         const date = trendDates[i];
         const current = dateMap.get(date)!;
-        const cumDbMB = current.cumDbBytes / (1024 * 1024);
-        const cumObjMB = current.cumObjBytes / (1024 * 1024);
 
-        const dailyDbMB = Math.max(0, cumDbMB - prevDbMB);
-        const dailyObjMB = Math.max(0, cumObjMB - prevObjMB);
+        // [핵심 수정] 어제 용량을 빼는 로직을 완전히 삭제했습니다.
+        // DB 테이블에 기록된 해당 일자의 데이터를 그대로 MB로 변환하여 사용합니다.
+        const dailyDbMB = current.dbBytes / (1024 * 1024); 
+        const dailyObjMB = current.objBytes / (1024 * 1024); 
 
-        dailyTrends.push({ date, cumDbMB, cumObjMB, dailyDbMB: (prevDbMB === 0 && i === 0) ? 0 : dailyDbMB, dailyObjMB: (prevObjMB === 0 && i === 0) ? 0 : dailyObjMB });
+        // FILE은 누적해서 선 차트를 그려야 하므로 누적합 계산
+        runningCumObjMB += dailyObjMB; 
+
+        dailyTrends.push({ 
+          date, 
+          cumDbMB: dailyDbMB,         // DB는 기록된 값 자체가 누적 총용량임
+          cumObjMB: runningCumObjMB, 
+          dailyDbMB: dailyDbMB,       // DB는 빼기 없이 있는 그대로 매핑
+          dailyObjMB: dailyObjMB 
+        });
 
         const month = date.substring(0, 7);
-        if (!monthlyMap.has(month)) monthlyMap.set(month, { date: month, cumDbMB, cumObjMB, monthlyDbMB: 0, monthlyObjMB: 0 });
+        if (!monthlyMap.has(month)) monthlyMap.set(month, { date: month, cumDbMB: dailyDbMB, cumObjMB: runningCumObjMB, monthlyDbMB: 0, monthlyObjMB: 0 });
         const m = monthlyMap.get(month)!;
-        m.monthlyDbMB += (prevDbMB === 0 && i === 0) ? 0 : dailyDbMB;
-        m.monthlyObjMB += (prevObjMB === 0 && i === 0) ? 0 : dailyObjMB;
-        m.cumDbMB = cumDbMB; m.cumObjMB = cumObjMB;
-
-        prevDbMB = cumDbMB; prevObjMB = cumObjMB;
+        
+        m.monthlyDbMB += dailyDbMB;
+        m.monthlyObjMB += dailyObjMB;
+        m.cumDbMB = dailyDbMB; 
+        m.cumObjMB = runningCumObjMB;
       }
       monthlyTrends.push(...Array.from(monthlyMap.values()));
     } catch (error: any) {
@@ -225,16 +261,8 @@ export class AdminService {
     return { summary: { totalDbUsageMB, totalObjectStorageMB }, tableDetails, dailyTrends, monthlyTrends };
   }
 
-  // =======================================================================
-  // [수동 동기화] 프론트엔드 버튼 클릭 시 강제로 용량 측정
-  // =======================================================================
-  async syncStorageNow() {
-    await this.recordDailyStorageSize();
-    return { success: true, message: 'Sync complete' };
-  }
-
   // -----------------------------------------------------------------------
-  // 이하 기존 권한 및 로그 관리 서비스 유지
+  // 이하 기존 권한 및 로그 관리 서비스는 이전과 동일 유지
   // -----------------------------------------------------------------------
   async getAllUsers() { return this.prisma.sysUser.findMany({ include: { context: { include: { sdwtInfo: true } } }, orderBy: { lastLoginAt: 'desc' }, }); }
   async getAllAdmins() { return this.prisma.cfgAdminUser.findMany({ orderBy: { assignedAt: 'desc' } }); }
