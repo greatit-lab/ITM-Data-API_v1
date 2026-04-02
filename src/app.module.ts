@@ -1,7 +1,8 @@
 // ITM-Data-API/src/app.module.ts
 import { Module, NestModule, MiddlewareConsumer, Logger } from '@nestjs/common';
 import { PrismaService } from './prisma.service';
-import { ConfigModule } from '@nestjs/config'; // ConfigModule 추가 권장
+import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule'; // [추가됨] 스케줄러 모듈
 
 // 1. 기존 데이터 API 모듈
 import { WaferModule } from './wafer/wafer.module';
@@ -17,7 +18,7 @@ import { FiltersModule } from './filters/filters.module';
 
 // [New] 게시판 및 알림 모듈
 import { BoardModule } from './board/board.module';
-import { AlertModule } from './alert/alert.module'; // [확인] 포함됨
+import { AlertModule } from './alert/alert.module';
 
 // 3. 비즈니스 로직 이관 모듈
 import { DashboardModule } from './dashboard/dashboard.module';
@@ -31,8 +32,11 @@ import { AgentModule } from './agent/agent.module';
 
 @Module({
   imports: [
-    // ConfigModule 설정 (필요 시)
+    // ConfigModule 설정
     ConfigModule.forRoot({ isGlobal: true }),
+    
+    // [추가됨] 백그라운드 스케줄러 (매일 00:01 실행을 위해 필수)
+    ScheduleModule.forRoot(),
 
     // 1. 데이터 모듈
     WaferModule,
