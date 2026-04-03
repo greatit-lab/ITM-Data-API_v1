@@ -1,5 +1,5 @@
 // ITM-Data-API/src/auth/auth.service.ts
-import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException, ForbiddenException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../prisma.service';
 import { LoginDto, SyncUserDto } from './auth.interface';
@@ -13,15 +13,52 @@ export class AuthService {
     private jwtService: JwtService,
   ) {}
 
-  // ---------------------------------------------------------
-  // [Helper] KST 시간 생성 함수
-  // ---------------------------------------------------------
   private getKstDate(): Date {
     const now = new Date();
-    // UTC 시간에 9시간(ms)을 더해 KST Date 객체 생성
     return new Date(now.getTime() + 9 * 60 * 60 * 1000);
   }
 
+  // =========================================================
+  // [인증 검증 로직] - 사용자의 요청에 따른 순서 재배치
+  // =========================================================
+
+  async checkWhitelist(loginId: string, compId?: string, deptId?: string) {
+    this.logger.log(`[Whitelist] Checking loginId=${loginId}, compId=${compId}, deptId=${deptId}`);
+
+    // 🌟 [1단계] 부서 단위 엄격 검증 (최우선 확인)
+    if (deptId) {
+      const access = await this.prisma.refAccessCode.findUnique({
+        where: { deptid: deptId }
+      });
+
+      if (access && access.isActive === 'Y') {
+        // 회사 코드 교차 검증 (보안 강화)
+        if (compId && access.compid && access.compid !== compId) {
+          this.logger.warn(`[Whitelist] Access Denied. Company Code mismatch for Dept: ${deptId}`);
+          throw new ForbiddenException('Company Code mismatch.');
+        }
+        this.logger.log(`[Whitelist] Access Granted via Dept: ${access.deptName}`);
+        return { isActive: 'Y', role: 'USER' };
+      }
+    }
+
+    // 🌟 [2단계] 개별 예외 사용자 확인 (부서 매칭 실패 시 확인)
+    const exceptionUser = await this.prisma.cfgUserException.findUnique({
+      where: { loginId }
+    });
+
+    if (exceptionUser && exceptionUser.isActive === 'Y') {
+      this.logger.log(`[Whitelist] Exception Access Granted for UserID: ${loginId}`);
+      return { isActive: 'Y', role: 'USER' }; 
+    }
+
+    // 🌟 [3단계] 모두 해당 없음 (이후 로직에서 게스트 신청 상태 확인으로 이어짐)
+    this.logger.warn(`[Whitelist] Access Denied. No matching Dept or Exception found for: ${loginId}`);
+    throw new NotFoundException('Not allowed');
+  }
+
+  // ... 이하 기존 코드(login, syncUser, checkGuest 등)는 동일하게 유지 ...
+  
   async login(loginDto: LoginDto) {
     return this.generateToken(loginDto.username, 'USER');
   }
@@ -30,13 +67,8 @@ export class AuthService {
     return this.generateToken(loginDto.username, 'GUEST');
   }
 
-  // =========================================================
-  // [Guest Request Logic] - 신청 등록 구현 (KST 적용)
-  // =========================================================
-
   async createGuestRequest(data: any) {
-    const kstNow = this.getKstDate(); // KST 시간
-
+    const kstNow = this.getKstDate();
     return this.prisma.cfgGuestRequest.create({
       data: {
         loginId: data.loginId,
@@ -58,146 +90,42 @@ export class AuthService {
     throw new NotFoundException('No request found');
   }
 
-  // =========================================================
-  // [Context Logic] - DB 연동 (KST 적용)
-  // =========================================================
-
   async getUserContext(loginId: string) {
-    if (!loginId) {
-      this.logger.error('[getUserContext] loginId is missing');
-      throw new BadRequestException('loginId is required');
-    }
-
-    this.logger.log(`[DB Query] Finding context for loginId: ${loginId}`);
-
+    if (!loginId) throw new BadRequestException('loginId is required');
     const context = await this.prisma.sysUserContext.findUnique({
       where: { loginId },
-      include: {
-        sdwtInfo: true, 
-      },
+      include: { sdwtInfo: true },
     });
-
-    if (!context) {
-      this.logger.warn(`[DB Result] No SysUserContext found for loginId: ${loginId}`);
-      return null;
-    }
-
-    if (!context.sdwtInfo) {
-      this.logger.warn(`[DB Result] Context found but 'sdwtInfo' (Join) is null. lastSdwtId: ${context.lastSdwtId}`);
-      return null;
-    }
-
-    const result = {
-      site: context.sdwtInfo.site,
-      sdwt: context.sdwtInfo.sdwt,
-    };
-
-    this.logger.log(`[DB Result] Success. Returning: ${JSON.stringify(result)}`);
-    return result;
+    if (!context || !context.sdwtInfo) return null;
+    return { site: context.sdwtInfo.site, sdwt: context.sdwtInfo.sdwt };
   }
 
   async saveUserContext(loginId: string, site: string, sdwtName: string) {
-    this.logger.log(`[saveUserContext] Searching RefSdwt for Site: ${site}, Name: ${sdwtName}`);
-
-    const sdwtInfo = await this.prisma.refSdwt.findFirst({
-      where: {
-        site: site,
-        sdwt: sdwtName,
-      },
-    });
-
-    if (!sdwtInfo) {
-      this.logger.error(`[saveUserContext] SDWT Info not found in DB.`);
-      throw new NotFoundException(`SDWT info not found for Site: ${site}, Name: ${sdwtName}`);
-    }
-
-    // KST 시간 적용
+    const sdwtInfo = await this.prisma.refSdwt.findFirst({ where: { site, sdwt: sdwtName } });
+    if (!sdwtInfo) throw new NotFoundException(`SDWT info not found`);
     const kstNow = this.getKstDate();
-
-    // 사용자 정보 없으면 생성 (안전장치)
     const userExists = await this.prisma.sysUser.findUnique({ where: { loginId } });
     if (!userExists) {
-        this.logger.log(`[saveUserContext] Creating SysUser for safety.`);
-        await this.prisma.sysUser.create({
-            data: { 
-              loginId, 
-              loginCount: 1, 
-              lastLoginAt: kstNow,
-              createdAt: kstNow
-            }
-        });
+        await this.prisma.sysUser.create({ data: { loginId, loginCount: 1, lastLoginAt: kstNow, createdAt: kstNow } });
     }
-
-    // Context 저장 (KST 적용)
     await this.prisma.sysUserContext.upsert({
       where: { loginId },
-      update: {
-        lastSdwtId: sdwtInfo.id,
-        updatedAt: kstNow,
-      },
-      create: {
-        loginId,
-        lastSdwtId: sdwtInfo.id,
-        updatedAt: kstNow,
-      },
+      update: { lastSdwtId: sdwtInfo.id, updatedAt: kstNow },
+      create: { loginId, lastSdwtId: sdwtInfo.id, updatedAt: kstNow },
     });
-
-    this.logger.log(`[saveUserContext] Successfully saved.`);
     return { status: 'success', site, sdwt: sdwtName };
-  }
-
-  // =========================================================
-  // [Backend 연동 로직] - Whitelist 및 권한 검증
-  // =========================================================
-
-  async checkWhitelist(compId?: string, deptId?: string) {
-    this.logger.log(`[Whitelist] Checking compId=${compId}, deptId=${deptId}`);
-
-    const conditions: any[] = [];
-    if (compId) conditions.push({ compid: compId, isActive: 'Y' });
-    if (deptId) conditions.push({ deptid: deptId, isActive: 'Y' });
-
-    if (conditions.length === 0) {
-      this.logger.warn(`[Whitelist] No compId or deptId provided.`);
-      throw new BadRequestException('Company Code or Dept ID is required');
-    }
-
-    const access = await this.prisma.refAccessCode.findFirst({
-      where: { OR: conditions }
-    });
-
-    if (access) {
-      this.logger.log(`[Whitelist] Access Granted: ${access.compName || access.deptName || 'Unknown Name'}`);
-      return { isActive: 'Y' };
-    }
-
-    this.logger.warn(`[Whitelist] Access Denied. No matching active code found.`);
-    throw new NotFoundException('Not allowed');
   }
 
   async syncUser(dto: SyncUserDto) {
     const loginId = dto.loginId || dto.username || 'unknown';
-    this.logger.log(`[Sync] Syncing user: ${loginId}`);
-    
     const kstNow = this.getKstDate();
-
     try {
       await this.prisma.sysUser.upsert({
         where: { loginId },
-        update: { 
-            lastLoginAt: kstNow, 
-            loginCount: { increment: 1 } 
-        },
-        create: { 
-            loginId, 
-            loginCount: 1, 
-            lastLoginAt: kstNow,
-            createdAt: kstNow 
-        },
+        update: { lastLoginAt: kstNow, loginCount: { increment: 1 } },
+        create: { loginId, loginCount: 1, lastLoginAt: kstNow, createdAt: kstNow },
       });
-    } catch (e) {
-      this.logger.error(`[Sync] DB Error (Ignored): ${e}`);
-    }
+    } catch (e) { this.logger.error(`[Sync] DB Error: ${e}`); }
     return { loginId, status: 'synced' };
   }
 
@@ -207,31 +135,17 @@ export class AuthService {
     throw new NotFoundException('Not an admin');
   }
 
-  /**
-   * [수정] Guest 권한 확인 (KST 기준) 및 유효기간 반환
-   */
   async checkGuest(loginId: string) {
     const guest = await this.prisma.cfgGuestAccess.findUnique({ where: { loginId } });
-    
-    // 현재 시간(KST) 생성
     const kstNow = this.getKstDate();
-
-    // 유효기간 검증: validUntil이 현재 시간보다 미래여야 함
     if (guest && guest.validUntil > kstNow) {
-       return { 
-         grantedRole: 'GUEST',
-         validUntil: guest.validUntil // 프론트엔드 알림을 위해 반환
-       };
+       return { grantedRole: 'GUEST', validUntil: guest.validUntil };
     }
-    
     throw new NotFoundException('Not a guest');
   }
 
   private generateToken(username: string, role: string) {
     const payload = { username, role, sub: username };
-    return {
-      accessToken: this.jwtService.sign(payload),
-      user: { username, role },
-    };
+    return { accessToken: this.jwtService.sign(payload), user: { username, role } };
   }
 }
