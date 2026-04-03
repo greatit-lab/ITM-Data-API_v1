@@ -17,6 +17,12 @@ export class AdminController {
   @Put('access-codes/:deptid') async updateAccessCode(@Param('deptid') deptid: string, @Body() body: any) { return this.adminService.updateAccessCode(deptid, body); }
   @Delete('access-codes/:deptid') async deleteAccessCode(@Param('deptid') deptid: string) { return this.adminService.deleteAccessCode(deptid); }
 
+  // 🌟 [추가됨] 예외 접근 허용 관리 API 
+  @Get('exceptions') async getExceptionUsers() { return this.adminService.getExceptionUsers(); }
+  @Post('exceptions') async addExceptionUser(@Body() body: any) { return this.adminService.addExceptionUser(body); }
+  @Put('exceptions/:loginId/status') async updateExceptionUserStatus(@Param('loginId') loginId: string, @Body() body: { isActive: string }) { return this.adminService.updateExceptionUserStatus(loginId, body.isActive); }
+  @Delete('exceptions/:loginId') async deleteExceptionUser(@Param('loginId') loginId: string) { return this.adminService.deleteExceptionUser(loginId); }
+
   @Get('guests') async getAllGuests() { return this.adminService.getAllGuests(); }
   @Post('guests') async addGuest(@Body() body: any) { return this.adminService.addGuest(body); }
   @Delete('guests/:loginId') async deleteGuest(@Param('loginId') loginId: string) { return this.adminService.deleteGuest(loginId); }
@@ -47,19 +53,12 @@ export class AdminController {
   }
 
   @Get('usage-analytics')
-  async getUsageAnalytics(
-    @Query('startDate') startDate: string,
-    @Query('endDate') endDate: string,
-  ) {
+  async getUsageAnalytics(@Query('startDate') startDate: string, @Query('endDate') endDate: string) {
     return this.adminService.getUsageAnalytics(startDate, endDate);
   }
 
   @Get('storage-usage')
-  async getStorageUsage(
-    @Query('startDate') startDate: string,
-    @Query('endDate') endDate: string,
-    @Query('interval') interval: string,
-  ) {
+  async getStorageUsage(@Query('startDate') startDate: string, @Query('endDate') endDate: string, @Query('interval') interval: string) {
     return this.adminService.getStorageUsage(startDate, endDate, interval);
   }
 }
