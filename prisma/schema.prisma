@@ -250,7 +250,7 @@ model RefAccessCode {
   @@map("ref_access_code")
 }
 
-// 🌟 [추가됨] 예외 접근 허용 사내 직원 관리 테이블
+// [추가됨] 예외 접근 허용 사내 직원 관리 테이블
 model CfgUserException {
   loginId      String   @id @map("login_id") @db.VarChar(50)
   deptCode     String?  @map("dept_code") @db.VarChar(50)
