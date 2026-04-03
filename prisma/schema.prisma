@@ -33,7 +33,7 @@ model RefEquipment {
   agentInfo  AgentInfo?
   agentStatus AgentStatus?
   itmInfo    ItmInfo?
-  cfgServer  CfgServer? // CfgServer와의 관계
+  cfgServer  CfgServer?
 
   plgErrors  PlgError[]
   eqpPerfs   EqpPerf[]
@@ -185,7 +185,7 @@ model EqpProcPerf {
   eqpid          String
   servTs         DateTime @map("serv_ts")
   processName    String   @map("process_name")
-  memoryUsageMB Float?    @map("memory_usage_mb")
+  memoryUsageMB  Float?   @map("memory_usage_mb")
   memoryCommitMB Float?   @map("memory_commit_mb")
 
   @@id([eqpid, servTs, processName])
@@ -240,9 +240,9 @@ model ErrSeverityMap {
 model RefAccessCode {
   compid      String?   @map("compid") @db.VarChar(50) 
   compName    String?   @map("comp_name") @db.VarChar(100)
-  deptid      String    @id @map("deptid") @db.VarChar(50) // [수정] PK 변경
+  deptid      String    @id @map("deptid") @db.VarChar(50) 
   deptName    String?   @map("dept_name") @db.VarChar(100)
-  description String?  @db.VarChar(100)
+  description String?   @db.VarChar(100)
   isActive    String    @default("Y") @map("is_active") @db.Char(1)
   
   updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamp(0)
@@ -250,18 +250,31 @@ model RefAccessCode {
   @@map("ref_access_code")
 }
 
+// 🌟 [추가됨] 예외 접근 허용 사내 직원 관리 테이블
+model CfgUserException {
+  loginId      String   @id @map("login_id") @db.VarChar(50)
+  deptCode     String?  @map("dept_code") @db.VarChar(50)
+  deptName     String?  @map("dept_name") @db.VarChar(100)
+  isActive     String   @default("Y") @map("is_active") @db.Char(1)
+  registeredBy String?  @map("registered_by") @db.VarChar(50)
+  
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
+
+  @@map("cfg_user_exception")
+}
+
 model RefMenu {
   menuId      Int      @id @default(autoincrement()) @map("menu_id")
   label       String   @db.VarChar(50)
-  routerPath String?  @map("router_path") @db.VarChar(100)
-  icon        String? @db.VarChar(50)
+  routerPath String?   @map("router_path") @db.VarChar(100)
+  icon        String?  @db.VarChar(50)
 
-  parentId Int?       @map("parent_id")
-  parent    RefMenu?  @relation("MenuHierarchy", fields: [parentId], references: [menuId])
-  children RefMenu[] @relation("MenuHierarchy")
+  parentId Int?        @map("parent_id")
+  parent    RefMenu?   @relation("MenuHierarchy", fields: [parentId], references: [menuId])
+  children RefMenu[]   @relation("MenuHierarchy")
 
   sortOrder Int @default(0) @map("sort_order")
-  statusTag String?   @map("status_tag") @db.VarChar(10) 
+  statusTag String?    @map("status_tag") @db.VarChar(10) 
   isVisible String @default("Y") @map("is_visible") @db.Char(1)
 
   roleMappings CfgMenuRole[]
@@ -291,7 +304,7 @@ model CfgAdminUser {
 model CfgGuestAccess {
   loginId      String    @id @map("login_id") @db.VarChar(50)
   deptCode     String?   @map("dept_code") @db.VarChar(50)
-  deptName     String?  @map("dept_name") @db.VarChar(100)
+  deptName     String?   @map("dept_name") @db.VarChar(100)
   
   grantedRole String    @default("GUEST") @map("granted_role") @db.VarChar(20)
   reason      String?   @db.VarChar(100)
@@ -310,7 +323,7 @@ model CfgGuestRequest {
   reason       String?    @db.VarChar(200)
   status       String     @default("PENDING") @db.VarChar(20) 
   processedBy String?     @map("processed_by") @db.VarChar(50)
-  processedAt DateTime? @map("processed_at") @db.Timestamp(0)
+  processedAt DateTime?   @map("processed_at") @db.Timestamp(0)
   createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamp(0)
 
   @@map("cfg_guest_request")
@@ -325,8 +338,8 @@ model SysUser {
 
   // Relations
   context  SysUserContext?
-  posts    SysBoard[]        // 작성한 게시글
-  comments SysBoardComment[] // 작성한 댓글
+  posts    SysBoard[]        
+  comments SysBoardComment[] 
 
   @@map("sys_user")
 }
@@ -363,8 +376,8 @@ model CfgServer {
   eqpid        String    @id @db.VarChar(50)
   agentDbHost  String?   @map("agent_db_host") @db.VarChar(255)
   agentFtpHost String?   @map("agent_ftp_host") @db.VarChar(255)
-  useProxy     String?   @map("use_proxy") @db.VarChar(1)      // 내부망 프록시 사용 여부
-  proxyIp      String?   @map("proxy_ip") @db.VarChar(255)     // 내부망 통신 IP
+  useProxy     String?   @map("use_proxy") @db.VarChar(1)      
+  proxyIp      String?   @map("proxy_ip") @db.VarChar(255)     
   updateFlag   String    @default("no") @map("update_flag") @db.VarChar(10)
   update       DateTime? @map("update") @db.Timestamp(0)
   
@@ -372,10 +385,6 @@ model CfgServer {
 
   @@map("cfg_server")
 }
-
-// ==========================================
-// [New Feature] Community / Support (Q&A & Manual)
-// ==========================================
 
 model SysBoard {
   postId       Int       @id @default(autoincrement()) @map("post_id")
@@ -440,7 +449,7 @@ model SysAlert {
   userId     String    @map("user_id") 
   type       String    
   message    String    
-  link       String?   
+  link       String?
   isRead     Boolean   @default(false) @map("is_read")
   createdAt DateTime @default(now()) @map("created_at")
 
@@ -468,10 +477,10 @@ model SysAgentVersion {
   features        String   @db.Text 
   fileUrl64       String?  @map("file_url_64") @db.VarChar(200) 
   fileUrlLegacy   String?  @map("file_url_legacy") @db.VarChar(200) 
-  fileUrlProxy    String?  @map("file_url_proxy") @db.VarChar(200) // [추가] Proxy용 경로
+  fileUrlProxy    String?  @map("file_url_proxy") @db.VarChar(200) 
   fileSize64      String?  @map("file_size_64") @db.VarChar(50)
   fileSizeLegacy  String?  @map("file_size_legacy") @db.VarChar(50)
-  fileSizeProxy   String?  @map("file_size_proxy") @db.VarChar(50) // [추가] Proxy용 용량
+  fileSizeProxy   String?  @map("file_size_proxy") @db.VarChar(50) 
   createdAt       DateTime @default(now()) @map("created_at") @db.Timestamp(0)
   is_visible_y    String   @default("Y") @db.VarChar(1) 
 
