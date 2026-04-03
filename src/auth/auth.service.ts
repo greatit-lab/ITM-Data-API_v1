@@ -150,11 +150,30 @@ export class AuthService {
   // [Backend 연동 로직] - Whitelist 및 권한 검증
   // =========================================================
 
-  // [전체 교체] ITM-Data-API_v1/src/auth/auth.service.ts 내의 checkWhitelist 함수
   async checkWhitelist(loginId: string, compId?: string, deptId?: string) {
     this.logger.log(`[Whitelist] Checking loginId=${loginId}, compId=${compId}, deptId=${deptId}`);
 
-    // 1순위: 새로 추가된 '개별 예외 허용 사용자' 검증
+    // 1순위: 부서 단위의 엄격한 권한 검증 (대부분의 일반 사용자가 통과하는 Fast Path)
+    if (deptId) {
+      const access = await this.prisma.refAccessCode.findUnique({
+        where: { deptid: deptId }
+      });
+
+      if (access && access.isActive === 'Y') {
+        // (선택적 보안 강화) 넘어온 회사 코드와 등록된 회사 코드가 일치하는지 교차 검증
+        if (compId && access.compid && access.compid !== compId) {
+           this.logger.warn(`[Whitelist] Company Code mismatch. Proceeding to exception check.`);
+           // 회사 코드가 틀릴 경우 즉시 에러를 내지 않고, 혹시 예외 사용자인지 확인하기 위해 2순위로 넘깁니다.
+        } else {
+           this.logger.log(`[Whitelist] Access Granted via Dept: ${access.deptName}`);
+           return { isActive: 'Y', role: 'USER' };
+        }
+      }
+    } else {
+      this.logger.warn(`[Whitelist] No Dept ID provided. Proceeding to exception check.`);
+    }
+
+    // 2순위: 개별 예외 허용 사용자 검증 (부서가 허용되지 않았거나 회사 코드가 불일치하는 경우)
     const exceptionUser = await this.prisma.cfgUserException.findUnique({
       where: { loginId }
     });
@@ -164,28 +183,9 @@ export class AuthService {
       return { isActive: 'Y', role: 'USER' }; 
     }
 
-    // 2순위: 부서 단위의 엄격한 권한 검증 (보안 결함 수정)
-    if (!deptId) {
-      this.logger.warn(`[Whitelist] Access Denied. No Dept ID provided.`);
-      throw new BadRequestException('Department ID is required for access.');
-    }
-
-    // OR 조건이 아닌, deptId(PK) 기준으로 정확히 일치하는 부서만 찾습니다.
-    const access = await this.prisma.refAccessCode.findUnique({
-      where: { deptid: deptId }
-    });
-
-    if (access && access.isActive === 'Y') {
-      // (선택적 보안 강화) 넘어온 회사 코드와 등록된 회사 코드가 일치하는지까지 교차 검증
-      if (compId && access.compid && access.compid !== compId) {
-         this.logger.warn(`[Whitelist] Access Denied. Company Code mismatch.`);
-         throw new ForbiddenException('Company Code mismatch.');
-      }
-      this.logger.log(`[Whitelist] Access Granted via Dept: ${access.deptName}`);
-      return { isActive: 'Y', role: 'USER' };
-    }
-
-    this.logger.warn(`[Whitelist] Access Denied. User's deptId (${deptId}) is not in whitelist.`);
+    // 3순위: 1, 2순위 모두 실패 시 차단
+    // (여기서 에러가 발생하면, SSO 서버(ITM.Vision_SSO_v1)가 에러를 감지하고 자동으로 게스트 권한 및 신청 내역(4순위)을 검사하게 됩니다.)
+    this.logger.warn(`[Whitelist] Access Denied. Not in dept whitelist and not an exception.`);
     throw new NotFoundException('Not allowed');
   }
 
