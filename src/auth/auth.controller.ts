@@ -67,11 +67,12 @@ export class AuthController {
 
   @Get('whitelist/check')
   async checkWhitelist(
+    @Query('username') username: string, // 🌟 필수로 받도록 순서 조정
     @Query('compId') compId?: string,
     @Query('deptId') deptId?: string,
-    @Query('username') username?: string, 
   ) {
-    return this.authService.checkWhitelist(compId, deptId);
+    // 🌟 [수정된 부분] authService.checkWhitelist의 첫 번째 인자로 username을 전달합니다.
+    return this.authService.checkWhitelist(username, compId, deptId);
   }
 
   @Post('user/sync')
