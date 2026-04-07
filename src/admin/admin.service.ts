@@ -34,9 +34,11 @@ export class AdminService {
         });
       });
       req.on('error', reject);
-      req.setTimeout(5000, () => {
+      
+      // 스토리지 계산 지연에 대비해 타임아웃을 60초(60000ms)로 연장
+      req.setTimeout(60000, () => {
         req.destroy();
-        reject(new Error('Request timeout'));
+        reject(new Error('Request timeout (60s)'));
       });
     });
   }
@@ -45,8 +47,10 @@ export class AdminService {
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
     const kstNow = this.getKstDate();
+    // 기록 대상일 (예: 오늘 자정이면 어제 날짜)
     const checkDate = new Date(Date.UTC(kstNow.getFullYear(), kstNow.getMonth(), kstNow.getDate() - 1));
 
+    // 1. 오브젝트 스토리지 (파일) 용량 기록 로직 (일일 증가량 계산)
     try {
       const uploadApiUrl = process.env.UPLOAD_API_URL || 'http://127.0.0.1:8082';
       const targetUrl = `${uploadApiUrl}/api/FileUpload/size`;
@@ -72,12 +76,20 @@ export class AdminService {
       this.logger.error(`[Upload API Error] Failed to connect: ${error.message}`);
     }
 
+    // 2. [수정됨] DB 용량 기록 로직 (특정 일자의 증가분만 정확하게 계산)
     try {
+      // 해당 테이블의 타임스탬프 컬럼명도 함께 추출합니다.
       const dbTables: any[] = await this.prisma.$queryRaw`
         SELECT
           c.relname AS "tableName",
-          COALESCE(c.reltuples::bigint, 0) AS "rowCount",
-          COALESCE(pg_total_relation_size(c.oid), 0) AS "sizeBytes"
+          (
+            SELECT col.column_name
+            FROM information_schema.columns col
+            WHERE col.table_schema = n.nspname
+              AND col.table_name = c.relname
+              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
+            LIMIT 1
+          ) AS "tsColumn"
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public' AND c.relkind = 'r'
@@ -90,15 +102,36 @@ export class AdminService {
           )
       `;
 
+      // 하루 간격을 구하기 위해 nextDate 설정
+      const nextDate = new Date(checkDate.getTime() + 24 * 60 * 60 * 1000);
+
       for (const t of dbTables) {
+        const tableName = String(t.tableName);
+        const tsColumn = String(t.tsColumn);
+
+        if (!tableName || !tsColumn) continue;
+
+        // [핵심] checkDate 하루 동안 생성된 row의 개수와, 실제 row 들의 물리적 Byte 크기를 합산합니다.
+        const dailyStats: any[] = await this.prisma.$queryRawUnsafe(`
+          SELECT
+            COUNT(*)::bigint AS "dailyRowCount",
+            COALESCE(SUM(pg_column_size(t.*)), 0)::bigint AS "dailySizeBytes"
+          FROM "${tableName}" t
+          WHERE "${tsColumn}" >= $1 AND "${tsColumn}" < $2
+        `, checkDate, nextDate);
+
+        const dailyRowCount = Number(dailyStats[0]?.dailyRowCount || 0);
+        const dailySizeBytes = Number(dailyStats[0]?.dailySizeBytes || 0);
+
+        // 이제 전체 누적이 아닌 "일일 증가량(Increment)" 이 기록됩니다.
         await this.prisma.sysStorageHistory.upsert({
-          where: { checkDate_tableName: { checkDate: checkDate, tableName: String(t.tableName) } },
-          update: { sizeBytes: Number(t.sizeBytes), rowCount: Number(t.rowCount) },
+          where: { checkDate_tableName: { checkDate: checkDate, tableName: tableName } },
+          update: { sizeBytes: dailySizeBytes, rowCount: dailyRowCount },
           create: {
             checkDate,
-            tableName: String(t.tableName),
-            sizeBytes: Number(t.sizeBytes),
-            rowCount: Number(t.rowCount),
+            tableName: tableName,
+            sizeBytes: dailySizeBytes,
+            rowCount: dailyRowCount,
             storageType: 'DB',
             createdAt: kstNow,
           },
@@ -116,6 +149,7 @@ export class AdminService {
     let totalDbUsageMB = 0;
     let tableDetails: any[] = [];
     
+    // 테이블 요약은 현재 시점의 전체 용량이 맞으므로 기존 로직 유지
     try {
       const dbTables: any[] = await this.prisma.$queryRaw`
         SELECT
@@ -189,17 +223,27 @@ export class AdminService {
       });
 
       const trendDates = Array.from(dateMap.keys()).sort();
+      
       let runningCumObjMB = 0;
+      let runningCumDbMB = 0; // [수정됨] DB 데이터도 증가분이므로 누적 변수 추가
 
       if (trendDates.length > 0) {
         const firstDate = new Date(trendDates[0]);
         firstDate.setUTCDate(firstDate.getUTCDate() - 1); 
 
+        // 과거 누적 합산 (Object)
         const prevObjSum = await this.prisma.sysStorageHistory.aggregate({
           _sum: { sizeBytes: true },
           where: { storageType: 'FILE', checkDate: { lte: firstDate } }
         });
         runningCumObjMB = Number(prevObjSum._sum.sizeBytes || 0) / (1024 * 1024);
+
+        // 과거 누적 합산 (DB)
+        const prevDbSum = await this.prisma.sysStorageHistory.aggregate({
+          _sum: { sizeBytes: true },
+          where: { storageType: 'DB', checkDate: { lte: firstDate } }
+        });
+        runningCumDbMB = Number(prevDbSum._sum.sizeBytes || 0) / (1024 * 1024);
       }
 
       const monthlyMap = new Map<string, any>();
@@ -208,26 +252,28 @@ export class AdminService {
         const date = trendDates[i];
         const current = dateMap.get(date)!;
 
+        // DB 역시 이제 일일 증가량(Increment) 데이터입니다.
         const dailyDbMB = current.dbBytes / (1024 * 1024); 
         const dailyObjMB = current.objBytes / (1024 * 1024); 
 
         runningCumObjMB += dailyObjMB; 
+        runningCumDbMB += dailyDbMB; // 매일의 데이터를 누적시킴
 
         dailyTrends.push({ 
           date, 
-          cumDbMB: dailyDbMB,         
+          cumDbMB: runningCumDbMB,  // [수정됨] 올바른 누적값 매핑
           cumObjMB: runningCumObjMB, 
           dailyDbMB: dailyDbMB,       
           dailyObjMB: dailyObjMB 
         });
 
         const month = date.substring(0, 7);
-        if (!monthlyMap.has(month)) monthlyMap.set(month, { date: month, cumDbMB: dailyDbMB, cumObjMB: runningCumObjMB, monthlyDbMB: 0, monthlyObjMB: 0 });
+        if (!monthlyMap.has(month)) monthlyMap.set(month, { date: month, cumDbMB: runningCumDbMB, cumObjMB: runningCumObjMB, monthlyDbMB: 0, monthlyObjMB: 0 });
         const m = monthlyMap.get(month)!;
         
         m.monthlyDbMB += dailyDbMB;
         m.monthlyObjMB += dailyObjMB;
-        m.cumDbMB = dailyDbMB; 
+        m.cumDbMB = runningCumDbMB; 
         m.cumObjMB = runningCumObjMB;
       }
       monthlyTrends.push(...Array.from(monthlyMap.values()));
@@ -266,25 +312,20 @@ export class AdminService {
     return this.prisma.cfgUserException.delete({ where: { loginId } });
   }
 
-  // 🌟 [수정됨] 권한 확인을 위해 관리자 및 게스트 테이블을 병합하여 Role 부여
   async getAllUsers() { 
-    // 1. 모든 시스템 유저 조회
     const users = await this.prisma.sysUser.findMany({ 
       include: { context: { include: { sdwtInfo: true } } }, 
       orderBy: { lastLoginAt: 'desc' }
     }); 
 
-    // 2. 관리자와 게스트 테이블 조회
     const admins = await this.prisma.cfgAdminUser.findMany();
     const guests = await this.prisma.cfgGuestAccess.findMany();
 
-    // 3. 빠른 조회를 위한 Map 생성
     const adminMap = new Map(admins.map(a => [a.loginId, a.role]));
     const guestMap = new Map(guests.map(g => [g.loginId, g.grantedRole]));
 
-    // 4. Role 매핑하여 반환
     return users.map(u => {
-      let role = 'USER'; // 기본 권한
+      let role = 'USER'; 
       if (adminMap.has(u.loginId)) {
         role = adminMap.get(u.loginId) || 'ADMIN';
       } else if (guestMap.has(u.loginId)) {
