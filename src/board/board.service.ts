@@ -168,23 +168,18 @@ export class BoardService {
       });
 
       // ==========================================
-      // [알림 발송 로직 분기 처리]
+      // [요청하신 기능 2 확인점] 공지사항 알림 로직
       // ==========================================
       if (newPost.category === 'NOTICE') {
-        // 분기 1: 공지사항인 경우 -> I:Vision의 모든 사용자(관리자, 매니저, 유저, 게스트)에게 발송
+        // 분기 1: 공지사항인 경우 -> I:Vision의 모든 사용자(User, Admin, Manager, Guest)에게 발송
         try {
-          // 1-1. 시스템 접속 이력이 있는 모든 사용자
           const allUsers = await this.prisma.sysUser.findMany({ select: { loginId: true } });
-          // 1-2. 아직 접속 이력이 없는 승인된 게스트 계정들까지 모두 긁어옴
           const allGuests = await this.prisma.cfgGuestAccess.findMany({ select: { loginId: true } });
           
-          // 중복 제거를 위해 Set 사용
           const uniqueUserIds = new Set([
             ...allUsers.map(u => u.loginId),
             ...allGuests.map(g => g.loginId)
           ]);
-
-          // 작성자 본인 제외 (선택 사항이지만 일반적으로 본인이 쓴 글의 알림은 받지 않음)
           uniqueUserIds.delete(newPost.authorId);
 
           const alertData = Array.from(uniqueUserIds).map(userId => ({
@@ -204,15 +199,17 @@ export class BoardService {
         }
 
       } else {
-        // 분기 2: 일반 게시글(QnA, 버그 리포트 등)인 경우 -> '관리자' 및 '매니저' 권한 보유자에게만 발송
+        // 분기 2: 일반 문의글(QnA)인 경우 -> 관리자에게만 발송
         try {
           const adminUsers = await this.prisma.cfgAdminUser.findMany({
-            // 역할이 Admin 이거나 Manager 인 사용자 조회
-            where: { role: { in: ['ADMIN', 'MANAGER'] } },
+            where: { 
+              role: { 
+                in: ['ADMIN', 'MANAGER', 'Admin', 'Manager', 'admin', 'manager'] 
+              } 
+            },
             select: { loginId: true }
           });
 
-          // 본인이 관리자/매니저인데 스스로 문의글을 남긴 경우 자기 자신에게는 알림이 안 가도록 필터링
           const targetAdmins = adminUsers
             .map(u => u.loginId)
             .filter(id => id !== newPost.authorId);
@@ -279,7 +276,6 @@ export class BoardService {
         },
       });
 
-      // 게시글이 처리 완료되었을 때 작성자에게 알림 발송
       if ((status === 'Complete' || status === 'ANSWERED') && board.status !== status) {
         await this.alertService.createAlert(
           board.authorId,
@@ -340,7 +336,9 @@ export class BoardService {
         return comment;
       });
 
-      // [작동 확인] 댓글 작성자가 원글 작성자가 아닐 경우에만 원글 작성자에게 알림 발송 (완벽 작동 중)
+      // ==========================================
+      // [요청하신 기능 1 확인점] 답글 작성 시 원글 작성자에게 알림
+      // ==========================================
       if (board.authorId !== data.authorId) {
         await this.alertService.createAlert(
           board.authorId,
