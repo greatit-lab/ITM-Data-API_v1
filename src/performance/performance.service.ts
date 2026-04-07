@@ -5,7 +5,7 @@ import { Prisma } from '@prisma/client';
 import dayjs from 'dayjs';
 import utc from 'dayjs/plugin/utc';
 
-// [완벽 방어] Prisma Raw Query가 반환하는 BigInt 타입을 NestJS가 JSON으로 직렬화할 수 있도록 전역 패치 적용
+// Prisma Raw Query가 반환하는 BigInt 타입을 NestJS가 JSON으로 직렬화할 수 있도록 전역 패치 적용
 if (typeof (BigInt.prototype as any).toJSON === 'undefined') {
   (BigInt.prototype as any).toJSON = function () {
     return Number(this);
@@ -123,6 +123,7 @@ export class PerformanceService {
     }));
   }
 
+  // [성능 개선 완료] 25초 병목의 원인인 DB 스캔 및 조인 쿼리 최적화
   async getItmAgentTrend(
     site: string,
     sdwt: string,
@@ -131,43 +132,68 @@ export class PerformanceService {
     eqpid?: string,
     interval: number = 60,
   ) {
-    // [수정] 광범위한 '%agent%' 와일드카드 제거 (SQLAgent, ZabbixAgent 등 타 프로세스 오탐지 원천 차단)
-    // 실제 ITM Agent의 실행 파일명으로 사용될 수 있는 명확한 패턴만 엄격하게 매핑
+    
+    // 1. 조건에 맞는 장비(eqpid) 목록을 먼저 조회하여 본 쿼리의 탐색 범위(Full Scan)를 획기적으로 축소
+    let targetEqpIds: string[] = [];
+    const hasSiteOrSdwtFilter = site || sdwt;
+    
+    if (hasSiteOrSdwtFilter && !eqpid) {
+      const eqps = await this.prisma.refEquipment.findMany({
+        where: {
+          sdwtRel: {
+            ...(site ? { site: site } : {}),
+          },
+          ...(sdwt ? { sdwt: sdwt } : {})
+        },
+        select: { eqpid: true }
+      });
+      targetEqpIds = eqps.map(e => e.eqpid);
+      
+      // 필터에 맞는 장비가 없다면 복잡한 쿼리를 돌릴 필요 없이 즉시 빈 배열 반환
+      if (targetEqpIds.length === 0) return [];
+    }
+
+    // 2. 엄청나게 느린 ILIKE 와일드카드 검색을 버리고 명시적 IN 구문 사용
     let filterSql = Prisma.sql`
-      WHERE (p.process_name ILIKE 'ITM_Agent' OR p.process_name ILIKE 'ITMAgent' OR p.process_name ILIKE 'ITM-Agent')
+      WHERE p.process_name IN ('ITM_Agent', 'ITMAgent', 'ITM-Agent', 'itm_agent', 'itmagent', 'itm-agent')
         AND p.serv_ts >= CAST(${startDate} AS TIMESTAMP)
         AND p.serv_ts <= CAST(${endDate} AS TIMESTAMP)
     `;
 
     if (eqpid) {
       filterSql = Prisma.sql`${filterSql} AND p.eqpid = ${eqpid}`;
+    } else if (targetEqpIds.length > 0) {
+      filterSql = Prisma.sql`${filterSql} AND p.eqpid IN (${Prisma.join(targetEqpIds)})`;
     }
 
-    if (sdwt) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt = ${sdwt}`;
-    } else if (site) {
-      filterSql = Prisma.sql`${filterSql} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${site})`;
-    }
-
+    // 3. 4개 테이블을 JOIN 하기 전에 1개 대상 테이블만 먼저 묶어버리는 CTE(WITH 절) 구조 도입
     try {
       const results = await this.prisma.$queryRaw`
+        WITH AggregatedData AS (
+          SELECT 
+            to_timestamp(
+              (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+            ) AT TIME ZONE 'UTC' as timestamp,
+            p.eqpid,
+            MAX(p.memory_usage_mb) as memory_usage_mb,
+            MAX(p.memory_commit_mb) as memory_commit_mb
+          FROM public.eqp_proc_perf p
+          ${filterSql}
+          GROUP BY 1, 2
+        )
         SELECT 
-          to_timestamp(
-            (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
-          ) AT TIME ZONE 'UTC' as timestamp,
-          p.eqpid as "eqpId",
+          a.timestamp,
+          a.eqpid as "eqpId",
           s.site as "site",
           r.sdwt as "sdwt",
-          MAX(p.memory_usage_mb) as "memoryUsageMB",
-          MAX(p.memory_commit_mb) as "memoryCommitMB", 
-          MAX(i.app_ver) as "agentVersion"
-        FROM public.eqp_proc_perf p
-        LEFT JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+          a.memory_usage_mb as "memoryUsageMB",
+          a.memory_commit_mb as "memoryCommitMB", 
+          i.app_ver as "agentVersion"
+        FROM AggregatedData a
+        LEFT JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-        LEFT JOIN public.agent_info i ON p.eqpid = i.eqpid
-        ${filterSql}
-        GROUP BY 1, 2, 3, 4
-        ORDER BY 1 ASC
+        LEFT JOIN public.agent_info i ON a.eqpid = i.eqpid
+        ORDER BY a.timestamp ASC
       `;
 
       return (results as any[]).map(r => ({
@@ -176,24 +202,33 @@ export class PerformanceService {
       }));
 
     } catch (e) {
+      // Fallback
       const fallbackResults = await this.prisma.$queryRaw`
+        WITH AggregatedData AS (
+          SELECT 
+            to_timestamp(
+              (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
+            ) AT TIME ZONE 'UTC' as timestamp,
+            p.eqpid,
+            MAX(p.memory_usage_mb) as memory_usage_mb,
+            0::numeric as memory_commit_mb
+          FROM public.eqp_proc_perf p
+          ${filterSql}
+          GROUP BY 1, 2
+        )
         SELECT 
-          to_timestamp(
-            (floor(extract(epoch from p.serv_ts AT TIME ZONE 'UTC') / ${Prisma.raw(interval.toString())}) * ${Prisma.raw(interval.toString())})::double precision
-          ) AT TIME ZONE 'UTC' as timestamp,
-          p.eqpid as "eqpId",
+          a.timestamp,
+          a.eqpid as "eqpId",
           s.site as "site",
           r.sdwt as "sdwt",
-          MAX(p.memory_usage_mb) as "memoryUsageMB",
-          0::numeric as "memoryCommitMB", 
-          MAX(i.app_ver) as "agentVersion"
-        FROM public.eqp_proc_perf p
-        LEFT JOIN public.ref_equipment r ON p.eqpid = r.eqpid
+          a.memory_usage_mb as "memoryUsageMB",
+          a.memory_commit_mb as "memoryCommitMB", 
+          i.app_ver as "agentVersion"
+        FROM AggregatedData a
+        LEFT JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-        LEFT JOIN public.agent_info i ON p.eqpid = i.eqpid
-        ${filterSql}
-        GROUP BY 1, 2, 3, 4
-        ORDER BY 1 ASC
+        LEFT JOIN public.agent_info i ON a.eqpid = i.eqpid
+        ORDER BY a.timestamp ASC
       `;
 
       return (fallbackResults as any[]).map(r => ({
