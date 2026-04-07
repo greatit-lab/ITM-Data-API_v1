@@ -1,10 +1,8 @@
 // ITM-Data-API/src/dashboard/dashboard.service.ts
-
 import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 
-// Raw Query 결과 매핑을 위한 인터페이스
 interface AgentStatusRawResult {
   eqpid: string;
   is_online: boolean;
@@ -32,7 +30,6 @@ export class DashboardService {
 
   constructor(private prisma: PrismaService) {}
 
-  // 버전 문자열 비교 헬퍼 함수
   private compareVersions(v1: string, v2: string) {
     const p1 = v1.replace(/[^0-9.]/g, '').split('.').map(Number);
     const p2 = v2.replace(/[^0-9.]/g, '').split('.').map(Number);
@@ -45,13 +42,124 @@ export class DashboardService {
     return 0;
   }
 
-  // 1. 대시보드 요약 정보 조회
+  // [극강의 방어력 적용] 에러 원천 차단형 메모리 집계 로직
+  async getGlobalFleetData() {
+    try {
+      const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
+      const todayDateStr = kstNow.toISOString().split('T')[0];
+      const startOfToday = new Date(`${todayDateStr}T00:00:00.000Z`);
+
+      // 1. 모든 사용 중인 SDWT 기본 정보 조회
+      const sdwts = await this.prisma.refSdwt.findMany({
+        where: { isUse: 'Y' },
+        select: { id: true, site: true, sdwt: true },
+        orderBy: { id: 'asc' }
+      });
+
+      // 2. 장비 조회 (Prisma 에러를 유발할 수 있는 isNot: null 조건을 빼고 전체를 가져옴)
+      const rawEquipments = await this.prisma.refEquipment.findMany({
+        where: { sdwtRel: { isUse: 'Y' } },
+        select: {
+          eqpid: true,
+          sdwt: true,
+          agentInfo: { select: { eqpid: true } },
+          agentStatus: { select: { status: true } },
+        }
+      });
+
+      // 서버 메모리에서 안전하게 필터링 (에이전트가 등록된 장비만 남김)
+      const equipments = rawEquipments.filter(e => e.agentInfo !== null);
+      const eqpIds = equipments.map((e) => e.eqpid);
+      
+      // 3. 에러 카운트 (개별 테이블 오류로 전체 로딩이 멈추지 않도록 독립 try-catch 적용)
+      const errorMap = new Map<string, number>();
+      try {
+        if (eqpIds.length > 0) {
+          const errorCounts = await this.prisma.plgError.groupBy({
+            by: ['eqpid'],
+            where: {
+              timeStamp: { gte: startOfToday },
+              eqpid: { in: eqpIds }
+            },
+            _count: { _all: true }
+          });
+          
+          errorCounts.forEach((e) => {
+            errorMap.set(e.eqpid, e._count._all);
+          });
+        }
+      } catch (err) {
+        this.logger.warn("PlgError Query Failed (에러 데이터 로드 실패, 조회는 계속됨):", err);
+      }
+
+      // 4. 프론트엔드용 JSON 트리 구조로 In-Memory 고속 집계
+      const siteMap = new Map<string, any>();
+      let siteIndex = 0;
+
+      // 사이트 및 SDWT 골격 먼저 생성
+      for (const s of sdwts) {
+        if (!siteMap.has(s.site)) {
+          siteMap.set(s.site, {
+            siteName: s.site,
+            sdwts: [],
+            siteStats: { total: 0, online: 0, offline: 0, alerts: 0 },
+            index: siteIndex++
+          });
+        }
+
+        const siteObj = siteMap.get(s.site);
+        if (!siteObj.sdwts.find((sd: any) => sd.name === s.sdwt)) {
+          siteObj.sdwts.push({
+            name: s.sdwt,
+            totalCount: 0,
+            onlineCount: 0,
+            offlineCount: 0,
+            summary: { todayErrorCount: 0 },
+            index: siteObj.sdwts.length
+          });
+        }
+      }
+
+      // 조회된 장비 데이터를 골격에 채워 넣기
+      for (const eqp of equipments) {
+        const targetSdwt = sdwts.find((s) => s.sdwt === eqp.sdwt);
+        if (!targetSdwt) continue;
+
+        const siteObj = siteMap.get(targetSdwt.site);
+        if (!siteObj) continue;
+
+        const sdwtObj = siteObj.sdwts.find((s: any) => s.name === eqp.sdwt);
+        if (!sdwtObj) continue;
+
+        const isOnline = eqp.agentStatus?.status === 'ONLINE';
+        const errorCount = errorMap.get(eqp.eqpid) || 0;
+        const hasError = errorCount > 0;
+
+        // SDWT 누적
+        sdwtObj.totalCount++;
+        if (isOnline) sdwtObj.onlineCount++;
+        else sdwtObj.offlineCount++;
+        if (hasError) sdwtObj.summary.todayErrorCount++;
+
+        // Site 누적
+        siteObj.siteStats.total++;
+        if (isOnline) siteObj.siteStats.online++;
+        else siteObj.siteStats.offline++;
+        if (hasError) siteObj.siteStats.alerts++;
+      }
+
+      return Array.from(siteMap.values());
+
+    } catch (error) {
+      this.logger.error("getGlobalFleetData Fatal Error:", error);
+      throw new InternalServerErrorException("Failed to fetch global fleet data");
+    }
+  }
+
   async getSummary(site?: string, sdwt?: string) {
     try {
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
-
-      this.logger.debug(`getSummary called with - site: ${safeSite}, sdwt: ${safeSdwt}`);
 
       const distinctVersions = await this.prisma.agentInfo.findMany({
         distinct: ['appVer'],
@@ -75,12 +183,8 @@ export class DashboardService {
         ...(safeSdwt ? { sdwt: safeSdwt } : {}),
       };
 
-      // =======================================================================
-      // [핵심 변경 1] 타임존 오지랖 방지 (KST 기준 문자열 추출 후 UTC 강제 래핑)
-      // Prisma가 로컬 시간대를 UTC로 변환하여 전날 데이터가 섞이는 것을 차단합니다.
-      // =======================================================================
       const now = new Date();
-      const kstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000); // 명시적 KST 변환
+      const kstNow = new Date(now.getTime() + 9 * 60 * 60 * 1000); 
       
       const todayStr = kstNow.toISOString().split('T')[0];
       const startOfToday = new Date(`${todayStr}T00:00:00.000Z`);
@@ -132,13 +236,13 @@ export class DashboardService {
         const [totalError, recentError] = await Promise.all([
           this.prisma.plgError.count({
             where: {
-              timeStamp: { gte: startOfToday }, // 강제 보정된 KST 자정값 투입
+              timeStamp: { gte: startOfToday }, 
               equipment: equipmentWhere,
             },
           }),
           this.prisma.plgError.count({
             where: { 
-              timeStamp: { gte: oneHourAgo }, // 강제 보정된 KST 1시간전 투입
+              timeStamp: { gte: oneHourAgo }, 
               equipment: equipmentWhere 
             },
           }),
@@ -184,7 +288,6 @@ export class DashboardService {
     }
   }
 
-  // 2. Agent 상태 목록 조회 (Raw Query)
   async getAgentStatus(site?: string, sdwt?: string) {
     try {
       const safeSite = site && site.trim() !== '' ? site : undefined;
@@ -198,11 +301,6 @@ export class DashboardService {
         whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${safeSite})`;
       }
 
-      // =======================================================================
-      // [핵심 변경 2] Raw Query에서의 CURRENT_DATE 보정
-      // DB 서버의 타임존에 따라 CURRENT_DATE가 전날을 가리키는 현상을 방지하기 위해,
-      // 백엔드에서 KST 문자열을 직접 추출하여 파라미터로 주입합니다.
-      // =======================================================================
       const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
       const todayDateStr = kstNow.toISOString().split('T')[0];
 
