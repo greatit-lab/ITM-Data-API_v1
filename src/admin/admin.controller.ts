@@ -17,7 +17,6 @@ export class AdminController {
   @Put('access-codes/:deptid') async updateAccessCode(@Param('deptid') deptid: string, @Body() body: any) { return this.adminService.updateAccessCode(deptid, body); }
   @Delete('access-codes/:deptid') async deleteAccessCode(@Param('deptid') deptid: string) { return this.adminService.deleteAccessCode(deptid); }
 
-  // [추가됨] 예외 접근 허용 관리 API 
   @Get('exceptions') async getExceptionUsers() { return this.adminService.getExceptionUsers(); }
   @Post('exceptions') async addExceptionUser(@Body() body: any) { return this.adminService.addExceptionUser(body); }
   @Put('exceptions/:loginId/status') async updateExceptionUserStatus(@Param('loginId') loginId: string, @Body() body: { isActive: string }) { return this.adminService.updateExceptionUserStatus(loginId, body.isActive); }
@@ -60,5 +59,13 @@ export class AdminController {
   @Get('storage-usage')
   async getStorageUsage(@Query('startDate') startDate: string, @Query('endDate') endDate: string, @Query('interval') interval: string) {
     return this.adminService.getStorageUsage(startDate, endDate, interval);
+  }
+
+  // ==========================================
+  // [신규 추가] 수동 스토리지 동기화 API 연결부
+  // ==========================================
+  @Post('storage-sync')
+  async syncStorageNow() {
+    return this.adminService.syncStorageNow();
   }
 }
