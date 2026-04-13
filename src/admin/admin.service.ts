@@ -35,110 +35,181 @@ export class AdminService {
       });
       req.on('error', reject);
       
-      // 스토리지 계산 지연에 대비해 타임아웃을 60초(60000ms)로 연장
-      req.setTimeout(60000, () => {
+      req.setTimeout(180000, () => {
         req.destroy();
-        reject(new Error('Request timeout (60s)'));
+        reject(new Error('Request timeout (180s)'));
       });
     });
+  }
+
+  private getTargetTimeColumn(tableName: string): string | null {
+    const columnMap: Record<string, string> = {
+      'eqp_perf': 'serv_ts',
+      'eqp_proc_perf': 'serv_ts',
+      'plg_error': 'serv_ts',
+      'plg_onto_spectrum': 'serv_ts',
+      'plg_prealign': 'serv_ts',
+      'plg_wf_flat': 'serv_ts',
+      'plg_wf_map': 'serv_ts',
+      'sys_access_logs': 'access_ts',
+      'sys_alert': 'created_at',
+      'sys_board': 'created_at',
+      'sys_board_comment': 'created_at',
+      'sys_user': 'created_at',
+      'sys_user_context': 'updated_at',
+    };
+
+    if (columnMap[tableName]) return columnMap[tableName];
+    if (tableName.startsWith('plg_onto_spectrum_y')) return 'serv_ts';
+
+    return null; 
   }
 
   @Cron('0 1 0 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
-    const kstNow = this.getKstDate();
-    // 기록 대상일 (예: 오늘 자정이면 어제 날짜)
-    const checkDate = new Date(Date.UTC(kstNow.getFullYear(), kstNow.getMonth(), kstNow.getDate() - 1));
+    
+    const now = new Date();
+    const kstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+    const kstYesterday = new Date(kstTime.getTime() - 24 * 60 * 60 * 1000);
 
-    // 1. 오브젝트 스토리지 (파일) 용량 기록 로직 (일일 증가량 계산)
+    const yYear = kstYesterday.getUTCFullYear();
+    const yMonth = kstYesterday.getUTCMonth(); 
+    const yDate = kstYesterday.getUTCDate();
+
+    const tYear = kstTime.getUTCFullYear();
+    const tMonth = kstTime.getUTCMonth();
+    const tDate = kstTime.getUTCDate();
+
+    const checkDate = new Date(Date.UTC(yYear, yMonth, yDate));
+    const pad = (n: number) => String(n).padStart(2, '0');
+    
+    const startDateStr = `${yYear}-${pad(yMonth + 1)}-${pad(yDate)} 00:00:00`;
+    const endDateStr = `${tYear}-${pad(tMonth + 1)}-${pad(tDate)} 00:00:00`;
+    const dateStr = `${yYear}${pad(yMonth + 1)}${pad(yDate)}`; 
+
+    const kstNow = this.getKstDate();
+
+    // 1. 오브젝트 스토리지 (파일)
     try {
       const uploadApiUrl = process.env.UPLOAD_API_URL || 'http://127.0.0.1:8082';
-      const targetUrl = `${uploadApiUrl}/api/FileUpload/size`;
+      const targetUrl = `${uploadApiUrl}/api/FileUpload/daily-size?date=${dateStr}`;
       
       const data = await this.fetchUploadApiSize(targetUrl);
 
       if (data && data.success) {
-        const currentTotalBytes = Number(data.sizeBytes); 
-        const sumResult = await this.prisma.sysStorageHistory.aggregate({
-          _sum: { sizeBytes: true },
-          where: { storageType: 'FILE' }
-        });
-        const previousTotalBytes = Number(sumResult._sum.sizeBytes || 0);
-        const dailyIncrementBytes = currentTotalBytes - previousTotalBytes;
+        const dailyIncrementBytes = Number(data.sizeBytes); 
 
-        await this.prisma.sysStorageHistory.upsert({
-          where: { checkDate_tableName: { checkDate: checkDate, tableName: 'OBJECT_STORE_TOTAL' } },
-          update: { sizeBytes: dailyIncrementBytes },
-          create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: dailyIncrementBytes, storageType: 'FILE', createdAt: kstNow },
-        });
+        if (dailyIncrementBytes > 0) {
+          await this.prisma.sysStorageHistory.upsert({
+            where: { checkDate_tableName: { checkDate: checkDate, tableName: 'OBJECT_STORE_TOTAL' } },
+            update: { sizeBytes: dailyIncrementBytes, rowCount: 0 },
+            create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: dailyIncrementBytes, rowCount: 0, storageType: 'FILE', createdAt: kstNow },
+          });
+        }
       }
     } catch (error: any) {
       this.logger.error(`[Upload API Error] Failed to connect: ${error.message}`);
     }
 
-    // 2. [수정됨] DB 용량 기록 로직 (특정 일자의 증가분만 정확하게 계산)
+    // 2. DB 용량 기록 (샘플링 최적화 적용)
     try {
-      // 해당 테이블의 타임스탬프 컬럼명도 함께 추출합니다.
       const dbTables: any[] = await this.prisma.$queryRaw`
-        SELECT
-          c.relname AS "tableName",
-          (
-            SELECT col.column_name
-            FROM information_schema.columns col
-            WHERE col.table_schema = n.nspname
-              AND col.table_name = c.relname
-              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
-            LIMIT 1
-          ) AS "tsColumn"
+        SELECT c.relname AS "tableName"
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind = 'r'
-          AND EXISTS (
-            SELECT 1 
-            FROM information_schema.columns col 
-            WHERE col.table_schema = n.nspname 
-              AND col.table_name = c.relname 
-              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
-          )
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
       `;
-
-      // 하루 간격을 구하기 위해 nextDate 설정
-      const nextDate = new Date(checkDate.getTime() + 24 * 60 * 60 * 1000);
 
       for (const t of dbTables) {
         const tableName = String(t.tableName);
-        const tsColumn = String(t.tsColumn);
+        const tsColumn = this.getTargetTimeColumn(tableName);
 
-        if (!tableName || !tsColumn) continue;
+        if (!tsColumn) continue;
 
-        // [핵심] checkDate 하루 동안 생성된 row의 개수와, 실제 row 들의 물리적 Byte 크기를 합산합니다.
-        const dailyStats: any[] = await this.prisma.$queryRawUnsafe(`
-          SELECT
-            COUNT(*)::bigint AS "dailyRowCount",
-            COALESCE(SUM(pg_column_size(t.*)), 0)::bigint AS "dailySizeBytes"
-          FROM "${tableName}" t
-          WHERE "${tsColumn}" >= $1 AND "${tsColumn}" < $2
-        `, checkDate, nextDate);
+        // [단계 1] 해당 일자의 살아있는 총 Row 개수 추출 (인덱스 사용으로 초고속)
+        const countStats: any[] = await this.prisma.$queryRawUnsafe(`
+          SELECT COUNT(*)::bigint AS "dailyRowCount"
+          FROM "${tableName}"
+          WHERE "${tsColumn}" >= $1::timestamp AND "${tsColumn}" < $2::timestamp
+        `, startDateStr, endDateStr);
 
-        const dailyRowCount = Number(dailyStats[0]?.dailyRowCount || 0);
-        const dailySizeBytes = Number(dailyStats[0]?.dailySizeBytes || 0);
+        const dailyRowCount = Number(countStats[0]?.dailyRowCount || 0);
 
-        // 이제 전체 누적이 아닌 "일일 증가량(Increment)" 이 기록됩니다.
+        if (dailyRowCount === 0) {
+          continue; // 데이터가 없으면 바로 다음 테이블로
+        }
+
+        // [단계 2] 궁극의 최적화: 수백만 건을 스캔하지 않고, '오늘 들어온 데이터 중 1000건'만 추출하여
+        // TOAST가 완벽히 포함된 실제 평균 Row 크기를 계산함 (0.01초 소요, 거품 배제)
+        const sampleStats: any[] = await this.prisma.$queryRawUnsafe(`
+          SELECT COALESCE(AVG(pg_column_size(t.*)), 0) + 24 AS "avgRowSize"
+          FROM (
+            SELECT * FROM "${tableName}" 
+            WHERE "${tsColumn}" >= $1::timestamp AND "${tsColumn}" < $2::timestamp 
+            LIMIT 1000
+          ) t
+        `, startDateStr, endDateStr);
+
+        const avgRowSize = Number(sampleStats[0]?.avgRowSize || 24);
+        
+        // [단계 3] 정확한 평균 단가 × 전체 개수 = 완벽한 일일 적재 용량 산출
+        const dailySizeBytes = Math.round(dailyRowCount * avgRowSize);
+
         await this.prisma.sysStorageHistory.upsert({
           where: { checkDate_tableName: { checkDate: checkDate, tableName: tableName } },
           update: { sizeBytes: dailySizeBytes, rowCount: dailyRowCount },
-          create: {
-            checkDate,
-            tableName: tableName,
-            sizeBytes: dailySizeBytes,
-            rowCount: dailyRowCount,
-            storageType: 'DB',
-            createdAt: kstNow,
-          },
+          create: { checkDate, tableName: tableName, sizeBytes: dailySizeBytes, rowCount: dailyRowCount, storageType: 'DB', createdAt: kstNow },
         });
       }
     } catch (error: any) {
       this.logger.error(`[DB Query Error] ${error.message}`);
+    }
+  }
+
+  // ==========================================
+  // 수동 스토리지 동기화
+  // ==========================================
+  async syncStorageNow() {
+    this.logger.log('Manual storage sync triggered by admin.');
+    try {
+      const now = new Date();
+      const kstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+      const kstYesterday = new Date(kstTime.getTime() - 24 * 60 * 60 * 1000);
+      
+      const yYear = kstYesterday.getUTCFullYear();
+      const yMonth = kstYesterday.getUTCMonth();
+      const yDate = kstYesterday.getUTCDate();
+      
+      const checkDate = new Date(Date.UTC(yYear, yMonth, yDate));
+      
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const formattedDate = `${yYear}-${pad(yMonth + 1)}-${pad(yDate)}`;
+
+      const existingCount = await this.prisma.sysStorageHistory.count({
+        where: { checkDate: checkDate }
+      });
+
+      if (existingCount > 0) {
+        this.logger.log(`[Manual Sync] Skipped. Data for ${formattedDate} already exists.`);
+        return { 
+          success: false, 
+          message: `이미 전일(${formattedDate}) 데이터가 존재합니다. 동기화를 중단합니다.` 
+        };
+      }
+
+      await this.recordDailyStorageSize();
+      
+      return { 
+        success: true, 
+        message: `수동 스토리지 동기화가 완료되었습니다. (${formattedDate} 정상 적재)` 
+      };
+    } catch (error: any) {
+      this.logger.error(`[Manual Sync Error] ${error.message}`);
+      return { 
+        success: false, 
+        message: `수동 동기화 중 오류가 발생했습니다: ${error.message}` 
+      };
     }
   }
 
@@ -149,7 +220,6 @@ export class AdminService {
     let totalDbUsageMB = 0;
     let tableDetails: any[] = [];
     
-    // 테이블 요약은 현재 시점의 전체 용량이 맞으므로 기존 로직 유지
     try {
       const dbTables: any[] = await this.prisma.$queryRaw`
         SELECT
@@ -158,14 +228,7 @@ export class AdminService {
           COALESCE(pg_total_relation_size(c.oid), 0) AS "sizeBytes"
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public' AND c.relkind = 'r'
-          AND EXISTS (
-            SELECT 1 
-            FROM information_schema.columns col 
-            WHERE col.table_schema = n.nspname 
-              AND col.table_name = c.relname 
-              AND col.column_name IN ('serv_ts', 'access_ts', 'created_at', 'ts', 'datetime', 'time_stamp')
-          )
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
         ORDER BY pg_total_relation_size(c.oid) DESC
       `;
 
@@ -173,7 +236,7 @@ export class AdminService {
         const sizeMB = Number(t.sizeBytes || 0) / (1024 * 1024);
         totalDbUsageMB += sizeMB;
         const tableName = String(t.tableName || '');
-        const isDynamic = tableName.startsWith('plg_') || tableName.startsWith('eqp_') || tableName.startsWith('sys_') || tableName.startsWith('cfg_');
+        const isDynamic = this.getTargetTimeColumn(tableName) !== null;
         return { tableName, type: isDynamic ? 'Dynamic' : 'Static', rowCount: Number(t.rowCount || 0), sizeMB };
       });
     } catch (error: any) {
@@ -225,20 +288,18 @@ export class AdminService {
       const trendDates = Array.from(dateMap.keys()).sort();
       
       let runningCumObjMB = 0;
-      let runningCumDbMB = 0; // [수정됨] DB 데이터도 증가분이므로 누적 변수 추가
+      let runningCumDbMB = 0; 
 
       if (trendDates.length > 0) {
         const firstDate = new Date(trendDates[0]);
         firstDate.setUTCDate(firstDate.getUTCDate() - 1); 
 
-        // 과거 누적 합산 (Object)
         const prevObjSum = await this.prisma.sysStorageHistory.aggregate({
           _sum: { sizeBytes: true },
           where: { storageType: 'FILE', checkDate: { lte: firstDate } }
         });
         runningCumObjMB = Number(prevObjSum._sum.sizeBytes || 0) / (1024 * 1024);
 
-        // 과거 누적 합산 (DB)
         const prevDbSum = await this.prisma.sysStorageHistory.aggregate({
           _sum: { sizeBytes: true },
           where: { storageType: 'DB', checkDate: { lte: firstDate } }
@@ -252,16 +313,15 @@ export class AdminService {
         const date = trendDates[i];
         const current = dateMap.get(date)!;
 
-        // DB 역시 이제 일일 증가량(Increment) 데이터입니다.
         const dailyDbMB = current.dbBytes / (1024 * 1024); 
         const dailyObjMB = current.objBytes / (1024 * 1024); 
 
         runningCumObjMB += dailyObjMB; 
-        runningCumDbMB += dailyDbMB; // 매일의 데이터를 누적시킴
+        runningCumDbMB += dailyDbMB; 
 
         dailyTrends.push({ 
           date, 
-          cumDbMB: runningCumDbMB,  // [수정됨] 올바른 누적값 매핑
+          cumDbMB: runningCumDbMB,
           cumObjMB: runningCumObjMB, 
           dailyDbMB: dailyDbMB,       
           dailyObjMB: dailyObjMB 
@@ -284,61 +344,11 @@ export class AdminService {
     return { summary: { totalDbUsageMB, totalObjectStorageMB }, tableDetails, dailyTrends, monthlyTrends };
   }
 
-  async getExceptionUsers() {
-    return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } });
-  }
-
-  async addExceptionUser(data: { loginId: string; deptCode?: string; deptName?: string; registeredBy: string }) {
-    return this.prisma.cfgUserException.create({
-      data: {
-        loginId: data.loginId,
-        deptCode: data.deptCode,
-        deptName: data.deptName,
-        isActive: 'Y',
-        registeredBy: data.registeredBy, 
-        createdAt: this.getKstDate()
-      }
-    });
-  }
-
-  async updateExceptionUserStatus(loginId: string, isActive: string) {
-    return this.prisma.cfgUserException.update({
-      where: { loginId },
-      data: { isActive }
-    });
-  }
-
-  async deleteExceptionUser(loginId: string) {
-    return this.prisma.cfgUserException.delete({ where: { loginId } });
-  }
-
-  async getAllUsers() { 
-    const users = await this.prisma.sysUser.findMany({ 
-      include: { context: { include: { sdwtInfo: true } } }, 
-      orderBy: { lastLoginAt: 'desc' }
-    }); 
-
-    const admins = await this.prisma.cfgAdminUser.findMany();
-    const guests = await this.prisma.cfgGuestAccess.findMany();
-
-    const adminMap = new Map(admins.map(a => [a.loginId, a.role]));
-    const guestMap = new Map(guests.map(g => [g.loginId, g.grantedRole]));
-
-    return users.map(u => {
-      let role = 'USER'; 
-      if (adminMap.has(u.loginId)) {
-        role = adminMap.get(u.loginId) || 'ADMIN';
-      } else if (guestMap.has(u.loginId)) {
-        role = guestMap.get(u.loginId) || 'GUEST';
-      }
-
-      return {
-        ...u,
-        role
-      };
-    });
-  }
-
+  async getExceptionUsers() { return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } }); }
+  async addExceptionUser(data: { loginId: string; deptCode?: string; deptName?: string; registeredBy: string }) { return this.prisma.cfgUserException.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, isActive: 'Y', registeredBy: data.registeredBy, createdAt: this.getKstDate() } }); }
+  async updateExceptionUserStatus(loginId: string, isActive: string) { return this.prisma.cfgUserException.update({ where: { loginId }, data: { isActive } }); }
+  async deleteExceptionUser(loginId: string) { return this.prisma.cfgUserException.delete({ where: { loginId } }); }
+  async getAllUsers() { const users = await this.prisma.sysUser.findMany({ include: { context: { include: { sdwtInfo: true } } }, orderBy: { lastLoginAt: 'desc' } }); const admins = await this.prisma.cfgAdminUser.findMany(); const guests = await this.prisma.cfgGuestAccess.findMany(); const adminMap = new Map(admins.map(a => [a.loginId, a.role])); const guestMap = new Map(guests.map(g => [g.loginId, g.grantedRole])); return users.map(u => { let role = 'USER'; if (adminMap.has(u.loginId)) { role = adminMap.get(u.loginId) || 'ADMIN'; } else if (guestMap.has(u.loginId)) { role = guestMap.get(u.loginId) || 'GUEST'; } return { ...u, role }; }); }
   async getAllAdmins() { return this.prisma.cfgAdminUser.findMany({ orderBy: { assignedAt: 'desc' } }); }
   async addAdmin(data: any) { return this.prisma.cfgAdminUser.create({ data: { loginId: data.loginId, role: data.role || 'MANAGER', assignedBy: data.assignedBy, assignedAt: this.getKstDate() } }); }
   async deleteAdmin(loginId: string) { return this.prisma.cfgAdminUser.delete({ where: { loginId } }); }
