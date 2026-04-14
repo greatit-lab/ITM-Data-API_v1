@@ -65,7 +65,8 @@ export class AdminService {
     return null; 
   }
 
-  @Cron('0 1 0 * * *', { timeZone: 'Asia/Seoul' })
+  // 데이터 마이그레이션(파티셔닝) 완료 후 안전하게 집계하기 위해 매일 새벽 2시로 변경
+  @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
     
