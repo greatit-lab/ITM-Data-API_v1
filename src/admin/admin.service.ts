@@ -6,6 +6,11 @@ import { Cron } from '@nestjs/schedule';
 import * as http from 'http';
 import * as https from 'https';
 
+// [추가] 리눅스 실제 OS 디스크 용량 조회를 위한 내장 모듈
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
+
 @Injectable()
 export class AdminService {
   private readonly logger = new Logger(AdminService.name);
@@ -65,7 +70,6 @@ export class AdminService {
     return null; 
   }
 
-  // 데이터 마이그레이션(파티셔닝) 완료 후 안전하게 집계하기 위해 매일 새벽 2시로 변경
   @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
@@ -128,7 +132,6 @@ export class AdminService {
 
         if (!tsColumn) continue;
 
-        // [단계 1] 해당 일자의 살아있는 총 Row 개수 추출 (인덱스 사용으로 초고속)
         const countStats: any[] = await this.prisma.$queryRawUnsafe(`
           SELECT COUNT(*)::bigint AS "dailyRowCount"
           FROM "${tableName}"
@@ -137,12 +140,8 @@ export class AdminService {
 
         const dailyRowCount = Number(countStats[0]?.dailyRowCount || 0);
 
-        if (dailyRowCount === 0) {
-          continue; // 데이터가 없으면 바로 다음 테이블로
-        }
+        if (dailyRowCount === 0) continue;
 
-        // [단계 2] 궁극의 최적화: 수백만 건을 스캔하지 않고, '오늘 들어온 데이터 중 1000건'만 추출하여
-        // TOAST가 완벽히 포함된 실제 평균 Row 크기를 계산함 (0.01초 소요, 거품 배제)
         const sampleStats: any[] = await this.prisma.$queryRawUnsafe(`
           SELECT COALESCE(AVG(pg_column_size(t.*)), 0) + 24 AS "avgRowSize"
           FROM (
@@ -153,8 +152,6 @@ export class AdminService {
         `, startDateStr, endDateStr);
 
         const avgRowSize = Number(sampleStats[0]?.avgRowSize || 24);
-        
-        // [단계 3] 정확한 평균 단가 × 전체 개수 = 완벽한 일일 적재 용량 산출
         const dailySizeBytes = Math.round(dailyRowCount * avgRowSize);
 
         await this.prisma.sysStorageHistory.upsert({
@@ -168,9 +165,6 @@ export class AdminService {
     }
   }
 
-  // ==========================================
-  // 수동 스토리지 동기화
-  // ==========================================
   async syncStorageNow() {
     this.logger.log('Manual storage sync triggered by admin.');
     try {
@@ -193,30 +187,33 @@ export class AdminService {
 
       if (existingCount > 0) {
         this.logger.log(`[Manual Sync] Skipped. Data for ${formattedDate} already exists.`);
-        return { 
-          success: false, 
-          message: `이미 전일(${formattedDate}) 데이터가 존재합니다. 동기화를 중단합니다.` 
-        };
+        return { success: false, message: `이미 전일(${formattedDate}) 데이터가 존재합니다. 동기화를 중단합니다.` };
       }
 
       await this.recordDailyStorageSize();
-      
-      return { 
-        success: true, 
-        message: `수동 스토리지 동기화가 완료되었습니다. (${formattedDate} 정상 적재)` 
-      };
+      return { success: true, message: `수동 스토리지 동기화가 완료되었습니다. (${formattedDate} 정상 적재)` };
     } catch (error: any) {
       this.logger.error(`[Manual Sync Error] ${error.message}`);
-      return { 
-        success: false, 
-        message: `수동 동기화 중 오류가 발생했습니다: ${error.message}` 
-      };
+      return { success: false, message: `수동 동기화 중 오류가 발생했습니다: ${error.message}` };
     }
   }
 
   async getStorageUsage(startDate: string, endDate: string, interval: string) {
     const start = new Date(`${startDate}T00:00:00.000Z`);
     const end = new Date(`${endDate}T23:59:59.999Z`);
+
+    // [신규 로직] 실제 OS의 루트(/) 파티션 전체 크기 조회 (MB 단위)
+    let serverCapacityMB = 4194304; // 리눅스 명령어 실패 시 4TB 안전 기본값
+    try {
+      // df -m: MB 단위 출력, awk 'NR==2 {print $2}': 두 번째 줄의 2번째 열(Total 크기) 추출
+      const { stdout } = await execAsync("df -m / | awk 'NR==2 {print $2}'");
+      const parsed = parseInt(stdout.trim(), 10);
+      if (!isNaN(parsed) && parsed > 0) {
+        serverCapacityMB = parsed;
+      }
+    } catch (error: any) {
+      this.logger.warn(`[OS Disk Warning] 리눅스 실제 디스크 크기 조회 실패, 기본값 사용: ${error.message}`);
+    }
 
     let totalDbUsageMB = 0;
     let tableDetails: any[] = [];
@@ -342,7 +339,8 @@ export class AdminService {
       this.logger.error(`[Trends Query Error] ${error.message}`);
     }
 
-    return { summary: { totalDbUsageMB, totalObjectStorageMB }, tableDetails, dailyTrends, monthlyTrends };
+    // 서버 실제 용량(`serverCapacityMB`)을 함께 반환합니다.
+    return { summary: { totalDbUsageMB, totalObjectStorageMB, serverCapacityMB }, tableDetails, dailyTrends, monthlyTrends };
   }
 
   async getExceptionUsers() { return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } }); }
