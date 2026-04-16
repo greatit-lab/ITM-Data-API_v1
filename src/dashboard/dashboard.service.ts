@@ -1,4 +1,4 @@
-// ITM-Data-API/src/dashboard/dashboard.service.ts
+// ITM-Data-API_v1/src/dashboard/dashboard.service.ts
 import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
@@ -42,21 +42,18 @@ export class DashboardService {
     return 0;
   }
 
-  // [극강의 방어력 적용] 에러 원천 차단형 메모리 집계 로직
   async getGlobalFleetData() {
     try {
       const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
       const todayDateStr = kstNow.toISOString().split('T')[0];
       const startOfToday = new Date(`${todayDateStr}T00:00:00.000Z`);
 
-      // 1. 모든 사용 중인 SDWT 기본 정보 조회
       const sdwts = await this.prisma.refSdwt.findMany({
         where: { isUse: 'Y' },
         select: { id: true, site: true, sdwt: true },
         orderBy: { id: 'asc' }
       });
 
-      // 2. 장비 조회 (Prisma 에러를 유발할 수 있는 isNot: null 조건을 빼고 전체를 가져옴)
       const rawEquipments = await this.prisma.refEquipment.findMany({
         where: { sdwtRel: { isUse: 'Y' } },
         select: {
@@ -67,11 +64,9 @@ export class DashboardService {
         }
       });
 
-      // 서버 메모리에서 안전하게 필터링 (에이전트가 등록된 장비만 남김)
       const equipments = rawEquipments.filter(e => e.agentInfo !== null);
       const eqpIds = equipments.map((e) => e.eqpid);
       
-      // 3. 에러 카운트 (개별 테이블 오류로 전체 로딩이 멈추지 않도록 독립 try-catch 적용)
       const errorMap = new Map<string, number>();
       try {
         if (eqpIds.length > 0) {
@@ -89,14 +84,12 @@ export class DashboardService {
           });
         }
       } catch (err) {
-        this.logger.warn("PlgError Query Failed (에러 데이터 로드 실패, 조회는 계속됨):", err);
+        this.logger.warn("PlgError Query Failed:", err);
       }
 
-      // 4. 프론트엔드용 JSON 트리 구조로 In-Memory 고속 집계
       const siteMap = new Map<string, any>();
       let siteIndex = 0;
 
-      // 사이트 및 SDWT 골격 먼저 생성
       for (const s of sdwts) {
         if (!siteMap.has(s.site)) {
           siteMap.set(s.site, {
@@ -120,7 +113,6 @@ export class DashboardService {
         }
       }
 
-      // 조회된 장비 데이터를 골격에 채워 넣기
       for (const eqp of equipments) {
         const targetSdwt = sdwts.find((s) => s.sdwt === eqp.sdwt);
         if (!targetSdwt) continue;
@@ -135,13 +127,11 @@ export class DashboardService {
         const errorCount = errorMap.get(eqp.eqpid) || 0;
         const hasError = errorCount > 0;
 
-        // SDWT 누적
         sdwtObj.totalCount++;
         if (isOnline) sdwtObj.onlineCount++;
         else sdwtObj.offlineCount++;
         if (hasError) sdwtObj.summary.todayErrorCount++;
 
-        // Site 누적
         siteObj.siteStats.total++;
         if (isOnline) siteObj.siteStats.online++;
         else siteObj.siteStats.offline++;
@@ -201,6 +191,7 @@ export class DashboardService {
         where: equipmentWhere,
         select: { eqpid: true }
       });
+      // [최적화] 필터링된 eqpid 배열을 미리 추출하여 이후 쿼리의 속도를 극대화
       const eqpIds = targetEqps.map(e => e.eqpid);
 
       const totalEqp = await this.prisma.refEquipment.count({ 
@@ -233,36 +224,38 @@ export class DashboardService {
       let newAlarmCount = 0;
 
       try {
-        const [totalError, recentError] = await Promise.all([
-          this.prisma.plgError.count({
-            where: {
-              timeStamp: { gte: startOfToday }, 
-              equipment: equipmentWhere,
-            },
-          }),
-          this.prisma.plgError.count({
-            where: { 
-              timeStamp: { gte: oneHourAgo }, 
-              equipment: equipmentWhere 
-            },
-          }),
-        ]);
+        if (eqpIds.length > 0) {
+          // [최적화] relation Join을 빼고 in: eqpIds 로 직접 매칭하여 속도 극대화
+          const [totalError, recentError] = await Promise.all([
+            this.prisma.plgError.count({
+              where: {
+                timeStamp: { gte: startOfToday }, 
+                eqpid: { in: eqpIds },
+              },
+            }),
+            this.prisma.plgError.count({
+              where: { 
+                timeStamp: { gte: oneHourAgo }, 
+                eqpid: { in: eqpIds },
+              },
+            }),
+          ]);
 
-        todayErrorTotalCount = totalError;
-        newAlarmCount = recentError;
+          todayErrorTotalCount = totalError;
+          newAlarmCount = recentError;
 
-        if (todayErrorTotalCount > 0) {
-           const errorEqps = await this.prisma.plgError.findMany({
-             where: {
-               timeStamp: { gte: startOfToday },
-               equipment: equipmentWhere,
-             },
-             distinct: ['eqpid'],
-             select: { eqpid: true },
-           });
-           todayErrorCount = errorEqps.length;
+          if (todayErrorTotalCount > 0) {
+             const errorEqps = await this.prisma.plgError.findMany({
+               where: {
+                 timeStamp: { gte: startOfToday },
+                 eqpid: { in: eqpIds },
+               },
+               distinct: ['eqpid'],
+               select: { eqpid: true },
+             });
+             todayErrorCount = errorEqps.length;
+          }
         }
-
       } catch (err) {
         this.logger.warn("Error stats query failed:", err);
       }
@@ -304,6 +297,8 @@ export class DashboardService {
       const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
       const todayDateStr = kstNow.toISOString().split('T')[0];
 
+      // [핵심 최적화] ROW_NUMBER() 테이블 풀스캔을 제거하고 LATERAL JOIN 도입.
+      // 필터링된 장비 수만큼만 서브쿼리를 실행하여 조회 속도를 수십 초에서 밀리초 단위로 단축.
       const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
         SELECT 
             a.eqpid, 
@@ -323,18 +318,20 @@ export class DashboardService {
         JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.agent_status s ON a.eqpid = s.eqpid
         LEFT JOIN public.cfg_server cs ON a.eqpid = cs.eqpid
-        LEFT JOIN (
-            SELECT eqpid, cpu_usage, mem_usage, serv_ts, ts, 
-                  ROW_NUMBER() OVER(PARTITION BY eqpid ORDER BY serv_ts DESC) as rn
+        LEFT JOIN LATERAL (
+            SELECT cpu_usage, mem_usage, serv_ts, ts
             FROM public.eqp_perf
-            WHERE serv_ts >= NOW() - INTERVAL '1 day' 
-        ) p ON a.eqpid = p.eqpid AND p.rn = 1
-        LEFT JOIN (
-            SELECT eqpid, COUNT(*) AS alarm_count 
+            WHERE eqpid = a.eqpid
+              AND serv_ts >= NOW() - INTERVAL '1 day' 
+            ORDER BY serv_ts DESC
+            LIMIT 1
+        ) p ON true
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS alarm_count 
             FROM public.plg_error 
-            WHERE time_stamp >= CAST(${todayDateStr} AS TIMESTAMP)
-            GROUP BY eqpid
-        ) e ON a.eqpid = e.eqpid
+            WHERE eqpid = a.eqpid
+              AND time_stamp >= CAST(${todayDateStr} AS TIMESTAMP)
+        ) e ON true
         ${whereCondition}
         ORDER BY a.eqpid ASC;
       `;
