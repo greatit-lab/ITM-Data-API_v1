@@ -527,3 +527,13 @@ model SysStorageHistory {
   @@index([checkDate])
   @@map("sys_storage_history")
 }
+
+model SysEasterEgg {
+  id        Int      @id @default(autoincrement())
+  userId    String   @map("user_id") @db.VarChar(50) // 발견자 ID
+  eggType   String   @map("egg_type") @db.VarChar(50) // 'MATRIX' 또는 'DEFENDER'
+  score     Int      @default(0) // 디펜스 게임 점수 (매트릭스는 0)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@map("sys_easter_egg")
+}
