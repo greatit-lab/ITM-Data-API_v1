@@ -27,7 +27,6 @@ export class DashboardService {
       const todayDateStr = kstNow.toISOString().split('T')[0];
       const startOfToday = new Date(`${todayDateStr}T00:00:00.000Z`);
 
-      // [추가] DB에서 'Y' 플래그가 설정된 최신 버전 정보를 가져옵니다.
       const latestVerEntry = await this.prisma.sysAgentVersion.findFirst({
         where: { isLatest: 'Y' },
         select: { version: true }
@@ -45,7 +44,7 @@ export class DashboardService {
         select: {
           eqpid: true,
           sdwt: true,
-          agentInfo: { select: { eqpid: true, appVer: true } }, // appVer 추가 조회
+          agentInfo: { select: { eqpid: true, appVer: true } }, 
           agentStatus: { select: { status: true } },
         }
       });
@@ -93,7 +92,7 @@ export class DashboardService {
             totalCount: 0,
             onlineCount: 0,
             offlineCount: 0,
-            latestCount: 0, // 최신 버전 장비 수 카운트용
+            latestCount: 0, 
             summary: { todayErrorCount: 0 },
             index: siteObj.sdwts.length
           });
@@ -114,14 +113,13 @@ export class DashboardService {
         const errorCount = errorMap.get(eqp.eqpid) || 0;
         const hasError = errorCount > 0;
 
-        // [추가] 해당 장비가 최신 버전인지 체크
         const isLatest = eqp.agentInfo?.appVer === latestVersion;
 
         sdwtObj.totalCount++;
         if (isOnline) sdwtObj.onlineCount++;
         else sdwtObj.offlineCount++;
         if (hasError) sdwtObj.summary.todayErrorCount++;
-        if (isLatest) sdwtObj.latestCount++; // 최신 버전 카운트 증가
+        if (isLatest) sdwtObj.latestCount++; 
 
         siteObj.siteStats.total++;
         if (isOnline) siteObj.siteStats.online++;
@@ -129,7 +127,6 @@ export class DashboardService {
         if (hasError) siteObj.siteStats.alerts++;
       }
 
-      // 최종 배열 생성 시 SDWT별로 모두 최신 버전인지 플래그 설정
       const result = Array.from(siteMap.values());
       result.forEach(site => {
         site.sdwts.forEach((sdwt: any) => {
@@ -145,7 +142,6 @@ export class DashboardService {
     }
   }
 
-  // ... (getSummary, getAgentStatus 등 나머지 코드는 이전 답변과 동일)
   async getSummary(site?: string, sdwt?: string) {
     try {
       const safeSite = site && site.trim() !== '' ? site : undefined;
@@ -384,6 +380,78 @@ export class DashboardService {
     } catch (error) {
       this.logger.error("getAgentStatus Error:", error);
       throw new InternalServerErrorException("Failed to fetch agent status");
+    }
+  }
+
+  // ========================================================================
+  // 이스터에그(글로벌 리더보드) 기능
+  // ========================================================================
+
+  async saveEasterEgg(data: { userId: string; eggType: string; score: number }) {
+    try {
+      const existingRecord = await this.prisma.sysEasterEgg.findUnique({
+        where: {
+          userId_eggType: {
+            userId: data.userId,
+            eggType: data.eggType,
+          }
+        }
+      });
+
+      if (!existingRecord || data.score > existingRecord.score) {
+        return await this.prisma.sysEasterEgg.upsert({
+          where: {
+            userId_eggType: {
+              userId: data.userId,
+              eggType: data.eggType,
+            }
+          },
+          update: {
+            score: data.score,
+            achievedAt: new Date(), 
+          },
+          create: {
+            userId: data.userId,
+            eggType: data.eggType,
+            score: data.score,
+          },
+        });
+      }
+      
+      return existingRecord;
+
+    } catch (error) {
+      this.logger.error("saveEasterEgg Error:", error);
+      throw new InternalServerErrorException("Failed to save easter egg record");
+    }
+  }
+
+  // [수정됨] TO_CHAR를 사용하여 날짜를 YYYY-MM-DD HH:mm:ss 형식으로 반환하도록 쿼리 수정
+  async getEasterEggRanking(eggType: string) {
+    try {
+      const rankings = await this.prisma.$queryRaw<any[]>`
+        SELECT 
+          user_id as "id", 
+          score,
+          TO_CHAR(created_at, 'YYYY-MM-DD HH24:MI:SS') as "createdAt",
+          TO_CHAR(achieved_at, 'YYYY-MM-DD HH24:MI:SS') as "achievedAt"
+        FROM sys_easter_egg
+        WHERE egg_type = ${eggType}
+        ORDER BY score DESC, achieved_at ASC
+        LIMIT 5;
+      `;
+      
+      return Array.isArray(rankings) 
+        ? rankings.map(r => ({ 
+            id: String(r.id), 
+            score: Number(r.score),
+            createdAt: r.createdAt,
+            achievedAt: r.achievedAt
+          })) 
+        : [];
+    } catch (error) {
+      this.logger.error("getEasterEggRanking Error:", error);
+      throw new InternalServerErrorException("Failed to fetch easter egg rankings");
     }
   }
 }
