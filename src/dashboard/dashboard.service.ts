@@ -3,27 +3,6 @@ import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
 
-interface AgentStatusRawResult {
-  eqpid: string;
-  is_online: boolean;
-  last_contact: Date | null;
-  pc_name: string | null;
-  cpu_usage: number;
-  mem_usage: number;
-  app_ver: string | null;
-  type: string | null;
-  ip_address: string | null;
-  os: string | null;
-  system_type: string | null;
-  locale: string | null;
-  timezone: string | null;
-  today_alarm_count: number;
-  last_perf_serv_ts: Date | null;
-  last_perf_eqp_ts: Date | null;
-  use_proxy: string | null; 
-  proxy_ip: string | null;  
-}
-
 @Injectable()
 export class DashboardService {
   private readonly logger = new Logger(DashboardService.name);
@@ -48,6 +27,13 @@ export class DashboardService {
       const todayDateStr = kstNow.toISOString().split('T')[0];
       const startOfToday = new Date(`${todayDateStr}T00:00:00.000Z`);
 
+      // [추가] DB에서 'Y' 플래그가 설정된 최신 버전 정보를 가져옵니다.
+      const latestVerEntry = await this.prisma.sysAgentVersion.findFirst({
+        where: { isLatest: 'Y' },
+        select: { version: true }
+      });
+      const latestVersion = latestVerEntry?.version || '';
+
       const sdwts = await this.prisma.refSdwt.findMany({
         where: { isUse: 'Y' },
         select: { id: true, site: true, sdwt: true },
@@ -59,7 +45,7 @@ export class DashboardService {
         select: {
           eqpid: true,
           sdwt: true,
-          agentInfo: { select: { eqpid: true } },
+          agentInfo: { select: { eqpid: true, appVer: true } }, // appVer 추가 조회
           agentStatus: { select: { status: true } },
         }
       });
@@ -107,6 +93,7 @@ export class DashboardService {
             totalCount: 0,
             onlineCount: 0,
             offlineCount: 0,
+            latestCount: 0, // 최신 버전 장비 수 카운트용
             summary: { todayErrorCount: 0 },
             index: siteObj.sdwts.length
           });
@@ -127,10 +114,14 @@ export class DashboardService {
         const errorCount = errorMap.get(eqp.eqpid) || 0;
         const hasError = errorCount > 0;
 
+        // [추가] 해당 장비가 최신 버전인지 체크
+        const isLatest = eqp.agentInfo?.appVer === latestVersion;
+
         sdwtObj.totalCount++;
         if (isOnline) sdwtObj.onlineCount++;
         else sdwtObj.offlineCount++;
         if (hasError) sdwtObj.summary.todayErrorCount++;
+        if (isLatest) sdwtObj.latestCount++; // 최신 버전 카운트 증가
 
         siteObj.siteStats.total++;
         if (isOnline) siteObj.siteStats.online++;
@@ -138,7 +129,15 @@ export class DashboardService {
         if (hasError) siteObj.siteStats.alerts++;
       }
 
-      return Array.from(siteMap.values());
+      // 최종 배열 생성 시 SDWT별로 모두 최신 버전인지 플래그 설정
+      const result = Array.from(siteMap.values());
+      result.forEach(site => {
+        site.sdwts.forEach((sdwt: any) => {
+          sdwt.isAllLatest = sdwt.totalCount > 0 && sdwt.latestCount === sdwt.totalCount;
+        });
+      });
+
+      return result;
 
     } catch (error) {
       this.logger.error("getGlobalFleetData Fatal Error:", error);
@@ -146,6 +145,7 @@ export class DashboardService {
     }
   }
 
+  // ... (getSummary, getAgentStatus 등 나머지 코드는 이전 답변과 동일)
   async getSummary(site?: string, sdwt?: string) {
     try {
       const safeSite = site && site.trim() !== '' ? site : undefined;
@@ -191,7 +191,6 @@ export class DashboardService {
         where: equipmentWhere,
         select: { eqpid: true }
       });
-      // [최적화] 필터링된 eqpid 배열을 미리 추출하여 이후 쿼리의 속도를 극대화
       const eqpIds = targetEqps.map(e => e.eqpid);
 
       const totalEqp = await this.prisma.refEquipment.count({ 
@@ -225,7 +224,6 @@ export class DashboardService {
 
       try {
         if (eqpIds.length > 0) {
-          // [최적화] relation Join을 빼고 in: eqpIds 로 직접 매칭하여 속도 극대화
           const [totalError, recentError] = await Promise.all([
             this.prisma.plgError.count({
               where: {
@@ -286,61 +284,79 @@ export class DashboardService {
       const safeSite = site && site.trim() !== '' ? site : undefined;
       const safeSdwt = sdwt && sdwt.trim() !== '' ? sdwt : undefined;
 
-      let whereCondition = Prisma.sql`WHERE r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE is_use = 'Y')`;
+      const targetEqps = await this.prisma.refEquipment.findMany({
+        where: {
+          sdwtRel: {
+            isUse: 'Y',
+            ...(safeSite ? { site: safeSite } : {}),
+          },
+          ...(safeSdwt ? { sdwt: safeSdwt } : {}),
+        },
+        select: { eqpid: true }
+      });
 
-      if (safeSdwt) {
-        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt = ${safeSdwt}`;
-      } else if (safeSite) {
-        whereCondition = Prisma.sql`${whereCondition} AND r.sdwt IN (SELECT sdwt FROM public.ref_sdwt WHERE site = ${safeSite})`;
-      }
+      const eqpIds = targetEqps.map(e => e.eqpid);
+      if (eqpIds.length === 0) return [];
 
       const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
       const todayDateStr = kstNow.toISOString().split('T')[0];
+      const startOfToday = new Date(`${todayDateStr}T00:00:00.000Z`);
 
-      // [핵심 최적화] ROW_NUMBER() 테이블 풀스캔을 제거하고 LATERAL JOIN 도입.
-      // 필터링된 장비 수만큼만 서브쿼리를 실행하여 조회 속도를 수십 초에서 밀리초 단위로 단축.
-      const results = await this.prisma.$queryRaw<AgentStatusRawResult[]>`
+      const baseInfoRaw = await this.prisma.$queryRaw<any[]>`
         SELECT 
             a.eqpid, 
             CASE WHEN COALESCE(s.status, 'OFFLINE') = 'ONLINE' THEN true ELSE false END AS is_online, 
             s.last_perf_update AS last_contact,
             a.pc_name, 
-            COALESCE(p.cpu_usage, 0) AS cpu_usage, 
-            COALESCE(p.mem_usage, 0) AS mem_usage, 
             a.app_ver,
             a.type, a.ip_address, a.os, a.system_type, a.locale, a.timezone,
-            COALESCE(e.alarm_count, 0)::int AS today_alarm_count,
-            p.serv_ts AS last_perf_serv_ts,
-            p.ts AS last_perf_eqp_ts,
             cs.use_proxy,
             cs.proxy_ip
         FROM public.agent_info a
-        JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.agent_status s ON a.eqpid = s.eqpid
         LEFT JOIN public.cfg_server cs ON a.eqpid = cs.eqpid
-        LEFT JOIN LATERAL (
-            SELECT cpu_usage, mem_usage, serv_ts, ts
-            FROM public.eqp_perf
-            WHERE eqpid = a.eqpid
-              AND serv_ts >= NOW() - INTERVAL '1 day' 
-            ORDER BY serv_ts DESC
-            LIMIT 1
-        ) p ON true
-        LEFT JOIN LATERAL (
-            SELECT COUNT(*) AS alarm_count 
-            FROM public.plg_error 
-            WHERE eqpid = a.eqpid
-              AND time_stamp >= CAST(${todayDateStr} AS TIMESTAMP)
-        ) e ON true
-        ${whereCondition}
-        ORDER BY a.eqpid ASC;
+        WHERE a.eqpid IN (${Prisma.join(eqpIds)})
       `;
 
-      return results.map((r) => {
+      const errorStats = await this.prisma.plgError.groupBy({
+        by: ['eqpid'],
+        where: {
+          eqpid: { in: eqpIds },
+          timeStamp: { gte: startOfToday }
+        },
+        _count: { _all: true }
+      });
+      const errorMap = new Map(errorStats.map(e => [e.eqpid, e._count._all]));
+
+      const perfMap = new Map<string, any>();
+      const chunkSize = 20; 
+      for (let i = 0; i < eqpIds.length; i += chunkSize) {
+        const chunk = eqpIds.slice(i, i + chunkSize);
+        const promises = chunk.map(id => 
+          this.prisma.$queryRaw<any[]>`
+            SELECT cpu_usage, mem_usage, serv_ts, ts 
+            FROM public.eqp_perf 
+            WHERE eqpid = ${id} 
+            ORDER BY serv_ts DESC 
+            LIMIT 1
+          `
+        );
+        const results = await Promise.all(promises);
+        chunk.forEach((id, index) => {
+          if (results[index] && results[index].length > 0) {
+            perfMap.set(id, results[index][0]);
+          }
+        });
+      }
+
+      return baseInfoRaw.map((r) => {
+        const errCount = errorMap.get(r.eqpid) || 0;
+        const pData = perfMap.get(r.eqpid);
+        
         let clockDrift: number | null = null;
-        if (r.last_perf_serv_ts && r.last_perf_eqp_ts) {
-          const servTs = new Date(r.last_perf_serv_ts).getTime();
-          const eqpTs = new Date(r.last_perf_eqp_ts).getTime();
+        if (pData && pData.serv_ts && pData.ts) {
+          const servTs = new Date(pData.serv_ts).getTime();
+          const eqpTs = new Date(pData.ts).getTime();
           clockDrift = (servTs - eqpTs) / 1000;
         }
 
@@ -349,8 +365,8 @@ export class DashboardService {
           isOnline: r.is_online,
           lastContact: r.last_contact,
           pcName: r.pc_name,
-          cpuUsage: r.cpu_usage,
-          memoryUsage: r.mem_usage,
+          cpuUsage: pData && pData.cpu_usage != null ? Number(pData.cpu_usage) : 0,
+          memoryUsage: pData && pData.mem_usage != null ? Number(pData.mem_usage) : 0,
           appVersion: r.app_ver || '',
           type: r.type || '',
           ipAddress: r.ip_address || '',
@@ -358,12 +374,13 @@ export class DashboardService {
           systemType: r.system_type || '',
           locale: r.locale || '',
           timezone: r.timezone || '',
-          todayAlarmCount: r.today_alarm_count,
+          todayAlarmCount: Number(errCount),
           clockDrift: clockDrift,
           useProxy: r.use_proxy || 'N', 
-          proxyIp: r.proxy_ip || '',    
+          proxyIp: r.proxy_ip || '', 
         };
-      });
+      }).sort((a, b) => a.eqpId.localeCompare(b.eqpId));
+
     } catch (error) {
       this.logger.error("getAgentStatus Error:", error);
       throw new InternalServerErrorException("Failed to fetch agent status");
