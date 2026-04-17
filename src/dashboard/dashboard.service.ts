@@ -389,6 +389,9 @@ export class DashboardService {
 
   async saveEasterEgg(data: { userId: string; eggType: string; score: number }) {
     try {
+      // 1. 현재 시간에 9시간(밀리초 환산)을 더해 KST(한국 시간) 객체를 생성합니다.
+      const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
+
       const existingRecord = await this.prisma.sysEasterEgg.findUnique({
         where: {
           userId_eggType: {
@@ -408,12 +411,16 @@ export class DashboardService {
           },
           update: {
             score: data.score,
-            achievedAt: new Date(), 
+            // 갱신될 때 KST 시간 강제 주입
+            achievedAt: kstNow, 
           },
           create: {
             userId: data.userId,
             eggType: data.eggType,
             score: data.score,
+            // 최초 생성 시 DB Default(UTC)를 무시하고 KST 시간 강제 주입
+            createdAt: kstNow,
+            achievedAt: kstNow,
           },
         });
       }
