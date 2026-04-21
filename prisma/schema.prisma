@@ -541,3 +541,16 @@ model SysEasterEgg {
   @@map("sys_easter_egg")
   @@index([eggType, userId])
 }
+
+// 기존 모델들 아래에 추가
+model ServerMetric {
+  id        Int      @id @default(autoincrement())
+  serverId  String   // 예: 'web-01', 'api-01', 'db-01'
+  cpu       Float    // vCPU 사용률 (%)
+  memory    Float    // 메모리 사용률 (%)
+  disk      Float    // 디스크 사용률 (%)
+  createdAt DateTime @default(now()) // 기록된 시간
+
+  // 서버별, 시간별 빠른 조회를 위해 인덱스 생성
+  @@index([serverId, createdAt])
+}
