@@ -5,10 +5,9 @@ import { Prisma } from '@prisma/client';
 import { Cron } from '@nestjs/schedule';
 import * as http from 'http';
 import * as https from 'https';
-
-// [추가] 리눅스 실제 OS 디스크 용량 조회를 위한 내장 모듈
 import { exec } from 'child_process';
 import { promisify } from 'util';
+
 const execAsync = promisify(exec);
 
 @Injectable()
@@ -202,10 +201,9 @@ export class AdminService {
     const start = new Date(`${startDate}T00:00:00.000Z`);
     const end = new Date(`${endDate}T23:59:59.999Z`);
 
-    // [신규 로직] 실제 OS의 루트(/) 파티션 전체 크기 조회 (MB 단위)
-    let serverCapacityMB = 4194304; // 리눅스 명령어 실패 시 4TB 안전 기본값
+    // OS 디스크 크기 조회
+    let serverCapacityMB = 4194304;
     try {
-      // df -m: MB 단위 출력, awk 'NR==2 {print $2}': 두 번째 줄의 2번째 열(Total 크기) 추출
       const { stdout } = await execAsync("df -m / | awk 'NR==2 {print $2}'");
       const parsed = parseInt(stdout.trim(), 10);
       if (!isNaN(parsed) && parsed > 0) {
@@ -339,10 +337,117 @@ export class AdminService {
       this.logger.error(`[Trends Query Error] ${error.message}`);
     }
 
-    // 서버 실제 용량(`serverCapacityMB`)을 함께 반환합니다.
     return { summary: { totalDbUsageMB, totalObjectStorageMB, serverCapacityMB }, tableDetails, dailyTrends, monthlyTrends };
   }
+  
+  // ==========================================
+  // 서버 모니터링 (실시간 + 트렌드) 로직 - 100% 실제 데이터 기반
+  // ==========================================
 
+  async recordServerMetric(data: { serverId: string; cpu: number; memory: number; disk: number }) {
+    try {
+      return await (this.prisma as any).serverMetric.create({
+        data: {
+          serverId: data.serverId,
+          cpu: data.cpu,
+          memory: data.memory,
+          disk: data.disk,
+        },
+      });
+    } catch (error: any) {
+      this.logger.error(`Failed to record server metric: ${error.message}`);
+      return { success: false };
+    }
+  }
+
+  async getLatestServerMetrics() {
+    try {
+      // PostgreSQL의 DISTINCT ON 기능을 사용하여 현재 DB에 데이터를 보내고 있는 
+      // 모든 서버들의 '가장 최신 데이터 1건씩'만 빠르고 정확하게 추출합니다.
+      const latestMetrics: any[] = await this.prisma.$queryRaw`
+        SELECT DISTINCT ON ("serverId")
+          "serverId", "cpu", "memory", "disk", "createdAt"
+        FROM "ServerMetric"
+        ORDER BY "serverId", "createdAt" DESC
+      `;
+
+      return latestMetrics.map(metric => {
+        let status = 'healthy';
+        if (metric.cpu >= 90 || metric.memory >= 90) status = 'critical';
+        else if (metric.cpu >= 75 || metric.memory >= 75) status = 'warning';
+
+        return {
+          id: metric.serverId,
+          name: metric.serverId, // DB에 기록된 실제 서버 ID 표출
+          ip: 'Agent Connected', // 향후 DB 스키마에 IP 컬럼 추가 시 실제 IP로 대체 가능
+          status,
+          cpu: Number(metric.cpu.toFixed(1)),
+          memory: Number(metric.memory.toFixed(1)),
+          memoryDetails: `Usage: ${Number(metric.memory.toFixed(1))}%`, 
+          disk: Number(metric.disk.toFixed(1)),
+          diskDetails: `Usage: ${Number(metric.disk.toFixed(1))}%`,
+        };
+      });
+    } catch (error: any) {
+      this.logger.error(`[Real Data Mode] Failed to fetch latest metrics: ${error.message}`);
+      return []; // 에러 시 빈 배열 반환 (화면 뻗음 방지)
+    }
+  }
+
+  async getServerTrend(serverId: string, days: number = 30) {
+    const targetDate = new Date();
+    targetDate.setDate(targetDate.getDate() - days);
+
+    const dates: string[] = [];
+    const cpu: number[] = [];
+    const memory: number[] = [];
+    const disk: number[] = [];
+
+    try {
+      // DB에서 100% 실제 데이터만 가져오기
+      const rawData = await (this.prisma as any).serverMetric.findMany({
+        where: {
+          serverId,
+          createdAt: { gte: targetDate },
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      // 데이터가 없으면 가짜 데이터 생성 없이 깔끔하게 빈 배열 반환
+      if (!rawData || rawData.length === 0) {
+        return { dates, cpu, memory, disk };
+      }
+
+      // 날짜별 평균치(Mean) 계산 그룹핑 로직
+      const grouped = rawData.reduce((acc: any, curr: any) => {
+        const dateKey = `${curr.createdAt.getMonth() + 1}/${curr.createdAt.getDate()}`;
+        if (!acc[dateKey]) {
+          acc[dateKey] = { cpuSum: 0, memSum: 0, diskSum: 0, count: 0 };
+        }
+        acc[dateKey].cpuSum += curr.cpu;
+        acc[dateKey].memSum += curr.memory;
+        acc[dateKey].diskSum += curr.disk;
+        acc[dateKey].count += 1;
+        return acc;
+      }, {});
+
+      for (const [date, values] of Object.entries(grouped)) {
+        dates.push(date);
+        cpu.push(Number(((values as any).cpuSum / (values as any).count).toFixed(1)));
+        memory.push(Number(((values as any).memSum / (values as any).count).toFixed(1)));
+        disk.push(Number(((values as any).diskSum / (values as any).count).toFixed(1)));
+      }
+      
+      return { dates, cpu, memory, disk };
+
+    } catch (error: any) {
+      this.logger.error(`[Real Data Mode] Failed to fetch trend for ${serverId}: ${error.message}`);
+      return { dates: [], cpu: [], memory: [], disk: [] };
+    }
+  }
+
+  // ==========================================
+  
   async getExceptionUsers() { return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } }); }
   async addExceptionUser(data: { loginId: string; deptCode?: string; deptName?: string; registeredBy: string }) { return this.prisma.cfgUserException.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, isActive: 'Y', registeredBy: data.registeredBy, createdAt: this.getKstDate() } }); }
   async updateExceptionUserStatus(loginId: string, isActive: string) { return this.prisma.cfgUserException.update({ where: { loginId }, data: { isActive } }); }
