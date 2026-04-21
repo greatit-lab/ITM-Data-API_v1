@@ -68,4 +68,29 @@ export class AdminController {
   async syncStorageNow() {
     return this.adminService.syncStorageNow();
   }
+
+  // ==========================================
+  // [신규 추가] 서버 모니터링 API 3종 세트
+  // ==========================================
+
+  // 1. 에이전트(리눅스 서버)가 데이터를 쏠 때 받는 곳 (POST)
+  @Post('server-metrics')
+  async recordMetric(@Body() body: { serverId: string; cpu: number; memory: number; disk: number }) {
+    return this.adminService.recordServerMetric(body);
+  }
+
+  // 2. 프론트엔드 상단 실시간 카드에 데이터를 주는 곳 (GET)
+  @Get('server-metrics')
+  async getLatestMetrics() {
+    return this.adminService.getLatestServerMetrics();
+  }
+
+  // 3. 프론트엔드 하단 30일 차트에 트렌드 데이터를 주는 곳 (GET)
+  @Get('server-trend/:serverId')
+  async getServerTrend(
+    @Param('serverId') serverId: string,
+    @Query('days') days?: number,
+  ) {
+    return this.adminService.getServerTrend(serverId, days ? Number(days) : 30);
+  }
 }
