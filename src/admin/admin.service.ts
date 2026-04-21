@@ -339,7 +339,7 @@ export class AdminService {
 
     return { summary: { totalDbUsageMB, totalObjectStorageMB, serverCapacityMB }, tableDetails, dailyTrends, monthlyTrends };
   }
-  
+
   // ==========================================
   // 서버 모니터링 (실시간 + 트렌드) 로직 - 100% 실제 데이터 기반
   // ==========================================
@@ -447,7 +447,7 @@ export class AdminService {
   }
 
   // ==========================================
-  
+
   async getExceptionUsers() { return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } }); }
   async addExceptionUser(data: { loginId: string; deptCode?: string; deptName?: string; registeredBy: string }) { return this.prisma.cfgUserException.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, isActive: 'Y', registeredBy: data.registeredBy, createdAt: this.getKstDate() } }); }
   async updateExceptionUserStatus(loginId: string, isActive: string) { return this.prisma.cfgUserException.update({ where: { loginId }, data: { isActive } }); }
