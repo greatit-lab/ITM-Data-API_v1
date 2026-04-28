@@ -1,4 +1,4 @@
-// ITM-Data-API/src/error/error.service.ts
+// ITM-Data-API_v1/src/error/error.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma.service';
 import { Prisma } from '@prisma/client';
@@ -9,6 +9,8 @@ export class ErrorQueryParams {
   eqpId?: string;
   start?: string | Date;
   end?: string | Date;
+  page?: number;
+  pageSize?: number;
 }
 
 @Injectable()
@@ -17,51 +19,42 @@ export class ErrorService {
 
   constructor(private prisma: PrismaService) {}
 
-  // [핵심 수정 1] Prisma 타임존 오지랖 방지: 순수 문자열 추출 후 UTC(Z)로 강제 래핑
-  private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
-    const extractDateStr = (d?: string | Date, isStart: boolean = false): string => {
-      if (!d) {
-        // 기본값: 서버의 KST 시간 기준 오늘/7일전
-        const temp = new Date();
-        const kstTime = new Date(temp.getTime() + 9 * 60 * 60 * 1000);
-        if (isStart) kstTime.setDate(kstTime.getDate() - 7);
-        return kstTime.toISOString().split('T')[0];
-      }
-      
-      const dStr = typeof d === 'string' ? d : d.toISOString();
-      
-      // '2026-04-02' 형태면 그대로 반환
-      if (dStr.length === 10) return dStr;
-      
-      // '2026-04-01T15:00:00.000Z' 형태면, KST로 변환해 사용자가 실제 의도한 날짜 문자열 도출
-      if (dStr.includes('T')) {
-        const parsed = new Date(dStr);
-        if(!isNaN(parsed.getTime())) {
-            const kstDate = new Date(parsed.getTime() + 9 * 60 * 60 * 1000);
-            return kstDate.toISOString().split('T')[0];
-        }
-      }
-      
-      return dStr.substring(0, 10);
-    };
+  // [해결 핵심] Prisma ORM과 QueryRaw의 타임존 불일치 버그를 해결하는 날짜 파서
+  private getSafeDates(start?: string | Date, end?: string | Date) {
+    let startStr = '';
+    let endStr = '';
 
-    const startStr = extractDateStr(start, true);
-    const endStr = extractDateStr(end, false);
+    if (start && end) {
+      // 프론트엔드가 전송한 URL 문자열 복원 (+, T 기호를 모두 공백으로 통일)
+      startStr = decodeURIComponent(String(start)).replace(/\+/g, ' ').replace('T', ' ');
+      endStr = decodeURIComponent(String(end)).replace(/\+/g, ' ').replace('T', ' ');
+    } else {
+      // 파라미터가 없으면 기본 최근 7일
+      const e = new Date();
+      const s = new Date();
+      s.setDate(s.getDate() - 7);
+      const pad = (n: number) => String(n).padStart(2, '0');
+      startStr = `${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())} 00:00:00`;
+      endStr = `${e.getFullYear()}-${pad(e.getMonth() + 1)}-${pad(e.getDate())} 23:59:59`;
+    }
 
-    // Prisma가 2026-04-02 00:00:00 문자열을 DB에 '그대로' 던지도록 유도
-    const startDate = new Date(`${startStr}T00:00:00.000Z`);
-    const endDate = new Date(`${endStr}T23:59:59.999Z`);
+    // 1. Prisma ORM 조회용 (Summary, List)
+    // Prisma는 DB 컬럼 특성에 따라 Z를 붙여야 원형 그대로 쿼리됩니다.
+    const ormStartDate = new Date(`${startStr.replace(' ', 'T')}.000Z`);
+    const ormEndDate = new Date(`${endStr.replace(' ', 'T')}.999Z`);
 
-    return { startDate, endDate };
+    // 2. QueryRaw 조회용 (Trend)
+    // QueryRaw에 Date 객체를 던지면 Node.js(pg)가 로컬 KST 타임존으로 +9시간 시프트를 해버립니다!
+    // 이를 막기 위해 순수 문자열(String)을 반환하여 직접 바인딩합니다.
+    return { ormStartDate, ormEndDate, rawStartStr: startStr, rawEndStr: endStr };
   }
 
-  // 1. 에러 요약 정보
   async getErrorSummary(params: ErrorQueryParams) {
     const { site, sdwt, eqpId, start, end } = params;
-    const { startDate, endDate } = this.getSafeDates(start, end);
+    const { ormStartDate, ormEndDate } = this.getSafeDates(start, end);
 
     const whereCondition: Prisma.PlgErrorWhereInput = {
-      timeStamp: { gte: startDate, lte: endDate },
+      timeStamp: { gte: ormStartDate, lte: ormEndDate },
     };
 
     if (eqpId) {
@@ -71,13 +64,13 @@ export class ErrorService {
       if (eqpList.length > 0) {
         whereCondition.eqpid = { in: eqpList };
       } else {
-        return { 
-          totalErrorCount: 0, 
+        return {
+          totalErrorCount: 0,
           errorEqpCount: 0,
           topErrorId: '-',
           topErrorCount: 0,
           topErrorLabel: '-',
-          errorCountByEqp: [] 
+          errorCountByEqp: []
         };
       }
     }
@@ -107,7 +100,7 @@ export class ErrorService {
       if (byErrorId.length > 0) {
         topErrorId = String(byErrorId[0].errorId);
         topErrorCount = byErrorId[0]._count._all;
-        
+
         const errorInfo = await this.prisma.plgError.findFirst({
           where: { errorId: topErrorId },
           select: { errorLabel: true, errorDesc: true },
@@ -137,13 +130,14 @@ export class ErrorService {
     }
   }
 
-  // 2. 에러 트렌드
   async getErrorTrend(params: ErrorQueryParams) {
     const { site, sdwt, eqpId, start, end } = params;
-    const { startDate, endDate } = this.getSafeDates(start, end);
+    // QueryRaw용 순수 문자열(String) 날짜 추출
+    const { rawStartStr, rawEndStr } = this.getSafeDates(start, end);
 
     let eqpFilter = '';
-    const queryParams: any[] = [startDate, endDate];
+    // Date 객체 대신 문자열 매개변수를 던져서 Postgres가 KST 변환 없이 정직하게 파싱하게 만듦!
+    const queryParams: any[] = [rawStartStr, rawEndStr];
 
     if (eqpId) {
       eqpFilter = `AND e.eqpid = $${queryParams.length + 1}`;
@@ -154,16 +148,16 @@ export class ErrorService {
           const eqpStr = eqpList.map(id => `'${id}'`).join(',');
           eqpFilter = `AND e.eqpid IN (${eqpStr})`;
       } else {
-          return []; 
-      }
+          return [];
+        }
     }
 
-    // [핵심 수정 2] DB 데이터가 이미 로컬 시간 기준이므로 INTERVAL 보정을 제거
+    // 문자열에 ::timestamp 캐스팅을 걸어 확실하게 타임존 개입 방어
     const sql = `
       SELECT DATE(e.time_stamp) as date, COUNT(*)::int as count
       FROM public.plg_error e
-      WHERE e.time_stamp >= $1 
-        AND e.time_stamp <= $2
+      WHERE e.time_stamp >= $1::timestamp
+        AND e.time_stamp <= $2::timestamp
         ${eqpFilter}
       GROUP BY DATE(e.time_stamp)
       ORDER BY date ASC
@@ -171,23 +165,29 @@ export class ErrorService {
 
     try {
       const result = await this.prisma.$queryRawUnsafe<any[]>(sql, ...queryParams);
-      return result.map(r => ({
-        date: typeof r.date === 'string' ? r.date : new Date(r.date).toISOString().split('T')[0],
-        count: r.count
-      }));
+      return result.map(r => {
+        // Postgres에서 넘어온 date 객체를 로컬 날짜 문자열로 안전하게 변환
+        const dStr = typeof r.date === 'string' 
+          ? r.date 
+          : new Date(r.date.getTime() - (r.date.getTimezoneOffset() * 60000)).toISOString();
+          
+        return {
+          date: dStr.substring(0, 10),
+          count: r.count
+        };
+      });
     } catch (e) {
       this.logger.error('Error fetching error trend:', e);
       return [];
     }
   }
 
-  // 3. 에러 목록 조회
-  async getErrorList(params: ErrorQueryParams & { page?: number, pageSize?: number }) {
+  async getErrorList(params: ErrorQueryParams) {
     const { site, sdwt, eqpId, start, end, page = 0, pageSize = 50 } = params;
-    const { startDate, endDate } = this.getSafeDates(start, end);
+    const { ormStartDate, ormEndDate } = this.getSafeDates(start, end);
 
     const whereCondition: Prisma.PlgErrorWhereInput = {
-      timeStamp: { gte: startDate, lte: endDate },
+      timeStamp: { gte: ormStartDate, lte: ormEndDate },
     };
 
     if (eqpId) {
@@ -215,10 +215,8 @@ export class ErrorService {
         }),
       ]);
 
-      // [핵심 수정 3] 프론트엔드가 날짜를 잘못 변환하지 못하도록, 백엔드에서 명시적 String 처리
       const mappedItems = items.map((item: any) => {
-        // item.timeStamp 객체를 YYYY-MM-DD HH:mm:ss 문자열로 하드코딩 변환
-        const formattedDate = item.timeStamp 
+        const formattedDate = item.timeStamp
           ? new Date(item.timeStamp).toISOString().replace('T', ' ').substring(0, 19)
           : null;
 
@@ -227,7 +225,7 @@ export class ErrorService {
           errorId: item.errorId,
           errorLabel: item.errorLabel,
           errorDesc: item.errorDesc,
-          timeStamp: formattedDate, // Date 객체 대신 문자열 전달
+          timeStamp: formattedDate,
           extraMessage1: item.extraMessage1,
           extraMessage2: item.extraMessage2,
         };
@@ -244,7 +242,7 @@ export class ErrorService {
     if (!site && !sdwt) return [];
 
     let sql = `
-      SELECT t1.eqpid 
+      SELECT t1.eqpid
       FROM public.ref_equipment t1
       JOIN public.ref_sdwt t2 ON t1.sdwt = t2.sdwt
       WHERE 1=1
