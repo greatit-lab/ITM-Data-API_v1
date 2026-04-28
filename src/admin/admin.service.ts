@@ -39,9 +39,10 @@ export class AdminService {
       });
       req.on('error', reject);
       
-      req.setTimeout(180000, () => {
+      // [수정됨] 무한 대기 방지를 위해 타임아웃을 15초로 단축
+      req.setTimeout(15000, () => {
         req.destroy();
-        reject(new Error('Request timeout (180s)'));
+        reject(new Error('Request timeout (15s)'));
       });
     });
   }
@@ -62,50 +63,107 @@ export class AdminService {
       'sys_user': 'created_at',
       'sys_user_context': 'updated_at',
     };
+
     if (columnMap[tableName]) return columnMap[tableName];
+    if (tableName.startsWith('plg_onto_spectrum_y')) return 'serv_ts';
+
     return null; 
   }
 
   @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
+    
     const now = new Date();
     const kstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
     const kstYesterday = new Date(kstTime.getTime() - 24 * 60 * 60 * 1000);
-    const checkDate = new Date(Date.UTC(kstYesterday.getUTCFullYear(), kstYesterday.getUTCMonth(), kstYesterday.getUTCDate()));
+
+    const yYear = kstYesterday.getUTCFullYear();
+    const yMonth = kstYesterday.getUTCMonth(); 
+    const yDate = kstYesterday.getUTCDate();
+
+    const tYear = kstTime.getUTCFullYear();
+    const tMonth = kstTime.getUTCMonth();
+    const tDate = kstTime.getUTCDate();
+
+    const checkDate = new Date(Date.UTC(yYear, yMonth, yDate));
+    const pad = (n: number) => String(n).padStart(2, '0');
+    
+    const startDateStr = `${yYear}-${pad(yMonth + 1)}-${pad(yDate)} 00:00:00`;
+    const endDateStr = `${tYear}-${pad(tMonth + 1)}-${pad(tDate)} 00:00:00`;
+    const dateStr = `${yYear}${pad(yMonth + 1)}${pad(yDate)}`; 
+
     const kstNow = this.getKstDate();
 
+    // 1. 오브젝트 스토리지 (파일)
     try {
       const uploadApiUrl = process.env.UPLOAD_API_URL || 'http://127.0.0.1:8082';
-      const dateStr = `${kstYesterday.getUTCFullYear()}${String(kstYesterday.getUTCMonth() + 1).padStart(2, '0')}${String(kstYesterday.getUTCDate()).padStart(2, '0')}`;
-      const data = await this.fetchUploadApiSize(`${uploadApiUrl}/api/FileUpload/daily-size?date=${dateStr}`);
-      if (data?.success && Number(data.sizeBytes) > 0) {
-        await this.prisma.sysStorageHistory.upsert({
-          where: { checkDate_tableName: { checkDate, tableName: 'OBJECT_STORE_TOTAL' } },
-          update: { sizeBytes: Number(data.sizeBytes), rowCount: 0 },
-          create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: Number(data.sizeBytes), rowCount: 0, storageType: 'FILE', createdAt: kstNow },
-        });
-      }
-    } catch (e) { this.logger.error(`[Upload API Error] ${e.message}`); }
+      const targetUrl = `${uploadApiUrl}/api/FileUpload/daily-size?date=${dateStr}`;
+      
+      const data = await this.fetchUploadApiSize(targetUrl);
 
+      if (data && data.success) {
+        const dailyIncrementBytes = Number(data.sizeBytes); 
+
+        if (dailyIncrementBytes > 0) {
+          await this.prisma.sysStorageHistory.upsert({
+            where: { checkDate_tableName: { checkDate: checkDate, tableName: 'OBJECT_STORE_TOTAL' } },
+            update: { sizeBytes: dailyIncrementBytes, rowCount: 0 },
+            create: { checkDate, tableName: 'OBJECT_STORE_TOTAL', sizeBytes: dailyIncrementBytes, rowCount: 0, storageType: 'FILE', createdAt: kstNow },
+          });
+        }
+      }
+    } catch (error: any) {
+      this.logger.error(`[Upload API Error] Failed to connect: ${error.message}`);
+    }
+
+    // 2. DB 용량 기록
     try {
-      const dbTables: any[] = await this.prisma.$queryRaw`SELECT c.relname AS "tableName" FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')`;
+      const dbTables: any[] = await this.prisma.$queryRaw`
+        SELECT c.relname AS "tableName"
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')
+      `;
+
       for (const t of dbTables) {
         const tableName = String(t.tableName);
         const tsColumn = this.getTargetTimeColumn(tableName);
+
         if (!tsColumn) continue;
-        const countStats: any[] = await this.prisma.$queryRawUnsafe(`SELECT COUNT(*)::bigint AS "dailyRowCount" FROM "${tableName}" WHERE "${tsColumn}" >= $1::timestamp AND "${tsColumn}" < $2::timestamp`, 
-          `${kstYesterday.getUTCFullYear()}-${kstYesterday.getUTCMonth()+1}-${kstYesterday.getUTCDate()} 00:00:00`,
-          `${kstTime.getUTCFullYear()}-${kstTime.getUTCMonth()+1}-${kstTime.getUTCDate()} 00:00:00`);
+
+        const countStats: any[] = await this.prisma.$queryRawUnsafe(`
+          SELECT COUNT(*)::bigint AS "dailyRowCount"
+          FROM "${tableName}"
+          WHERE "${tsColumn}" >= $1::timestamp AND "${tsColumn}" < $2::timestamp
+        `, startDateStr, endDateStr);
+
         const dailyRowCount = Number(countStats[0]?.dailyRowCount || 0);
+
         if (dailyRowCount === 0) continue;
+
+        // [복구됨] 누락되었던 pg_column_size 기반의 실제 Byte 용량 계산 로직 복원
+        const sampleStats: any[] = await this.prisma.$queryRawUnsafe(`
+          SELECT COALESCE(AVG(pg_column_size(t.*)), 0) + 24 AS "avgRowSize"
+          FROM (
+            SELECT * FROM "${tableName}" 
+            WHERE "${tsColumn}" >= $1::timestamp AND "${tsColumn}" < $2::timestamp 
+            LIMIT 1000
+          ) t
+        `, startDateStr, endDateStr);
+
+        const avgRowSize = Number(sampleStats[0]?.avgRowSize || 24);
+        const dailySizeBytes = Math.round(dailyRowCount * avgRowSize);
+
         await this.prisma.sysStorageHistory.upsert({
-          where: { checkDate_tableName: { checkDate, tableName } },
-          update: { rowCount: dailyRowCount },
-          create: { checkDate, tableName, sizeBytes: 0, rowCount: dailyRowCount, storageType: 'DB', createdAt: kstNow },
+          where: { checkDate_tableName: { checkDate: checkDate, tableName: tableName } },
+          update: { sizeBytes: dailySizeBytes, rowCount: dailyRowCount },
+          create: { checkDate, tableName: tableName, sizeBytes: dailySizeBytes, rowCount: dailyRowCount, storageType: 'DB', createdAt: kstNow },
         });
       }
-    } catch (e) { this.logger.error(`[DB Size Error] ${e.message}`); }
+    } catch (error: any) {
+      this.logger.error(`[DB Query Error] ${error.message}`);
+    }
   }
 
   @Cron('0 5 0 * * *', { timeZone: 'Asia/Seoul' })
@@ -114,36 +172,58 @@ export class AdminService {
     try {
       const thirtyDaysAgo = this.getKstDate();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-      const result = await (this.prisma as any).serverMetric.deleteMany({ where: { createdAt: { lt: thirtyDaysAgo } } });
-      this.logger.log(`Deleted ${result.count} old records.`);
-    } catch (e) { this.logger.error(`[Cleanup Error] ${e.message}`); }
+      
+      const result = await (this.prisma as any).serverMetric.deleteMany({
+        where: {
+          createdAt: { lt: thirtyDaysAgo }
+        }
+      });
+      this.logger.log(`Deleted ${result.count} old server metrics.`);
+    } catch (error: any) {
+      this.logger.error(`Failed to clean up old server metrics: ${error.message}`);
+    }
   }
 
   async recordServerMetric(data: { serverId: string; cpu: number; memory: number; disk: number }) {
     try {
       return await (this.prisma as any).serverMetric.create({
-        data: { serverId: data.serverId, cpu: data.cpu, memory: data.memory, disk: data.disk, createdAt: this.getKstDate() },
+        data: {
+          serverId: data.serverId,
+          cpu: data.cpu,
+          memory: data.memory,
+          disk: data.disk,
+          createdAt: this.getKstDate(),
+        },
       });
-    } catch (e) { this.logger.error(`[Record Metric Error] ${e.message}`); return { success: false }; }
+    } catch (error: any) {
+      this.logger.error(`Failed to record server metric: ${error.message}`);
+      return { success: false };
+    }
   }
 
   async getLatestServerMetrics() {
     try {
-      const latestMetrics: any[] = await this.prisma.$queryRaw`SELECT DISTINCT ON ("serverId") "serverId", "cpu", "memory", "disk", "createdAt" FROM "ServerMetric" ORDER BY "serverId", "createdAt" DESC`;
+      const latestMetrics: any[] = await this.prisma.$queryRaw`
+        SELECT DISTINCT ON ("serverId")
+          "serverId", "cpu", "memory", "disk", "createdAt"
+        FROM "ServerMetric"
+        ORDER BY "serverId", "createdAt" DESC
+      `;
 
-      const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number }> = {
-        'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 200 }, 
-        'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 200 },
-        'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000 }, 
-        'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200 }
+      const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
+        'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
+        'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
+        'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
+        'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
 
-      return latestMetrics.map(metric => {
+      const result = latestMetrics.map(metric => {
         let status = 'healthy';
         if (metric.cpu >= 90 || metric.memory >= 90) status = 'critical';
         else if (metric.cpu >= 75 || metric.memory >= 75) status = 'warning';
 
         const spec = SERVER_SPECS[metric.serverId] || SERVER_SPECS['default'];
+
         const usedCpu = (spec.cpu * (metric.cpu / 100)).toFixed(1);
         const usedMem = (spec.memory * (metric.memory / 100)).toFixed(1);
         const usedDisk = (spec.disk * (metric.disk / 100)).toFixed(1);
@@ -153,6 +233,7 @@ export class AdminService {
           name: spec.name,
           ip: 'Connected',
           status,
+          order: spec.order,
           cpu: Number(metric.cpu.toFixed(1)),
           cpuDetails: `${usedCpu} vCPU / ${spec.cpu} vCPU`, 
           memory: Number(metric.memory.toFixed(1)),
@@ -161,69 +242,119 @@ export class AdminService {
           diskDetails: `${usedDisk} GB / ${spec.disk} GB`, 
         };
       });
-    } catch (e) { this.logger.error(`[Fetch Metrics Error] ${e.message}`); return []; }
+
+      return result.sort((a, b) => a.order - b.order);
+
+    } catch (error: any) {
+      this.logger.error(`[Real Data Mode] Failed to fetch latest metrics: ${error.message}`);
+      return []; 
+    }
   }
 
   async getServerTrend(serverId: string, days: number = 30) {
     const targetDate = this.getKstDate();
     targetDate.setDate(targetDate.getDate() - days);
-    
-    try {
-      const rawData = await (this.prisma as any).serverMetric.findMany({ 
-        where: { serverId, createdAt: { gte: targetDate } }, 
-        orderBy: { createdAt: 'asc' } 
-      });
-      
-      if (!rawData.length) return { dates: [], cpu: [], memory: [], disk: [] };
 
+    try {
+      const rawData = await (this.prisma as any).serverMetric.findMany({
+        where: {
+          serverId,
+          createdAt: { gte: targetDate },
+        },
+        orderBy: { createdAt: 'asc' },
+      });
+
+      if (!rawData || rawData.length === 0) {
+        return { dates: [], cpu: [], memory: [], disk: [] };
+      }
+      
       const dates = rawData.map(d => d.createdAt.toISOString());
       const cpu = rawData.map(d => Number(d.cpu.toFixed(1)));
       const memory = rawData.map(d => Number(d.memory.toFixed(1)));
       const disk = rawData.map(d => Number(d.disk.toFixed(1)));
 
       return { dates, cpu, memory, disk };
-      
-    } catch (e) { 
-      return { dates: [], cpu: [], memory: [], disk: [] }; 
+
+    } catch (error: any) {
+      this.logger.error(`[Real Data Mode] Failed to fetch trend for ${serverId}: ${error.message}`);
+      return { dates: [], cpu: [], memory: [], disk: [] };
     }
   }
 
+  // ==========================================
+  // 기존 관리자 데이터 조회/수정 메서드들 (유지)
+  // ==========================================
   async getExceptionUsers() { return this.prisma.cfgUserException.findMany({ orderBy: { createdAt: 'desc' } }); }
-  async addExceptionUser(data: any) { return this.prisma.cfgUserException.create({ data: { ...data, isActive: 'Y', createdAt: this.getKstDate() } }); }
+  async addExceptionUser(data: { loginId: string; deptCode?: string; deptName?: string; registeredBy: string }) { return this.prisma.cfgUserException.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, isActive: 'Y', registeredBy: data.registeredBy, createdAt: this.getKstDate() } }); }
   async updateExceptionUserStatus(loginId: string, isActive: string) { return this.prisma.cfgUserException.update({ where: { loginId }, data: { isActive } }); }
   async deleteExceptionUser(loginId: string) { return this.prisma.cfgUserException.delete({ where: { loginId } }); }
-  async getAllUsers() { return this.prisma.sysUser.findMany({ include: { context: { include: { sdwtInfo: true } } }, orderBy: { lastLoginAt: 'desc' } }); }
+  async getAllUsers() { const users = await this.prisma.sysUser.findMany({ include: { context: { include: { sdwtInfo: true } } }, orderBy: { lastLoginAt: 'desc' } }); const admins = await this.prisma.cfgAdminUser.findMany(); const guests = await this.prisma.cfgGuestAccess.findMany(); const adminMap = new Map(admins.map(a => [a.loginId, a.role])); const guestMap = new Map(guests.map(g => [g.loginId, g.grantedRole])); return users.map(u => { let role = 'USER'; if (adminMap.has(u.loginId)) { role = adminMap.get(u.loginId) || 'ADMIN'; } else if (guestMap.has(u.loginId)) { role = guestMap.get(u.loginId) || 'GUEST'; } return { ...u, role }; }); }
   async getAllAdmins() { return this.prisma.cfgAdminUser.findMany({ orderBy: { assignedAt: 'desc' } }); }
-  async addAdmin(data: any) { return this.prisma.cfgAdminUser.create({ data: { ...data, assignedAt: this.getKstDate() } }); }
+  async addAdmin(data: any) { return this.prisma.cfgAdminUser.create({ data: { loginId: data.loginId, role: data.role || 'MANAGER', assignedBy: data.assignedBy, assignedAt: this.getKstDate() } }); }
   async deleteAdmin(loginId: string) { return this.prisma.cfgAdminUser.delete({ where: { loginId } }); }
-  async getAllAccessCodes() { return this.prisma.refAccessCode.findMany({ orderBy: { updatedAt: 'desc' } }); }
-  async createAccessCode(data: any) { return this.prisma.refAccessCode.create({ data: { ...data, isActive: 'Y', updatedAt: this.getKstDate() } }); }
-  async updateAccessCode(deptid: string, data: any) { return this.prisma.refAccessCode.update({ where: { deptid }, data: { ...data, updatedAt: this.getKstDate() } }); }
+  async getAllAccessCodes() { return this.prisma.refAccessCode.findMany({ orderBy: { updatedAt: 'desc' }, select: { compid: true, compName: true, deptid: true, deptName: true, description: true, isActive: true, updatedAt: true }, }); }
+  async createAccessCode(data: any) { return this.prisma.refAccessCode.create({ data: { compid: data.compid, compName: data.compName, deptid: data.deptid, deptName: data.deptName, description: data.description, isActive: 'Y', updatedAt: this.getKstDate() } }); }
+  async updateAccessCode(deptid: string, data: any) { return this.prisma.refAccessCode.update({ where: { deptid }, data: { compid: data.compid, compName: data.compName, deptName: data.deptName, description: data.description, isActive: data.isActive, updatedAt: this.getKstDate() } }); }
   async deleteAccessCode(deptid: string) { return this.prisma.refAccessCode.delete({ where: { deptid } }); }
   async getAllGuests() { return this.prisma.cfgGuestAccess.findMany({ orderBy: { createdAt: 'desc' } }); }
-  async addGuest(data: any) { return this.prisma.cfgGuestAccess.create({ data: { ...data, grantedRole: 'GUEST', createdAt: this.getKstDate() } }); }
+  async addGuest(data: any) { return this.prisma.cfgGuestAccess.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, reason: data.reason, validUntil: new Date(data.validUntil), grantedRole: 'GUEST', createdAt: this.getKstDate() } }); }
   async deleteGuest(loginId: string) { return this.prisma.cfgGuestAccess.delete({ where: { loginId } }); }
   async getGuestRequests() { return this.prisma.cfgGuestRequest.findMany({ orderBy: { createdAt: 'desc' } }); }
-  async approveGuestRequest(reqId: number, approverId: string) { return { success: true }; }
+  async approveGuestRequest(reqId: number, approverId: string) { const request = await this.prisma.cfgGuestRequest.findUnique({ where: { reqId } }); if (!request) throw new NotFoundException('Request not found'); const kstNow = this.getKstDate(); const validUntil = new Date(kstNow.getTime()); validUntil.setDate(validUntil.getDate() + 30); return this.prisma.$transaction(async (tx) => { await tx.cfgGuestRequest.update({ where: { reqId }, data: { status: 'APPROVED', processedBy: approverId, processedAt: kstNow } }); return tx.cfgGuestAccess.upsert({ where: { loginId: request.loginId }, update: { validUntil: validUntil, reason: request.reason, grantedRole: 'GUEST' }, create: { loginId: request.loginId, deptCode: request.deptCode, deptName: request.deptName, reason: request.reason, grantedRole: 'GUEST', validUntil: validUntil, createdAt: kstNow }, }); }); }
   async rejectGuestRequest(reqId: number, rejectorId: string) { return this.prisma.cfgGuestRequest.update({ where: { reqId }, data: { status: 'REJECTED', processedBy: rejectorId, processedAt: this.getKstDate() } }); }
   async getSeverities() { return this.prisma.errSeverityMap.findMany(); }
-  async addSeverity(data: any) { return this.prisma.errSeverityMap.create({ data }); }
-  async updateSeverity(errorId: string, data: any) { return this.prisma.errSeverityMap.update({ where: { errorId }, data }); }
+  async addSeverity(data: any) { return this.prisma.errSeverityMap.create({ data: { errorId: data.errorId, severity: data.severity } }); }
+  async updateSeverity(errorId: string, data: any) { return this.prisma.errSeverityMap.update({ where: { errorId }, data: { severity: data.severity } }); }
   async deleteSeverity(errorId: string) { return this.prisma.errSeverityMap.delete({ where: { errorId } }); }
   async getMetrics() { return this.prisma.cfgLotUniformityMetrics.findMany(); }
-  async addMetric(data: any) { return this.prisma.cfgLotUniformityMetrics.create({ data }); }
-  async updateMetric(metricName: string, data: any) { return this.prisma.cfgLotUniformityMetrics.update({ where: { metricName }, data }); }
+  async addMetric(data: any) { return this.prisma.cfgLotUniformityMetrics.create({ data: { metricName: data.metricName, isExcluded: data.isExcluded ? 'Y' : 'N' } }); }
+  async updateMetric(metricName: string, data: any) { return this.prisma.cfgLotUniformityMetrics.update({ where: { metricName }, data: { isExcluded: data.isExcluded ? 'Y' : 'N' } }); }
   async deleteMetric(metricName: string) { return this.prisma.cfgLotUniformityMetrics.delete({ where: { metricName } }); }
   async getNewServerConfig() { return this.prisma.cfgNewServer.findUnique({ where: { id: 1 } }); }
-  async updateNewServerConfig(data: any) { return this.prisma.cfgNewServer.upsert({ where: { id: 1 }, update: data, create: { id: 1, ...data } }); }
-  async getCfgServers() { return this.prisma.cfgServer.findMany(); }
-  async updateCfgServer(eqpid: string, data: any) { return this.prisma.cfgServer.update({ where: { eqpid }, data }); }
-  async logAccess(data: any) { return this.prisma.sysAccessLog.create({ data: { ...data, accessTs: this.getKstDate() } }); }
-  async syncStorageNow() { await this.recordDailyStorageSize(); return { success: true }; }
+  async updateNewServerConfig(data: any) { return this.prisma.cfgNewServer.upsert({ where: { id: 1 }, update: { newDbHost: data.newDbHost, newDbUser: data.newDbUser, newDbPw: data.newDbPw, newDbPort: data.newDbPort ? parseInt(data.newDbPort) : 5432, newFtpHost: data.newFtpHost, newFtpUser: data.newFtpUser, newFtpPw: data.newFtpPw, newFtpPort: data.newFtpPort ? parseInt(data.newFtpPort) : 21, description: data.description }, create: { id: 1, newDbHost: data.newDbHost || '', newDbUser: data.newDbUser, newDbPw: data.newDbPw, newDbPort: data.newDbPort ? parseInt(data.newDbPort) : 5432, newFtpHost: data.newFtpHost || '', newFtpUser: data.newFtpUser, newFtpPw: data.newFtpPw, newFtpPort: data.newFtpPort ? parseInt(data.newFtpPort) : 21, description: data.description }, }); }
+  async getCfgServers() { const servers = await this.prisma.cfgServer.findMany({ orderBy: { eqpid: 'asc' } }); if (!servers.length) return []; const eqpIds = servers.map(s => s.eqpid); const equipments = await this.prisma.refEquipment.findMany({ where: { eqpid: { in: eqpIds } }, select: { eqpid: true, sdwt: true, sdwtRel: { select: { site: true } } } }); const eqpMap = new Map(equipments.map(e => [e.eqpid, e])); return servers.map(server => { const eqp = eqpMap.get(server.eqpid); return { ...server, sdwt: eqp?.sdwt || '-', site: eqp?.sdwtRel?.site || '-' }; }); }
+  async updateCfgServer(eqpid: string, data: any) { return this.prisma.cfgServer.update({ where: { eqpid }, data: { agentDbHost: data.agentDbHost, agentFtpHost: data.agentFtpHost, updateFlag: data.updateFlag } }); }
+  async logAccess(data: { loginId: string; menuName: string; accessUrl: string }) { return this.prisma.sysAccessLog.create({ data: { loginId: data.loginId, menuName: data.menuName, accessUrl: data.accessUrl, accessTs: this.getKstDate(), }, }); }
 
   // ==========================================
-  // [복구 완료] Usage Analytics 집계 로직
+  // [원복] 프론트엔드 스피너(동기화 중 표시) 유지를 위해 await 복원
   // ==========================================
+  async syncStorageNow() {
+    this.logger.log('Manual storage sync triggered by admin.');
+    try {
+      const now = new Date();
+      const kstTime = new Date(now.getTime() + 9 * 60 * 60 * 1000);
+      const kstYesterday = new Date(kstTime.getTime() - 24 * 60 * 60 * 1000);
+      
+      const yYear = kstYesterday.getUTCFullYear();
+      const yMonth = kstYesterday.getUTCMonth();
+      const yDate = kstYesterday.getUTCDate();
+      
+      const checkDate = new Date(Date.UTC(yYear, yMonth, yDate));
+      
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const formattedDate = `${yYear}-${pad(yMonth + 1)}-${pad(yDate)}`;
+
+      const existingCount = await this.prisma.sysStorageHistory.count({
+        where: { checkDate: checkDate }
+      });
+
+      if (existingCount > 0) {
+        this.logger.log(`[Manual Sync] Skipped. Data for ${formattedDate} already exists.`);
+        return { success: false, message: `이미 전일(${formattedDate}) 데이터가 존재합니다. 동기화를 중단합니다.` };
+      }
+
+      // [핵심 원복] 백그라운드 처리를 취소하고, 다시 작업 완료 시까지 대기(await)하도록 변경
+      // 이제 프론트엔드는 이 줄이 끝날 때까지 응답을 받지 못하므로 스피너가 계속 돕니다.
+      await this.recordDailyStorageSize();
+
+      return { success: true, message: `수동 스토리지 동기화가 완료되었습니다. (${formattedDate} 정상 적재)` };
+    } catch (error: any) {
+      this.logger.error(`[Manual Sync Error] ${error.message}`);
+      return { success: false, message: `수동 동기화 중 오류가 발생했습니다: ${error.message}` };
+    }
+  }
+
   async getUsageAnalytics(startDate: string, endDate: string) {
     const start = new Date(startDate.replace(' ', 'T') + '.000Z');
     const end = new Date(endDate.replace(' ', 'T') + '.999Z');
@@ -321,14 +452,10 @@ export class AdminService {
     };
   }
 
-  // ==========================================
-  // [복구 완료] Storage DB & Analytics 집계 로직
-  // ==========================================
   async getStorageUsage(startDate: string, endDate: string, interval: string) {
     const start = new Date(`${startDate}T00:00:00.000Z`);
     const end = new Date(`${endDate}T23:59:59.999Z`);
 
-    // [수정 반영] OS 디스크 크기 조회 대상을 '/' 에서 실제 데이터가 있는 '/appdata' 로 변경
     let serverCapacityMB = 4194304;
     try {
       const { stdout } = await execAsync("df -m /appdata | awk 'NR==2 {print $2}'");
