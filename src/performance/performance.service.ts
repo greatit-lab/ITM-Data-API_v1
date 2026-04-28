@@ -28,30 +28,90 @@ export class PerformanceService {
     eqpids?: string,
     intervalSec: number = 300, 
   ) {
+    const startDt = this.parseDate(startDate);
+    const endDt = this.parseDate(endDate);
     const safeInterval = (intervalSec && !isNaN(intervalSec) && intervalSec > 0) ? intervalSec : 300; 
 
-    const where: Prisma.EqpPerfWhereInput = {
-      servTs: {
-        gte: this.parseDate(startDate), 
-        lte: this.parseDate(endDate),   
-      },
+    const eqpIdList = eqpids ? eqpids.split(',') : [];
+    
+    // 당일과 전일 자정을 구함 (로컬 타임 기준)
+    // cutoffDate = 어제 00:00:00 (이 시간 이후는 eqp_perf, 이전은 월별 파티션 테이블 조회)
+    const cutoffDate = dayjs().startOf('day').subtract(1, 'day').toDate();
+
+    let queries: string[] = [];
+    let params: any[] = [];
+    let paramIndex = 1;
+
+    // 동적 쿼리 생성기 (UNION ALL을 위해 서브 쿼리 구조화)
+    const addQuery = (tableName: string, tStart: Date, tEnd: Date) => {
+      let q = `
+        SELECT 
+          eqpid, 
+          serv_ts as "servTs", 
+          cpu_usage as "cpuUsage", 
+          mem_usage as "memUsage", 
+          cpu_temp as "cpuTemp", 
+          gpu_temp as "gpuTemp", 
+          fan_speed as "fanSpeed" 
+        FROM ${tableName} 
+        WHERE serv_ts >= $${paramIndex++} AND serv_ts <= $${paramIndex++}
+      `;
+      params.push(tStart, tEnd);
+      
+      if (eqpIdList.length > 0) {
+         const placeholders = eqpIdList.map(() => `$${paramIndex++}`).join(', ');
+         q += ` AND eqpid IN (${placeholders})`;
+         params.push(...eqpIdList);
+      }
+      queries.push(q);
     };
 
-    if (eqpids) {
-      const eqpIdList = eqpids.split(',');
-      where.eqpid = { in: eqpIdList };
+    // 1. 과거 데이터 조회 (월별 파티션 테이블 탐색) -> serv_ts < cutoffDate
+    if (startDt < cutoffDate) {
+      let currentMonth = dayjs(startDt).startOf('month');
+      const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
+      
+      while (currentMonth.toDate() <= endPastDt) {
+        const yyyy = currentMonth.format('YYYY');
+        const mm = currentMonth.format('MM');
+        const tableName = `public.eqp_perf_y${yyyy}m${mm}`; // ex: eqp_perf_y2026m04
+        
+        // 각 월에 해당하는 날짜 경계값만 잘라내서 쿼리 생성
+        const mStart = currentMonth.toDate() < startDt ? startDt : currentMonth.toDate();
+        const mEnd = currentMonth.endOf('month').toDate() > endPastDt ? endPastDt : currentMonth.endOf('month').toDate();
+        
+        addQuery(tableName, mStart, mEnd);
+        
+        currentMonth = currentMonth.add(1, 'month');
+      }
     }
 
-    const results = await this.prisma.eqpPerf.findMany({
-      where,
-      orderBy: { servTs: 'asc' },
-    });
+    // 2. 최근 데이터 조회 (당일 및 전일 자정 이후 -> eqp_perf 단일 테이블)
+    if (endDt >= cutoffDate) {
+      const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
+      addQuery('public.eqp_perf', recentStartDt, endDt);
+    }
 
+    let results: any[] = [];
+    if (queries.length > 0) {
+      // 파티션 테이블들과 현재 테이블 쿼리를 UNION ALL로 결합하고 최종 정렬
+      const finalQuery = queries.join(' UNION ALL ') + ' ORDER BY "servTs" ASC';
+      try {
+        results = await this.prisma.$queryRawUnsafe<any[]>(finalQuery, ...params);
+      } catch (e) {
+        console.error('getPerformanceHistory partition query error:', e);
+        // 테이블이 아직 생성되지 않았거나 권한 에러 방어
+        return [];
+      }
+    }
+
+    // 기존 자바스크립트 기반의 interval(초 단위) 그룹핑 로직은 원형 그대로 유지하여 하위 호환성 보장
     if (safeInterval > 0 && results.length > 0) {
       const grouped = new Map<string, any>();
       
       for (const row of results) {
-        const timeMs = row.servTs.getTime();
+        // queryRaw로 가져온 servTs는 Date 객체임
+        const timeMs = new Date(row.servTs).getTime();
         const bucketTime = Math.floor(timeMs / (safeInterval * 1000)) * (safeInterval * 1000);
         const bucketKey = `${row.eqpid}_${bucketTime}`;
         
