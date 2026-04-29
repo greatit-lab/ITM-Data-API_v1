@@ -21,7 +21,8 @@ export class LampLifeService {
           l.lifespan_hour as "lifespanHour", 
           l.last_changed as "lastChanged", 
           l.serv_ts as "servTs",
-          e.prc_group as "prcGroup"  -- [수정 1] ref_equipment 테이블에서 prc_group 조회 추가
+          l.offset_hour as "offsetHour", -- [추가] 에이전트 보정값(오프셋) 조회
+          e.prc_group as "prcGroup"
         FROM public.eqp_lamp_life l
         JOIN public.ref_equipment e ON l.eqpid = e.eqpid
         LEFT JOIN public.ref_sdwt s ON e.sdwt = s.sdwt
@@ -38,8 +39,6 @@ export class LampLifeService {
         query = Prisma.sql`${query} AND l.eqpid = ${eqpId}`;
       }
 
-      // [수정] 정렬 조건 변경: EqpId 오름차순, LampNo 오름차순
-      // 기존: ORDER BY l.serv_ts DESC
       query = Prisma.sql`${query} ORDER BY l.eqpid ASC, l.lamp_no ASC`;
 
       const results = await this.prisma.$queryRaw<any[]>(query);
@@ -52,7 +51,7 @@ export class LampLifeService {
         lifespanHour: row.lifespanHour || row.lifespan_hour || 0,
         lastChanged: row.lastChanged || row.last_changed,
         servTs: row.servTs || row.serv_ts,
-        // [수정 2] 프론트엔드에서 사용할 수 있도록 매핑 (값이 없을 경우 예외처리 'UNKNOWN')
+        offsetHour: row.offsetHour || row.offset_hour || 0, // [추가] 오프셋 값 매핑 (없으면 0)
         prc_group: row.prcGroup || row.prc_group || 'UNKNOWN', 
       }));
 
