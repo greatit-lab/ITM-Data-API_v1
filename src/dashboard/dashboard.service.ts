@@ -324,25 +324,19 @@ export class DashboardService {
       });
       const errorMap = new Map(errorStats.map(e => [e.eqpid, e._count._all]));
 
+      // 🚀 핵심 성능 개선 구간: 루프를 제거하고 PostgreSQL DISTINCT ON을 활용한 단일 쿼리 일괄 조회
       const perfMap = new Map<string, any>();
-      const chunkSize = 20; 
-      for (let i = 0; i < eqpIds.length; i += chunkSize) {
-        const chunk = eqpIds.slice(i, i + chunkSize);
-        const promises = chunk.map(id => 
-          this.prisma.$queryRaw<any[]>`
-            SELECT cpu_usage, mem_usage, serv_ts, ts 
-            FROM public.eqp_perf 
-            WHERE eqpid = ${id} 
-            ORDER BY serv_ts DESC 
-            LIMIT 1
-          `
-        );
-        const results = await Promise.all(promises);
-        chunk.forEach((id, index) => {
-          if (results[index] && results[index].length > 0) {
-            perfMap.set(id, results[index][0]);
-          }
-        });
+      if (eqpIds.length > 0) {
+        const latestPerfRaw = await this.prisma.$queryRaw<any[]>`
+          SELECT DISTINCT ON (eqpid) eqpid, cpu_usage, mem_usage, serv_ts, ts 
+          FROM public.eqp_perf 
+          WHERE eqpid IN (${Prisma.join(eqpIds)}) 
+          ORDER BY eqpid, serv_ts DESC
+        `;
+        
+        for (const perf of latestPerfRaw) {
+          perfMap.set(perf.eqpid, perf);
+        }
       }
 
       return baseInfoRaw.map((r) => {
@@ -389,7 +383,7 @@ export class DashboardService {
 
   async saveEasterEgg(data: { userId: string; eggType: string; score: number }) {
     try {
-      // 1. 현재 시간에 9시간(밀리초 환산)을 더해 KST(한국 시간) 객체를 생성합니다.
+      // KST(한국 표준시) 시간 강제 기록 적용
       const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
 
       const existingRecord = await this.prisma.sysEasterEgg.findUnique({
@@ -411,14 +405,12 @@ export class DashboardService {
           },
           update: {
             score: data.score,
-            // 갱신될 때 KST 시간 강제 주입
             achievedAt: kstNow, 
           },
           create: {
             userId: data.userId,
             eggType: data.eggType,
             score: data.score,
-            // 최초 생성 시 DB Default(UTC)를 무시하고 KST 시간 강제 주입
             createdAt: kstNow,
             achievedAt: kstNow,
           },
@@ -433,7 +425,6 @@ export class DashboardService {
     }
   }
 
-  // [수정됨] TO_CHAR를 사용하여 날짜를 YYYY-MM-DD HH:mm:ss 형식으로 반환하도록 쿼리 수정
   async getEasterEggRanking(eggType: string) {
     try {
       const rankings = await this.prisma.$queryRaw<any[]>`
