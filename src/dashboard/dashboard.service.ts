@@ -21,6 +21,49 @@ export class DashboardService {
     return 0;
   }
 
+  // [초강력 페널티] 거리가 멀어질수록 점수가 수직 낙하하는 산식
+  private calculateAgentScore(v: string, latest: string): number {
+    if (!v) return 0;
+    if (v === latest) return 100;
+    
+    const vParts = v.replace(/[^0-9.]/g, '').split('.').map(Number);
+    const lParts = latest.replace(/[^0-9.]/g, '').split('.').map(Number);
+    
+    const l0 = lParts[0] || 0, v0 = vParts[0] || 0;
+    const l1 = lParts[1] || 0, v1 = vParts[1] || 0;
+    const l2 = lParts[2] || 0, v2 = vParts[2] || 0;
+    const l3 = lParts[3] || 0, v3 = vParts[3] || 0;
+
+    // 1. v0.1.0.0 미만 (예: v0.0.9.8)은 극단적 구버전으로 분류하여 즉시 0점
+    if (v0 === 0 && v1 === 0) {
+      return 0; 
+    }
+
+    // 2. 세그먼트별 극한의 누진 감점 적용
+    if (l0 > v0) {
+      return 0; // Major 차이는 즉시 0점
+    } else if (l1 > v1) {
+      // Minor 차이: 1차이 10점, 2차이 이상 0점
+      const diff = l1 - v1;
+      return diff === 1 ? 10 : 0;
+    } else if (l2 > v2) {
+      // Patch 차이: 1차이 60점, 2차이 20점, 3차이 이상 0점
+      const diff = l2 - v2;
+      if (diff === 1) return 60;
+      if (diff === 2) return 20;
+      return 0;
+    } else if (l3 > v3) {
+      // Build 차이: 1차이 90점, 2차이 75점, 3차이 50점, 4차이 20점
+      const diff = l3 - v3;
+      if (diff === 1) return 90;
+      if (diff === 2) return 75;
+      if (diff === 3) return 50;
+      return Math.max(0, 50 - (diff - 3) * 30);
+    }
+
+    return 100; // 최신 버전보다 미래의 버전인 경우 방어코드
+  }
+
   async getGlobalFleetData() {
     try {
       const kstNow = new Date(new Date().getTime() + 9 * 60 * 60 * 1000);
@@ -93,6 +136,8 @@ export class DashboardService {
             onlineCount: 0,
             offlineCount: 0,
             latestCount: 0, 
+            totalStabilityPoints: 0,
+            minStabilityPoint: 100, // 최약체 추적
             summary: { todayErrorCount: 0 },
             index: siteObj.sdwts.length
           });
@@ -113,13 +158,21 @@ export class DashboardService {
         const errorCount = errorMap.get(eqp.eqpid) || 0;
         const hasError = errorCount > 0;
 
-        const isLatest = eqp.agentInfo?.appVer === latestVersion;
+        const appVer = eqp.agentInfo?.appVer || '';
+        const isLatest = appVer === latestVersion;
+        
+        // 개별 점수 산출 (0점 ~ 100점)
+        const agentScore = this.calculateAgentScore(appVer, latestVersion);
 
         sdwtObj.totalCount++;
         if (isOnline) sdwtObj.onlineCount++;
         else sdwtObj.offlineCount++;
         if (hasError) sdwtObj.summary.todayErrorCount++;
         if (isLatest) sdwtObj.latestCount++; 
+        
+        sdwtObj.totalStabilityPoints += agentScore;
+        // SDWT 내 가장 치명적인 장비 점수(최저점) 기록
+        sdwtObj.minStabilityPoint = Math.min(sdwtObj.minStabilityPoint, agentScore);
 
         siteObj.siteStats.total++;
         if (isOnline) siteObj.siteStats.online++;
@@ -131,6 +184,21 @@ export class DashboardService {
       result.forEach(site => {
         site.sdwts.forEach((sdwt: any) => {
           sdwt.isAllLatest = sdwt.totalCount > 0 && sdwt.latestCount === sdwt.totalCount;
+          
+          // 1. 단순 평균 산출
+          const baseAverage = sdwt.totalCount > 0 ? sdwt.totalStabilityPoints / sdwt.totalCount : 0;
+          let finalScore = baseAverage;
+
+          // 2. [극한의 아웃라이어 페널티] 1대라도 80점 미만의 구버전이 있다면
+          // 전체 평균의 50% 비중 + 최약체 장비의 50% 비중을 강제로 섞어 수직 낙하시킴 (지분율 상향)
+          if (sdwt.totalCount > 1 && sdwt.minStabilityPoint < 80) {
+            finalScore = (baseAverage * 0.5) + (sdwt.minStabilityPoint * 0.5);
+          }
+          
+          sdwt.stabilityScore = Math.round(finalScore);
+          
+          delete sdwt.totalStabilityPoints;
+          delete sdwt.minStabilityPoint;
         });
       });
 
@@ -324,7 +392,6 @@ export class DashboardService {
       });
       const errorMap = new Map(errorStats.map(e => [e.eqpid, e._count._all]));
 
-      // 🚀 핵심 성능 개선 구간: 루프를 제거하고 PostgreSQL DISTINCT ON을 활용한 단일 쿼리 일괄 조회
       const perfMap = new Map<string, any>();
       if (eqpIds.length > 0) {
         const latestPerfRaw = await this.prisma.$queryRaw<any[]>`
@@ -377,13 +444,8 @@ export class DashboardService {
     }
   }
 
-  // ========================================================================
-  // 이스터에그(글로벌 리더보드) 기능
-  // ========================================================================
-
   async saveEasterEgg(data: { userId: string; eggType: string; score: number }) {
     try {
-      // KST(한국 표준시) 시간 강제 기록 적용
       const kstNow = new Date(Date.now() + 9 * 60 * 60 * 1000);
 
       const existingRecord = await this.prisma.sysEasterEgg.findUnique({
