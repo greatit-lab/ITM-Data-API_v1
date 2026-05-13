@@ -159,7 +159,7 @@ export class PerformanceService {
     }));
   }
 
-  // [성능 개선 완료] 75초 지연 해결: ORM findMany 원시 조회 방식 폐기 및 DB 레벨 타임 버킷 그룹핑 적용
+  // [성능 개선 및 월별 파티셔닝 적용 완료]
   async getProcessHistory(
     startDate: string,
     endDate: string,
@@ -170,35 +170,83 @@ export class PerformanceService {
     const endDt = this.parseDate(endDate);
     const safeInterval = interval && !isNaN(interval) && interval > 0 ? interval : 60;
 
-    try {
-      const results = await this.prisma.$queryRaw`
-        SELECT 
-          to_timestamp(
-            (floor(extract(epoch from serv_ts) / ${safeInterval}) * ${safeInterval})
-          ) AT TIME ZONE 'UTC' as timestamp,
-          process_name as "processName",
-          MAX(memory_usage_mb) as "memoryUsageMB"
-        FROM public.eqp_proc_perf
-        WHERE eqpid = ${eqpId}
-          AND serv_ts >= ${startDt}
-          AND serv_ts <= ${endDt}
-        GROUP BY 1, 2
-        ORDER BY timestamp ASC
-      `;
+    // cutoffDate = 어제 00:00:00
+    const cutoffDate = dayjs().startOf('day').subtract(1, 'day').toDate();
 
-      return (results as any[]).map((row: any) => ({
+    let queries: string[] = [];
+    let params: any[] = [];
+    let paramIndex = 1;
+
+    // 파티션 서브 쿼리 구조 생성기
+    const addQuery = (tableName: string, tStart: Date, tEnd: Date) => {
+      let q = `
+        SELECT serv_ts, process_name, memory_usage_mb
+        FROM ${tableName}
+        WHERE serv_ts >= $${paramIndex++} AND serv_ts <= $${paramIndex++}
+          AND eqpid = $${paramIndex++}
+      `;
+      params.push(tStart, tEnd, eqpId);
+      queries.push(q);
+    };
+
+    // 1. 과거 데이터 조회
+    if (startDt < cutoffDate) {
+      let currentMonth = dayjs(startDt).startOf('month');
+      const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
+      
+      while (currentMonth.toDate() <= endPastDt) {
+        const yyyy = currentMonth.format('YYYY');
+        const mm = currentMonth.format('MM');
+        const tableName = `public.eqp_proc_perf_y${yyyy}m${mm}`;
+        
+        const mStart = currentMonth.toDate() < startDt ? startDt : currentMonth.toDate();
+        const mEnd = currentMonth.endOf('month').toDate() > endPastDt ? endPastDt : currentMonth.endOf('month').toDate();
+        
+        addQuery(tableName, mStart, mEnd);
+        
+        currentMonth = currentMonth.add(1, 'month');
+      }
+    }
+
+    // 2. 최신 데이터 조회 
+    if (endDt >= cutoffDate) {
+      const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
+      addQuery('public.eqp_proc_perf', recentStartDt, endDt);
+    }
+
+    if (queries.length === 0) return [];
+
+    const unionQuery = queries.join(' UNION ALL ');
+
+    const finalQuery = `
+      SELECT 
+        to_timestamp(
+          (floor(extract(epoch from serv_ts) / ${safeInterval}) * ${safeInterval})
+        ) AT TIME ZONE 'UTC' as timestamp,
+        process_name as "processName",
+        MAX(memory_usage_mb) as "memoryUsageMB"
+      FROM (
+        ${unionQuery}
+      ) as combined_data
+      GROUP BY 1, 2
+      ORDER BY timestamp ASC
+    `;
+
+    try {
+      const results = await this.prisma.$queryRawUnsafe<any[]>(finalQuery, ...params);
+
+      return results.map((row: any) => ({
         timestamp: dayjs.utc(row.timestamp).format('YYYY-MM-DD HH:mm:ss'),
         processName: row.processName,
         memoryUsageMB: Number(row.memoryUsageMB) || 0, 
       }));
-
     } catch (e) {
       console.error('getProcessHistory query error:', e);
       return [];
     }
   }
 
-  // [성능 최종 최적화] Type-Casting(CAST)으로 인한 DB 인덱스 무력화 현상 해결 (Native Date Parameter 사용)
+  // [성능 최종 최적화 및 파티셔닝 적용] ITM Agent 데이터 동적 라우팅 및 CTE 기반 최적화
   async getItmAgentTrend(
     site: string,
     sdwt: string,
@@ -211,35 +259,81 @@ export class PerformanceService {
     const endDt = this.parseDate(endDate);
     const safeInterval = interval && !isNaN(interval) && interval > 0 ? interval : 60;
     
-    let eqpidFilter = Prisma.empty;
-    if (eqpid) {
-      eqpidFilter = Prisma.sql`AND p.eqpid = ${eqpid}`;
-    }
+    // cutoffDate = 어제 00:00:00
+    const cutoffDate = dayjs().startOf('day').subtract(1, 'day').toDate();
 
-    let metadataFilter = Prisma.empty;
-    if (site) {
-      metadataFilter = Prisma.sql`AND s.site = ${site}`;
-    }
-    if (sdwt) {
-      metadataFilter = Prisma.sql`${metadataFilter} AND r.sdwt = ${sdwt}`;
-    }
+    // 동적 파티션 쿼리 생성을 위한 Helper 함수 (Fallback 처리 지원)
+    const buildQuery = (isFallback: boolean) => {
+      let queries: string[] = [];
+      let params: any[] = [];
+      let paramIndex = 1;
 
-    try {
-      const results = await this.prisma.$queryRaw`
-        /* CAST( AS TIMESTAMP) 제거 및 순수 Date Parameter 주입으로 Index 적중률 100% 확보 */
+      const addQuery = (tableName: string, tStart: Date, tEnd: Date) => {
+        let q = `
+          SELECT serv_ts, eqpid, memory_usage_mb
+          ${isFallback ? ', 0::numeric as memory_commit_mb' : ', memory_commit_mb'}
+          FROM ${tableName}
+          WHERE serv_ts >= $${paramIndex++} AND serv_ts <= $${paramIndex++}
+            AND process_name IN ('ITM_Agent', 'ITMAgent', 'ITM-Agent', 'itm_agent', 'itmagent', 'itm-agent')
+        `;
+        params.push(tStart, tEnd);
+
+        if (eqpid) {
+          q += ` AND eqpid = $${paramIndex++}`;
+          params.push(eqpid);
+        }
+        queries.push(q);
+      };
+
+      // 1. 과거 데이터 (월별 테이블)
+      if (startDt < cutoffDate) {
+        let currentMonth = dayjs(startDt).startOf('month');
+        const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
+        
+        while (currentMonth.toDate() <= endPastDt) {
+          const yyyy = currentMonth.format('YYYY');
+          const mm = currentMonth.format('MM');
+          const tableName = `public.eqp_proc_perf_y${yyyy}m${mm}`;
+          
+          const mStart = currentMonth.toDate() < startDt ? startDt : currentMonth.toDate();
+          const mEnd = currentMonth.endOf('month').toDate() > endPastDt ? endPastDt : currentMonth.endOf('month').toDate();
+          
+          addQuery(tableName, mStart, mEnd);
+          currentMonth = currentMonth.add(1, 'month');
+        }
+      }
+
+      // 2. 최신 데이터 (기본 테이블)
+      if (endDt >= cutoffDate) {
+        const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
+        addQuery('public.eqp_proc_perf', recentStartDt, endDt);
+      }
+
+      // 외부 조인용 필터 추가
+      let outerFilters = "";
+      if (site) {
+        outerFilters += ` AND s.site = $${paramIndex++}`;
+        params.push(site);
+      }
+      if (sdwt) {
+        outerFilters += ` AND r.sdwt = $${paramIndex++}`;
+        params.push(sdwt);
+      }
+
+      const unionQuery = queries.length > 0 ? queries.join(' UNION ALL ') : '';
+
+      const finalQuery = unionQuery ? `
         WITH AggregatedData AS (
           SELECT 
             to_timestamp(
-              (floor(extract(epoch from p.serv_ts) / ${safeInterval}) * ${safeInterval})
+              (floor(extract(epoch from serv_ts) / ${safeInterval}) * ${safeInterval})
             ) AT TIME ZONE 'UTC' as timestamp,
-            p.eqpid,
-            MAX(p.memory_usage_mb) as memory_usage_mb,
-            MAX(p.memory_commit_mb) as memory_commit_mb
-          FROM public.eqp_proc_perf p
-          WHERE p.serv_ts >= ${startDt}
-            AND p.serv_ts <= ${endDt}
-            AND p.process_name IN ('ITM_Agent', 'ITMAgent', 'ITM-Agent', 'itm_agent', 'itmagent', 'itm-agent')
-            ${eqpidFilter}
+            eqpid,
+            MAX(memory_usage_mb) as memory_usage_mb,
+            MAX(memory_commit_mb) as memory_commit_mb
+          FROM (
+            ${unionQuery}
+          ) as combined_data
           GROUP BY 1, 2
         )
         SELECT 
@@ -254,50 +348,33 @@ export class PerformanceService {
         LEFT JOIN public.ref_equipment r ON a.eqpid = r.eqpid
         LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
         LEFT JOIN public.agent_info i ON a.eqpid = i.eqpid
-        WHERE 1=1 ${metadataFilter}
+        WHERE 1=1 ${outerFilters}
         ORDER BY a.timestamp ASC
-      `;
+      ` : '';
 
-      return (results as any[]).map(r => ({
+      return { finalQuery, params, hasQueries: queries.length > 0 };
+    };
+
+    try {
+      const { finalQuery, params, hasQueries } = buildQuery(false);
+      if (!hasQueries) return [];
+      
+      const results = await this.prisma.$queryRawUnsafe<any[]>(finalQuery, ...params);
+      
+      return results.map(r => ({
         ...r,
         timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
       }));
 
     } catch (e) {
-      // Fallback: memory_commit_mb 컬럼이 없을 경우
-      const fallbackResults = await this.prisma.$queryRaw`
-        WITH AggregatedData AS (
-          SELECT 
-            to_timestamp(
-              (floor(extract(epoch from p.serv_ts) / ${safeInterval}) * ${safeInterval})
-            ) AT TIME ZONE 'UTC' as timestamp,
-            p.eqpid,
-            MAX(p.memory_usage_mb) as memory_usage_mb,
-            0::numeric as memory_commit_mb
-          FROM public.eqp_proc_perf p
-          WHERE p.serv_ts >= ${startDt}
-            AND p.serv_ts <= ${endDt}
-            AND p.process_name IN ('ITM_Agent', 'ITMAgent', 'ITM-Agent', 'itm_agent', 'itmagent', 'itm-agent')
-            ${eqpidFilter}
-          GROUP BY 1, 2
-        )
-        SELECT 
-          a.timestamp,
-          a.eqpid as "eqpId",
-          s.site as "site",
-          r.sdwt as "sdwt",
-          a.memory_usage_mb as "memoryUsageMB",
-          a.memory_commit_mb as "memoryCommitMB", 
-          i.app_ver as "agentVersion"
-        FROM AggregatedData a
-        LEFT JOIN public.ref_equipment r ON a.eqpid = r.eqpid
-        LEFT JOIN public.ref_sdwt s ON r.sdwt = s.sdwt
-        LEFT JOIN public.agent_info i ON a.eqpid = i.eqpid
-        WHERE 1=1 ${metadataFilter}
-        ORDER BY a.timestamp ASC
-      `;
-
-      return (fallbackResults as any[]).map(r => ({
+      console.warn('getItmAgentTrend fallback triggered (commit_mb column missing in some partitions)');
+      // Fallback: 파티션 테이블들 중 일부에 memory_commit_mb 컬럼이 없을 경우를 방어
+      const { finalQuery, params, hasQueries } = buildQuery(true);
+      if (!hasQueries) return [];
+      
+      const fallbackResults = await this.prisma.$queryRawUnsafe<any[]>(finalQuery, ...params);
+      
+      return fallbackResults.map(r => ({
         ...r,
         timestamp: dayjs.utc(r.timestamp).format('YYYY-MM-DD HH:mm:ss')
       }));
