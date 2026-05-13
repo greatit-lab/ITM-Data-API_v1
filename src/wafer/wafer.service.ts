@@ -315,55 +315,46 @@ export class WaferService {
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
-    const tableName = await this.resolveSpectrumTableName(params);
-
-    // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
     let sql = `
-      SELECT DISTINCT s.point
-      FROM ${tableName} s
-      JOIN public.plg_wf_flat f 
-        ON TRIM(s.eqpid) = TRIM(f.eqpid)
-        AND TRIM(s.lotid) = TRIM(f.lotid)
-        AND s.waferid::integer = f.waferid
-        AND s.point = f.point
-        AND s.ts = f.datetime
+      SELECT DISTINCT point
+      FROM public.plg_wf_flat
       WHERE 1=1
     `;
 
     const queryParams: (string | number | Date)[] = [];
 
     if (eqpId) {
-      sql += ` AND s.eqpid = $${queryParams.length + 1}`;
+      sql += ` AND eqpid = $${queryParams.length + 1}`;
       queryParams.push(eqpId);
     }
     if (lotId) {
-      sql += ` AND s.lotid = $${queryParams.length + 1}`;
+      sql += ` AND lotid = $${queryParams.length + 1}`;
       queryParams.push(lotId);
     }
     if (cassetteRcp) {
-      sql += ` AND f.cassettercp = $${queryParams.length + 1}`;
+      sql += ` AND cassettercp = $${queryParams.length + 1}`;
       queryParams.push(cassetteRcp);
     }
     if (stageRcp) {
-      sql += ` AND f.stagercp = $${queryParams.length + 1}`;
+      sql += ` AND stagercp = $${queryParams.length + 1}`;
       queryParams.push(stageRcp);
     }
     if (stageGroup) {
-      sql += ` AND f.stagegroup = $${queryParams.length + 1}`;
+      sql += ` AND stagegroup = $${queryParams.length + 1}`;
       queryParams.push(stageGroup);
     }
     if (film) {
-      sql += ` AND f.film = $${queryParams.length + 1}`;
+      sql += ` AND film = $${queryParams.length + 1}`;
       queryParams.push(film);
     }
 
     if (!lotId && startDate && endDate) {
       const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
-      sql += ` AND s.ts >= $${queryParams.length + 1} AND s.ts <= $${queryParams.length + 2}`;
+      sql += ` AND serv_ts >= $${queryParams.length + 1} AND serv_ts <= $${queryParams.length + 2}`;
       queryParams.push(s, e);
     }
 
-    sql += ` ORDER BY s.point ASC`;
+    sql += ` ORDER BY point ASC`;
 
     try {
       const results = await this.prisma.$queryRawUnsafe<{ point: number }[]>(
@@ -416,7 +407,6 @@ export class WaferService {
     const queryParams: (string | number | Date)[] = [];
     const selectColumns = dynamicColumns.map((col) => `f."${col}"`).join(', ');
 
-    // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
     let sql = `
       SELECT DISTINCT ON (s."waferid")
         s."waferid", s."wavelengths", s."values", s."ts", s."eqpid",
@@ -520,6 +510,7 @@ export class WaferService {
     }
   }
 
+  // [수정됨] Model Gen 데이터 조회 시, 미세한 시간 정밀도로 인한 에러 방지 처리 적용
   async getSpectrumGen(params: WaferQueryParams) {
     const { lotId, waferId, pointId, eqpId, ts } = params;
     if (!lotId || !waferId || !pointId || !eqpId || !ts) return null;
@@ -528,7 +519,7 @@ export class WaferService {
       const targetDate = this.parseSafeDate(ts);
       const tableName = await this.resolveSpectrumTableName({ ts });
 
-      // [수정됨] 100% 정확한 시간 일치 검색
+      // date_trunc를 사용하여 정밀도 문제를 회피하거나, 단일 포인트 조회의 경우 ORDER BY로 가장 안전하게 추출
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
@@ -536,7 +527,7 @@ export class WaferService {
            AND "waferid"::integer = $2  
            AND "point" = $3    
            AND TRIM("eqpid") = TRIM($4)    
-           AND "ts" = $5::timestamp
+           AND date_trunc('second', "ts") = date_trunc('second', $5::timestamp)
            AND "class" = 'GEN'
          ORDER BY "ts" DESC
          LIMIT 1`,
@@ -913,6 +904,7 @@ export class WaferService {
     return { exists: false, url: null };
   }
 
+  // [수정됨] 일반 Spectrum 조회 시에도 시간 정밀도 오류 보정
   async getSpectrum(params: WaferQueryParams) {
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
@@ -921,12 +913,11 @@ export class WaferService {
       const targetDate = this.parseSafeDate(ts);
       const tableName = await this.resolveSpectrumTableName({ ts });
 
-      // [수정됨] 100% 정확한 시간 일치 매핑
       const results = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
          WHERE TRIM("eqpid") = TRIM($1) 
-           AND "ts" = $2::timestamp
+           AND date_trunc('second', "ts") = date_trunc('second', $2::timestamp)
            AND TRIM("lotid") = TRIM($3) 
            AND "waferid"::integer = $4 
            AND "point" = $5
@@ -968,7 +959,6 @@ export class WaferService {
       const targetDate = this.parseSafeDate(targetDateStr);
       const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss.SSS');
 
-      // [수정됨] 100% 정확한 시간 일치 매핑
       if (p.dateTime) {
         sql += ` AND datetime = $${pIdx}::timestamp`;
         params.push(cleanDateStr);
@@ -1198,7 +1188,6 @@ export class WaferService {
       if (stageGroup) { filterClause += ` AND f.stagegroup = $${queryParams.length + 1}`; queryParams.push(stageGroup); }
       if (film) { filterClause += ` AND f.film = $${queryParams.length + 1}`; queryParams.push(film); }
 
-      // [수정됨] 100% 장비시간 기준 정확한 일치 매핑
       const sql = `
         SELECT s.ts, s.lotid, s.waferid, s.point, s.wavelengths, s."values"
         FROM ${tableName} s
@@ -1268,34 +1257,52 @@ export class WaferService {
     }
   }
 
+  // [수정됨] 사용자 피드백 반영: 레시피 조건 제외 후 해당 Lot 전체 기준 검색 & 타임스탬프 오류 해결
   async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenSpectrumResponse | null> {
-    const { eqpId, lotId, pointId, cassetteRcp, stageGroup } = params;
+    const { eqpId, lotId, pointId } = params;
+    
+    // cassetteRcp, stageGroup 등 세부 조건을 쿼리 파라미터에서 완전히 제거했습니다.
     if (!eqpId || !lotId || !pointId) return null;
 
     try {
-      const tableName = await this.resolveSpectrumTableName(params);
-
+      // Step 1: 해당 LotID와 Point를 기준으로 모든 Wafer 중에서 가장 높은 GOF를 찾습니다.
       const bestGofSql = `
-            SELECT waferid FROM public.plg_wf_flat
+            SELECT waferid, datetime FROM public.plg_wf_flat
             WHERE eqpid = $1 AND lotid = $2 AND point = $3
-              ${cassetteRcp ? 'AND cassettercp = $4' : ''}
-              ${stageGroup ? 'AND stagegroup = $5' : ''}
               AND gof IS NOT NULL
             ORDER BY gof DESC LIMIT 1
         `;
       const queryParams: any[] = [eqpId, lotId, Number(pointId)];
-      if (cassetteRcp) queryParams.push(cassetteRcp);
-      if (stageGroup) queryParams.push(stageGroup);
 
-      const bestData = await this.prisma.$queryRawUnsafe<{ waferid: unknown }[]>(bestGofSql, ...queryParams);
+      const bestData = await this.prisma.$queryRawUnsafe<{ waferid: unknown, datetime: Date }[]>(bestGofSql, ...queryParams);
       if (!bestData || bestData.length === 0) return null;
 
+      const targetWaferId = bestData[0].waferid;
+      const targetTs = bestData[0].datetime;
+
+      // 타임스탬프를 이용해 파티션 테이블을 매핑하여 빠른 인덱스 검색(O(1)) 유지
+      const tableName = await this.resolveSpectrumTableName({ ts: targetTs });
+
+      // Step 2: 시간 정밀도 오류가 나지 않도록 ts=$2 대신 ORDER BY ts DESC LIMIT 1 로 안전하게 획득
       const spectrumSql = `
-            SELECT wavelengths, "values" FROM ${tableName}
-            WHERE eqpid = $1 AND lotid = $2 AND waferid = $3 AND point = $4 AND class = 'EXP' 
-            ORDER BY ts DESC LIMIT 1
+            SELECT wavelengths, "values" 
+            FROM ${tableName}
+            WHERE TRIM(eqpid) = TRIM($1) 
+              AND TRIM(lotid) = TRIM($2) 
+              AND waferid::integer = $3 
+              AND point = $4 
+              AND class = 'EXP' 
+            ORDER BY ts DESC 
+            LIMIT 1
         `;
-      const spectrum = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(spectrumSql, eqpId, lotId, String(bestData[0].waferid), Number(pointId));
+      const spectrum = await this.prisma.$queryRawUnsafe<SpectrumRawResult[]>(
+        spectrumSql, 
+        eqpId, 
+        lotId, 
+        Number(targetWaferId), 
+        Number(pointId)
+      );
+
       if (!spectrum || spectrum.length === 0) return null;
       return { wavelengths: spectrum[0].wavelengths, values: spectrum[0].values };
     } catch (e) {
