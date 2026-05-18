@@ -28,7 +28,7 @@ export class EquipmentService {
     }));
   }
 
-  // 2. 장비 상세 조회 (Explorer 등)
+  // 2. 장비 상세 조회 (Explorer 및 Equipment Status Summary 상세 팝업용 API)
   async getEquipmentDetails(params: {
     site?: string;
     sdwt?: string;
@@ -52,7 +52,7 @@ export class EquipmentService {
       isNot: null,
     };
 
-    // [수정됨] cfgServer 정보도 함께 가져오도록 include 속성 추가
+    // cfgServer 정보와 agentInfo 정보를 함께 Join하여 관계 데이터 조회
     const results = await this.prisma.refEquipment.findMany({
       where,
       include: {
@@ -69,7 +69,7 @@ export class EquipmentService {
       const info: any = eqp.agentInfo || {};
       const status: any = eqp.agentStatus || {};
       const itm: any = eqp.itmInfo || {};
-      const cfg: any = eqp.cfgServer || {}; // [추가됨]
+      const cfg: any = eqp.cfgServer || {}; 
 
       let isOnline = false;
       if (status.status && status.status.toUpperCase() === 'ONLINE') {
@@ -97,10 +97,11 @@ export class EquipmentService {
         systemModel: itm.systemModel || '-',
         serialNum: itm.serialNum || '-',
         application: itm.application || '-',
-        version: itm.version || '-',
+        version: itm.version || '-',        // ITM 장비(설비) 자체 App Ver (itmInfo)
         dbVersion: itm.dbVersion || '-',
-        useProxy: cfg.useProxy || 'N', // [추가됨] 프록시 여부 매핑
-        proxyIp: cfg.proxyIp || '-',   // [추가됨] 프록시 IP 매핑
+        appVer: info.appVer || '-',         // [버그 수정] 누락되었던 실제 ITM Agent 프로그램 버전(agentInfo) 매핑 추가!
+        useProxy: cfg.useProxy || 'N',      // 프록시 여부 매핑
+        proxyIp: cfg.proxyIp || '-',         // 프록시 IP 매핑
       };
     });
   }
