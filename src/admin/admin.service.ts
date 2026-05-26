@@ -69,42 +69,6 @@ export class AdminService {
     return null; 
   }
 
-  // ----------------------------------------------------------------------
-  // 👨‍💻 [핵심 추가] DBaaS PostgreSQL 클라우드 메트릭 1시간 주기 수집 (Pull 방식)
-  // ----------------------------------------------------------------------
-  @Cron('0 0 * * * *', { timeZone: 'Asia/Seoul' }) // 매시 정각(0분 0초)마다 실행
-  async collectDBaaSMetrics() {
-    this.logger.log('Starting DBaaS metric collection (Cloud API Pull)...');
-    try {
-      // 1. 클라우드 벤더 API를 통해 DBaaS의 CPU, Memory, Disk 메트릭을 수집합니다.
-      const dbaasMetrics = await this.fetchCloudDBaaSMetrics();
-
-      // 2. 수집된 메트릭을 기존 ServerMetric 테이블에 `dbaas-db-server` ID로 저장합니다.
-      await this.recordServerMetric({
-        serverId: 'dbaas-db-server',
-        cpu: dbaasMetrics.cpu,
-        memory: dbaasMetrics.memory,
-        disk: dbaasMetrics.disk,
-      });
-
-      this.logger.log(`Successfully recorded DBaaS metrics. CPU: ${dbaasMetrics.cpu}%, Mem: ${dbaasMetrics.memory}%`);
-    } catch (error: any) {
-      this.logger.error(`[DBaaS Metric Error] Failed to collect DBaaS data: ${error.message}`);
-    }
-  }
-
-  // 👨‍💻 [참고] 실제 클라우드 API 연동 함수 (AWS CloudWatch, NCP, NHN 등 환경에 맞게 SDK 적용 필요)
-  private async fetchCloudDBaaSMetrics() {
-    // [TODO] 클라우드 제공자의 Node.js SDK를 활용하여 데이터를 페치하는 로직으로 대체해야 합니다.
-    // 현재는 화면 UI 테스트를 위해 1시간마다 랜덤하게 변동되는 임시(Dummy) 데이터를 반환합니다.
-    return {
-      cpu: Number((Math.random() * 15 + 10).toFixed(1)),     // 10% ~ 25% 임의 CPU 부하
-      memory: Number((Math.random() * 20 + 40).toFixed(1)),  // 40% ~ 60% 임의 메모리 부하
-      disk: Number((Math.random() * 2 + 30).toFixed(1)),     // 30% ~ 32% 디스크 사용량 (서서히 증가하게 연출 가능)
-    };
-  }
-  // ----------------------------------------------------------------------
-
   @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
     this.logger.log('Starting daily storage size recording (Cron)...');
@@ -240,6 +204,7 @@ export class AdminService {
         ORDER BY "serverId", "createdAt" DESC
       `;
 
+      // 👨‍💻 [핵심 수정] dbaas-db-server 스펙 정의 추가
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
