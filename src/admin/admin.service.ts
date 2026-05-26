@@ -204,12 +204,10 @@ export class AdminService {
         ORDER BY "serverId", "createdAt" DESC
       `;
 
-      // 👨‍💻 [핵심 수정] dbaas-db-server 스펙 정의 추가
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
         'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
-        'dbaas-db-server': { name: 'DBaaS PostgreSQL', cpu: 16, memory: 64, disk: 2000, order: 4 },
         'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
 
@@ -496,6 +494,7 @@ export class AdminService {
     const dailyTrends: Array<{ date: string; cumDbMB: number; cumObjMB: number; dailyDbMB: number; dailyObjMB: number; }> = [];
     const monthlyTrends: Array<{ date: string; cumDbMB: number; cumObjMB: number; monthlyDbMB: number; monthlyObjMB: number; }> = [];
 
+    // [1. Daily Trends] - startDate와 endDate 필터 범위 기준
     try {
       const histories = await this.prisma.sysStorageHistory.findMany({
         where: { checkDate: { gte: start, lte: end } },
@@ -558,21 +557,26 @@ export class AdminService {
       this.logger.error(`[Daily Trends Query Error] ${error.message}`);
     }
 
+    // [2. Monthly Trends] - 당월 포함 최대 12개월 (단, 최초 적재월 이전의 빈 데이터는 제외)
     try {
       const kstNow = this.getKstDate();
       const mYear = kstNow.getUTCFullYear();
       const mMonth = kstNow.getUTCMonth();
 
+      // 기본 12개월 전 (최대 조회 범위)
       const defaultStartDate = new Date(Date.UTC(mYear, mMonth - 11, 1));
       const monthlyEndDate = new Date(Date.UTC(mYear, mMonth + 1, 0, 23, 59, 59, 999));
 
+      // DB에서 실제로 저장된 가장 오래된 날짜 조회
       const oldestRecord = await this.prisma.sysStorageHistory.findFirst({
         orderBy: { checkDate: 'asc' },
         select: { checkDate: true }
       });
 
+      // 실제 표시 시작 월 결정 (가장 오래된 데이터 월이 12개월 이내면 그 달부터, 아니면 12개월 전부터)
       let displayStartDate = defaultStartDate;
       if (!oldestRecord) {
+        // 데이터가 아예 없으면 당월만 표시
         displayStartDate = new Date(Date.UTC(mYear, mMonth, 1));
       } else if (oldestRecord.checkDate > defaultStartDate) {
         const oYear = oldestRecord.checkDate.getUTCFullYear();
@@ -585,6 +589,7 @@ export class AdminService {
         orderBy: { checkDate: 'asc' }
       });
 
+      // displayStartDate 이전까지의 누적 용량 선계산
       const mPrevObjSum = await this.prisma.sysStorageHistory.aggregate({
         _sum: { sizeBytes: true },
         where: { storageType: 'FILE', checkDate: { lt: displayStartDate } }
@@ -599,6 +604,7 @@ export class AdminService {
 
       const mDateMap = new Map<string, { dbMB: number, objMB: number }>();
 
+      // displayStartDate 부터 당월까지 동적으로 Map 초기화
       let currentMonthCursor = new Date(displayStartDate.getTime());
       const endMonthTime = new Date(Date.UTC(mYear, mMonth, 1)).getTime();
 
