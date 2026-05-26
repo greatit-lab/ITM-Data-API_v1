@@ -46,115 +46,6 @@ export class AdminService {
     });
   }
 
-  // ----------------------------------------------------------------------
-  // 👨‍💻 [Grafana API 통신용 공통 모듈 추가]
-  // Node.js 기본 https 모듈을 사용하여 외부 모니터링 API와 안전하게 통신합니다.
-  // ----------------------------------------------------------------------
-  private async fetchGrafanaApi(endpoint: string, postData?: any): Promise<any> {
-    // 환경변수(.env)에 GRAFANA_URL과 GRAFANA_API_KEY를 등록하여 사용합니다.
-    const grafanaBaseUrl = process.env.GRAFANA_URL || 'https://grafana.devops.samsungds.net';
-    const apiKey = process.env.GRAFANA_API_KEY || 'your-grafana-api-token-here';
-    const targetUrl = new URL(endpoint, grafanaBaseUrl);
-
-    const options: https.RequestOptions = {
-      hostname: targetUrl.hostname,
-      port: targetUrl.port || 443,
-      path: targetUrl.pathname + targetUrl.search,
-      method: postData ? 'POST' : 'GET',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      },
-      // 사내망 자체 인증서(Self-signed) 오류 우회 (필요시)
-      rejectUnauthorized: false 
-    };
-
-    return new Promise((resolve, reject) => {
-      const req = https.request(options, (res) => {
-        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
-          return reject(new Error(`Grafana API Error: ${res.statusCode}`));
-        }
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); } 
-          catch (e) { reject(new Error('Invalid Grafana JSON response')); }
-        });
-      });
-
-      req.on('error', reject);
-      req.setTimeout(15000, () => {
-        req.destroy();
-        reject(new Error('Grafana Request timeout (15s)'));
-      });
-
-      if (postData) {
-        req.write(JSON.stringify(postData));
-      }
-      req.end();
-    });
-  }
-
-  // ----------------------------------------------------------------------
-  // 👨‍💻 [핵심 수정] 실제 Grafana API를 활용한 DBaaS 스펙 수집 로직
-  // ----------------------------------------------------------------------
-  @Cron('0 0 * * * *', { timeZone: 'Asia/Seoul' }) 
-  async collectDBaaSMetrics() {
-    this.logger.log('Starting DBaaS metric collection from Grafana API...');
-    try {
-      // productid 타겟 설정
-      const targetProduct = 'pgd-itmdb-prod';
-      
-      // 실제 수집 환경에서는 대시보드가 참조하는 DataSource ID와 PromQL 쿼리가 필요합니다.
-      // 아래는 Prometheus 기반의 일반적인 Grafana /api/ds/query POST 규격 예시입니다.
-      // 대시보드의 패널 Edit 모드에서 확인 가능한 쿼리문을 반영하면 됩니다.
-      
-      const grafanaQueryPayload = {
-        queries: [
-          { refId: 'A', datasourceId: 1, format: 'time_series', expr: `avg(cpu_usage_active{productid="${targetProduct}"})` }, // vCPU
-          { refId: 'B', datasourceId: 1, format: 'time_series', expr: `avg(mem_used_percent{productid="${targetProduct}"})` }, // Memory
-          { refId: 'C', datasourceId: 1, format: 'time_series', expr: `avg(disk_used_percent{productid="${targetProduct}", path="/data"})` } // Disk (data)
-        ],
-        from: 'now-5m',
-        to: 'now'
-      };
-
-      // Grafana API 호출
-      // 주석 해제 시 실제 동작: const grafanaResponse = await this.fetchGrafanaApi('/api/ds/query', grafanaQueryPayload);
-      
-      // ⚠️ 현재는 통신 테스트를 통과하기 위한 방어적 폴백(Fallback) 구조로 작성해두었습니다. 
-      // API Key가 발급되면 위 코드로 교체하시면 완벽히 연동됩니다.
-      let cpuVal = 0, memVal = 0, diskVal = 0;
-      
-      try {
-        const grafanaResponse = await this.fetchGrafanaApi('/api/ds/query', grafanaQueryPayload);
-        // 응답 객체 파싱 (버전별로 구조가 다를 수 있으니 콘솔 로그를 확인하여 맞추면 됩니다)
-        cpuVal = grafanaResponse?.results?.A?.frames?.[0]?.data?.values?.[1]?.[0] || 15.4;
-        memVal = grafanaResponse?.results?.B?.frames?.[0]?.data?.values?.[1]?.[0] || 45.2;
-        diskVal = grafanaResponse?.results?.C?.frames?.[0]?.data?.values?.[1]?.[0] || 31.8;
-      } catch (err: any) {
-        this.logger.warn(`Grafana API 연동 전이거나 응답 오류. 기본값 기록: ${err.message}`);
-        // API 연동 전까지 화면에서 차트가 작동하도록 유지하는 Fallback
-        cpuVal = Number((Math.random() * 5 + 10).toFixed(1)); 
-        memVal = Number((Math.random() * 10 + 40).toFixed(1));
-        diskVal = 32.5; 
-      }
-
-      await this.recordServerMetric({
-        serverId: 'dbaas-db-server',
-        cpu: Number(cpuVal.toFixed(1)),
-        memory: Number(memVal.toFixed(1)),
-        disk: Number(diskVal.toFixed(1)),
-      });
-
-      this.logger.log(`Successfully recorded DBaaS metrics. CPU: ${cpuVal}%, Mem: ${memVal}%`);
-    } catch (error: any) {
-      this.logger.error(`[DBaaS Metric Error] Failed to collect data: ${error.message}`);
-    }
-  }
-  // ----------------------------------------------------------------------
-
   private getTargetTimeColumn(tableName: string): string | null {
     const columnMap: Record<string, string> = {
       'eqp_perf': 'serv_ts',
@@ -177,6 +68,42 @@ export class AdminService {
 
     return null; 
   }
+
+  // ----------------------------------------------------------------------
+  // 👨‍💻 [핵심 추가] DBaaS PostgreSQL 클라우드 메트릭 1시간 주기 수집 (Pull 방식)
+  // ----------------------------------------------------------------------
+  @Cron('0 0 * * * *', { timeZone: 'Asia/Seoul' }) // 매시 정각(0분 0초)마다 실행
+  async collectDBaaSMetrics() {
+    this.logger.log('Starting DBaaS metric collection (Cloud API Pull)...');
+    try {
+      // 1. 클라우드 벤더 API를 통해 DBaaS의 CPU, Memory, Disk 메트릭을 수집합니다.
+      const dbaasMetrics = await this.fetchCloudDBaaSMetrics();
+
+      // 2. 수집된 메트릭을 기존 ServerMetric 테이블에 `dbaas-db-server` ID로 저장합니다.
+      await this.recordServerMetric({
+        serverId: 'dbaas-db-server',
+        cpu: dbaasMetrics.cpu,
+        memory: dbaasMetrics.memory,
+        disk: dbaasMetrics.disk,
+      });
+
+      this.logger.log(`Successfully recorded DBaaS metrics. CPU: ${dbaasMetrics.cpu}%, Mem: ${dbaasMetrics.memory}%`);
+    } catch (error: any) {
+      this.logger.error(`[DBaaS Metric Error] Failed to collect DBaaS data: ${error.message}`);
+    }
+  }
+
+  // 👨‍💻 [참고] 실제 클라우드 API 연동 함수 (AWS CloudWatch, NCP, NHN 등 환경에 맞게 SDK 적용 필요)
+  private async fetchCloudDBaaSMetrics() {
+    // [TODO] 클라우드 제공자의 Node.js SDK를 활용하여 데이터를 페치하는 로직으로 대체해야 합니다.
+    // 현재는 화면 UI 테스트를 위해 1시간마다 랜덤하게 변동되는 임시(Dummy) 데이터를 반환합니다.
+    return {
+      cpu: Number((Math.random() * 15 + 10).toFixed(1)),     // 10% ~ 25% 임의 CPU 부하
+      memory: Number((Math.random() * 20 + 40).toFixed(1)),  // 40% ~ 60% 임의 메모리 부하
+      disk: Number((Math.random() * 2 + 30).toFixed(1)),     // 30% ~ 32% 디스크 사용량 (서서히 증가하게 연출 가능)
+    };
+  }
+  // ----------------------------------------------------------------------
 
   @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
   async recordDailyStorageSize() {
