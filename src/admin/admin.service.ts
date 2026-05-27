@@ -149,12 +149,13 @@ export class AdminService {
     return null; 
   }
 
-  // [수정됨] 1분 단위 테스트를 위해 크론 표현식을 '* * * * *'로 변경
-  @Cron('* * * * *', { timeZone: 'Asia/Seoul' })
+  // 매 1시간마다 DBaaS 서버의 메트릭 정보를 수집하는 스케줄러 (매 정시 0분에 실행)
+  @Cron('0 * * * *', { timeZone: 'Asia/Seoul' })
+  //@Cron('* * * * *', { timeZone: 'Asia/Seoul' }) // Test
   async collectDbaasMetrics() {
     this.logger.log('Starting DBaaS metrics collection...');
     
-    // IP 주소
+    // IP 주소 오타 수정 반영
     const targetIp = '10.172.122.198';
     const url = `http://${targetIp}:9100/metrics`;
     const serverId = 'dbaas_db_server';
@@ -349,7 +350,7 @@ export class AdminService {
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
-        'dbaas_db_server': { name: 'DBaaS Storage Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
+        'dbaas_db_server': { name: 'DBaaS DB Server', cpu: 4, memory: 8, disk: 4000, order: 3 },
         'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 4 },
         'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
