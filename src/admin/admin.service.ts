@@ -13,6 +13,9 @@ const execAsync = promisify(exec);
 @Injectable()
 export class AdminService {
   private readonly logger = new Logger(AdminService.name);
+  
+  // CPU Delta 계산을 위한 이전 상태 저장소
+  private prevCpuSnapshot: Map<string, number> = new Map();
 
   constructor(private prisma: PrismaService) {}
 
@@ -21,6 +24,83 @@ export class AdminService {
     const kstDate = new Date(now.getTime() + 9 * 60 * 60 * 1000);
     kstDate.setMilliseconds(0);
     return kstDate;
+  }
+
+  // HTTP를 통해 원격 서버의 Prometheus Metrics 데이터를 가져오는 메서드
+  private async fetchPrometheusMetrics(url: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const client = url.startsWith('https') ? https : http;
+      const req = client.get(url, { timeout: 10000 }, (res) => {
+        if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+          return reject(new Error(`HTTP Status Code: ${res.statusCode}`));
+        }
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => resolve(data));
+      });
+      req.on('error', reject);
+      
+      req.setTimeout(10000, () => {
+        req.destroy();
+        reject(new Error('Request timeout (10s)'));
+      });
+    });
+  }
+
+  // 텍스트 형태의 Metrics 데이터를 Key-Value 구조의 Map으로 파싱하는 메서드
+  private parseMetrics(text: string): Map<string, number> {
+    const map = new Map<string, number>();
+    const lines = text.split('\n');
+
+    for (const line of lines) {
+      if (!line || line.startsWith('#')) {
+        continue;
+      }
+      const idx = line.lastIndexOf(' ');
+      if (idx <= 0) {
+        continue;
+      }
+      const key = line.substring(0, idx).trim();
+      const value = Number(line.substring(idx + 1));
+
+      if (!Number.isNaN(value)) {
+        map.set(key, value);
+      }
+    }
+    return map;
+  }
+
+  // 이전 스냅샷과 현재 값을 비교하여 CPU 사용률(%)을 계산하는 메서드
+  private calculateCpuUsage(current: Map<string, number>): number {
+    let totalDelta = 0;
+    let idleDelta = 0;
+
+    for (const [key, value] of current.entries()) {
+      if (!key.startsWith('node_cpu_seconds_total')) {
+        continue;
+      }
+
+      const prev = this.prevCpuSnapshot.get(key);
+      if (prev === undefined) {
+        continue; // 최초 실행 시에는 Delta를 계산할 수 없음
+      }
+
+      const delta = value - prev;
+      totalDelta += delta;
+
+      if (key.includes('mode="idle"')) {
+        idleDelta += delta;
+      }
+    }
+
+    // 다음 주기 계산을 위해 현재 값을 스냅샷으로 저장
+    this.prevCpuSnapshot = new Map(current);
+
+    if (totalDelta <= 0) {
+      return 0; // 최초 실행 시 0 반환
+    }
+
+    return (1 - idleDelta / totalDelta) * 100;
   }
 
   private async fetchUploadApiSize(url: string): Promise<any> {
@@ -67,6 +147,68 @@ export class AdminService {
     if (tableName.startsWith('plg_onto_spectrum_y')) return 'serv_ts';
 
     return null; 
+  }
+
+  // [수정됨] 1분 단위 테스트를 위해 크론 표현식을 '* * * * *'로 변경
+  @Cron('* * * * *', { timeZone: 'Asia/Seoul' })
+  async collectDbaasMetrics() {
+    this.logger.log('Starting DBaaS metrics collection...');
+    
+    // IP 주소
+    const targetIp = '10.172.122.198';
+    const url = `http://${targetIp}:9100/metrics`;
+    const serverId = 'dbaas_db_server';
+
+    try {
+      // 1. 메트릭 데이터 가져오기 및 파싱
+      const metricsText = await this.fetchPrometheusMetrics(url);
+      const map = this.parseMetrics(metricsText);
+
+      // 2. Memory Usage 계산
+      const memTotal = map.get('node_memory_MemTotal_bytes') ?? 0;
+      const memAvailable = map.get('node_memory_MemAvailable_bytes') ?? 0;
+      let memoryUsagePct = 0;
+      if (memTotal > 0) {
+        memoryUsagePct = ((memTotal - memAvailable) / memTotal) * 100;
+      }
+
+      // 3. Disk Usage (/data1 기준) 계산
+      let diskSize = 0;
+      let diskAvail = 0;
+      
+      // 고정된 디바이스명이 아니라 mountpoint 기준 동적 탐색
+      for (const [key, value] of map.entries()) {
+        if (key.startsWith('node_filesystem_size_bytes') && key.includes('mountpoint="/data1"')) {
+          diskSize = value;
+        }
+        if (key.startsWith('node_filesystem_avail_bytes') && key.includes('mountpoint="/data1"')) {
+          diskAvail = value;
+        }
+      }
+
+      let diskUsagePct = 0;
+      if (diskSize > 0) {
+        diskUsagePct = ((diskSize - diskAvail) / diskSize) * 100;
+      }
+
+      // 4. CPU Usage 계산
+      const cpuUsage = this.calculateCpuUsage(map);
+
+      // 5. DB 적재 (ServerMetric 테이블)
+      await (this.prisma as any).serverMetric.create({
+        data: {
+          serverId: serverId,
+          cpu: Number(cpuUsage.toFixed(2)),
+          memory: Number(memoryUsagePct.toFixed(2)),
+          disk: Number(diskUsagePct.toFixed(2)),
+          createdAt: this.getKstDate(),
+        },
+      });
+
+      this.logger.log(`[DBaaS Metrics] Collected - CPU: ${cpuUsage.toFixed(2)}%, Mem: ${memoryUsagePct.toFixed(2)}%, Disk: ${diskUsagePct.toFixed(2)}%`);
+    } catch (error: any) {
+      this.logger.error(`[DBaaS Metrics Error] Failed to collect metrics from ${targetIp}: ${error.message}`);
+    }
   }
 
   @Cron('0 0 2 * * *', { timeZone: 'Asia/Seoul' })
@@ -207,7 +349,8 @@ export class AdminService {
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
-        'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
+        'dbaas_db_server': { name: 'DBaaS Storage Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
+        'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 4 },
         'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
 
