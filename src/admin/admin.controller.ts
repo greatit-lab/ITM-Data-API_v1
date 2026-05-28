@@ -62,7 +62,20 @@ export class AdminController {
   }
 
   // ==========================================
-  // [신규 추가] 수동 스토리지 동기화 API 연결부
+  // [신규 추가] 긴급 서비스 점검 모드 API
+  // ==========================================
+  @Get('maintenance')
+  async getMaintenanceStatus() {
+    return this.adminService.getMaintenanceStatus();
+  }
+
+  @Post('maintenance')
+  async updateMaintenanceStatus(@Body() body: { status: boolean; expectedTime?: string }) {
+    return this.adminService.updateMaintenanceStatus(body.status, body.expectedTime, 'admin');
+  }
+
+  // ==========================================
+  // [기존 유지] 수동 스토리지 동기화 API 연결부
   // ==========================================
   @Post('storage-sync')
   async syncStorageNow() {
@@ -70,7 +83,7 @@ export class AdminController {
   }
 
   // ==========================================
-  // [신규 추가] 서버 모니터링 API 3종 세트
+  // [기존 유지] 서버 모니터링 API 3종 세트
   // ==========================================
 
   // 1. 에이전트(리눅스 서버)가 데이터를 쏠 때 받는 곳 (POST)
