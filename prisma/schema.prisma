@@ -554,3 +554,12 @@ model ServerMetric {
   // 서버별, 시간별 빠른 조회를 위해 인덱스 생성
   @@index([serverId, createdAt])
 }
+
+/// 시스템 전역 환경설정 및 점검 모드 플래그 관리 테이블
+model cfg_system_config {
+  config_key   String   @id @db.VarChar(50)
+  config_value String   @db.VarChar(255)
+  updated_at   DateTime @default(dbgenerated("CURRENT_TIMESTAMP(0)")) @db.Timestamp(0)
+
+  @@map("cfg_system_config")
+}
