@@ -14,7 +14,6 @@ const execAsync = promisify(exec);
 export class AdminService {
   private readonly logger = new Logger(AdminService.name);
   
-  // CPU Delta 계산을 위한 이전 상태 저장소
   private prevCpuSnapshot: Map<string, number> = new Map();
 
   constructor(private prisma: PrismaService) {}
@@ -26,7 +25,67 @@ export class AdminService {
     return kstDate;
   }
 
-  // HTTP를 통해 원격 서버의 Prometheus Metrics 데이터를 가져오는 메서드
+  // ==========================================
+  // [신규 추가] 시스템 점검 모드 (Maintenance Mode)
+  // ==========================================
+  async getMaintenanceStatus() {
+    try {
+      const results: any[] = await this.prisma.$queryRaw`
+        SELECT config_key, config_value 
+        FROM cfg_system_config 
+        WHERE config_key IN ('MAINTENANCE_MODE', 'MAINTENANCE_EXPECTED_TIME')
+      `;
+      
+      let isMaintenance = false;
+      let expectedTime = '별도 공지 시까지';
+
+      for (const row of results) {
+        if (row.config_key === 'MAINTENANCE_MODE') isMaintenance = row.config_value === 'true';
+        if (row.config_key === 'MAINTENANCE_EXPECTED_TIME') expectedTime = row.config_value;
+      }
+      
+      return { isMaintenance, expectedTime };
+    } catch (error) {
+      return { isMaintenance: false, expectedTime: '별도 공지 시까지' };
+    }
+  }
+
+  async updateMaintenanceStatus(status: boolean, expectedTime: string = '별도 공지 시까지', loginId: string = 'system') {
+    const val = status ? 'true' : 'false';
+    try {
+      await this.prisma.$executeRaw`
+        CREATE TABLE IF NOT EXISTS cfg_system_config (
+            config_key VARCHAR(50) PRIMARY KEY,
+            config_value VARCHAR(255) NOT NULL,
+            updated_at TIMESTAMP(0) DEFAULT CURRENT_TIMESTAMP(0)
+        );
+      `;
+      
+      // 모드 활성화 상태 업데이트
+      await this.prisma.$executeRaw`
+        INSERT INTO cfg_system_config (config_key, config_value, updated_at) 
+        VALUES ('MAINTENANCE_MODE', ${val}, NOW()::timestamp(0))
+        ON CONFLICT (config_key) 
+        DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()::timestamp(0);
+      `;
+
+      // 예상 완료 시간 업데이트
+      await this.prisma.$executeRaw`
+        INSERT INTO cfg_system_config (config_key, config_value, updated_at) 
+        VALUES ('MAINTENANCE_EXPECTED_TIME', ${expectedTime}, NOW()::timestamp(0))
+        ON CONFLICT (config_key) 
+        DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = NOW()::timestamp(0);
+      `;
+      
+      this.logger.warn(`[System] Maintenance mode set to ${val} by ${loginId}. Expected: ${expectedTime}`);
+      return { success: true, isMaintenance: status, expectedTime };
+    } catch (error: any) {
+      this.logger.error(`Failed to update maintenance mode: ${error.message}`);
+      return { success: false, message: error.message };
+    }
+  }
+  // ==========================================
+
   private async fetchPrometheusMetrics(url: string): Promise<string> {
     return new Promise((resolve, reject) => {
       const client = url.startsWith('https') ? https : http;
@@ -47,7 +106,6 @@ export class AdminService {
     });
   }
 
-  // 텍스트 형태의 Metrics 데이터를 Key-Value 구조의 Map으로 파싱하는 메서드
   private parseMetrics(text: string): Map<string, number> {
     const map = new Map<string, number>();
     const lines = text.split('\n');
@@ -70,7 +128,6 @@ export class AdminService {
     return map;
   }
 
-  // 이전 스냅샷과 현재 값을 비교하여 CPU 사용률(%)을 계산하는 메서드
   private calculateCpuUsage(current: Map<string, number>): number {
     let totalDelta = 0;
     let idleDelta = 0;
@@ -79,12 +136,10 @@ export class AdminService {
       if (!key.startsWith('node_cpu_seconds_total')) {
         continue;
       }
-
       const prev = this.prevCpuSnapshot.get(key);
       if (prev === undefined) {
-        continue; // 최초 실행 시에는 Delta를 계산할 수 없음
+        continue;
       }
-
       const delta = value - prev;
       totalDelta += delta;
 
@@ -93,13 +148,9 @@ export class AdminService {
       }
     }
 
-    // 다음 주기 계산을 위해 현재 값을 스냅샷으로 저장
     this.prevCpuSnapshot = new Map(current);
 
-    if (totalDelta <= 0) {
-      return 0; // 최초 실행 시 0 반환
-    }
-
+    if (totalDelta <= 0) return 0;
     return (1 - idleDelta / totalDelta) * 100;
   }
 
@@ -149,23 +200,18 @@ export class AdminService {
     return null; 
   }
 
-  // 매 1시간마다 DBaaS 서버의 메트릭 정보를 수집하는 스케줄러 (매 정시 0분에 실행)
   @Cron('0 * * * *', { timeZone: 'Asia/Seoul' })
-  //@Cron('* * * * *', { timeZone: 'Asia/Seoul' }) // Test
   async collectDbaasMetrics() {
     this.logger.log('Starting DBaaS metrics collection...');
     
-    // IP 주소 오타 수정 반영
     const targetIp = '10.172.122.198';
     const url = `http://${targetIp}:9100/metrics`;
     const serverId = 'dbaas_db_server';
 
     try {
-      // 1. 메트릭 데이터 가져오기 및 파싱
       const metricsText = await this.fetchPrometheusMetrics(url);
       const map = this.parseMetrics(metricsText);
 
-      // 2. Memory Usage 계산
       const memTotal = map.get('node_memory_MemTotal_bytes') ?? 0;
       const memAvailable = map.get('node_memory_MemAvailable_bytes') ?? 0;
       let memoryUsagePct = 0;
@@ -173,11 +219,9 @@ export class AdminService {
         memoryUsagePct = ((memTotal - memAvailable) / memTotal) * 100;
       }
 
-      // 3. Disk Usage (/data1 기준) 계산
       let diskSize = 0;
       let diskAvail = 0;
       
-      // 고정된 디바이스명이 아니라 mountpoint 기준 동적 탐색
       for (const [key, value] of map.entries()) {
         if (key.startsWith('node_filesystem_size_bytes') && key.includes('mountpoint="/data1"')) {
           diskSize = value;
@@ -192,10 +236,8 @@ export class AdminService {
         diskUsagePct = ((diskSize - diskAvail) / diskSize) * 100;
       }
 
-      // 4. CPU Usage 계산
       const cpuUsage = this.calculateCpuUsage(map);
 
-      // 5. DB 적재 (ServerMetric 테이블)
       await (this.prisma as any).serverMetric.create({
         data: {
           serverId: serverId,
@@ -350,7 +392,7 @@ export class AdminService {
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
-        'dbaas_db_server': { name: 'DBaaS DB Server', cpu: 4, memory: 8, disk: 4000, order: 3 },
+        'dbaas_db_server': { name: 'DBaaS DB Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
         'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 4 },
         'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
@@ -707,20 +749,16 @@ export class AdminService {
       const mYear = kstNow.getUTCFullYear();
       const mMonth = kstNow.getUTCMonth();
 
-      // 기본 12개월 전 (최대 조회 범위)
       const defaultStartDate = new Date(Date.UTC(mYear, mMonth - 11, 1));
       const monthlyEndDate = new Date(Date.UTC(mYear, mMonth + 1, 0, 23, 59, 59, 999));
 
-      // DB에서 실제로 저장된 가장 오래된 날짜 조회
       const oldestRecord = await this.prisma.sysStorageHistory.findFirst({
         orderBy: { checkDate: 'asc' },
         select: { checkDate: true }
       });
 
-      // 실제 표시 시작 월 결정 (가장 오래된 데이터 월이 12개월 이내면 그 달부터, 아니면 12개월 전부터)
       let displayStartDate = defaultStartDate;
       if (!oldestRecord) {
-        // 데이터가 아예 없으면 당월만 표시
         displayStartDate = new Date(Date.UTC(mYear, mMonth, 1));
       } else if (oldestRecord.checkDate > defaultStartDate) {
         const oYear = oldestRecord.checkDate.getUTCFullYear();
@@ -733,7 +771,6 @@ export class AdminService {
         orderBy: { checkDate: 'asc' }
       });
 
-      // displayStartDate 이전까지의 누적 용량 선계산
       const mPrevObjSum = await this.prisma.sysStorageHistory.aggregate({
         _sum: { sizeBytes: true },
         where: { storageType: 'FILE', checkDate: { lt: displayStartDate } }
@@ -748,7 +785,6 @@ export class AdminService {
 
       const mDateMap = new Map<string, { dbMB: number, objMB: number }>();
 
-      // displayStartDate 부터 당월까지 동적으로 Map 초기화
       let currentMonthCursor = new Date(displayStartDate.getTime());
       const endMonthTime = new Date(Date.UTC(mYear, mMonth, 1)).getTime();
 
@@ -756,7 +792,6 @@ export class AdminService {
         const yyyy = currentMonthCursor.getUTCFullYear();
         const mm = String(currentMonthCursor.getUTCMonth() + 1).padStart(2, '0');
         mDateMap.set(`${yyyy}-${mm}`, { dbMB: 0, objMB: 0 });
-        
         currentMonthCursor.setUTCMonth(currentMonthCursor.getUTCMonth() + 1);
       }
 
