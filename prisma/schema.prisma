@@ -34,7 +34,6 @@ model RefEquipment {
   agentStatus AgentStatus?
   itmInfo    ItmInfo?
   cfgServer  CfgServer?
-
   plgErrors  PlgError[]
   eqpPerfs   EqpPerf[]
   lampLifes  EqpLampLife[]
@@ -250,7 +249,6 @@ model RefAccessCode {
   @@map("ref_access_code")
 }
 
-// [추가됨] 예외 접근 허용 사내 직원 관리 테이블
 model CfgUserException {
   loginId      String   @id @map("login_id") @db.VarChar(50)
   deptCode     String?  @map("dept_code") @db.VarChar(50)
@@ -481,6 +479,7 @@ model SysAgentVersion {
   fileSize64      String?  @map("file_size_64") @db.VarChar(50)
   fileSizeLegacy  String?  @map("file_size_legacy") @db.VarChar(50)
   fileSizeProxy   String?  @map("file_size_proxy") @db.VarChar(50) 
+  proxyVersion    String?  @map("proxy_version") @db.VarChar(50)   // [추가됨] Proxy 유틸리티 버전
   createdAt       DateTime @default(now()) @map("created_at") @db.Timestamp(0)
   is_visible_y    String   @default("Y") @db.VarChar(1) 
 
@@ -533,7 +532,6 @@ model SysEasterEgg {
   userId     String   @map("user_id") @db.VarChar(50)
   eggType    String   @map("egg_type") @db.VarChar(50)
   score      Int      @default(0)
-  // [수정됨] db.Timestamptz(6) -> db.Timestamp(0)
   createdAt  DateTime @default(now()) @map("created_at") @db.Timestamp(0)
   achievedAt DateTime @default(now()) @map("achieved_at") @db.Timestamp(0)
 
@@ -542,7 +540,6 @@ model SysEasterEgg {
   @@index([eggType, userId])
 }
 
-// 기존 모델들 아래에 추가
 model ServerMetric {
   id        Int      @id @default(autoincrement())
   serverId  String   // 예: 'web-01', 'api-01', 'db-01'
@@ -551,11 +548,9 @@ model ServerMetric {
   disk      Float    // 디스크 사용률 (%)
   createdAt DateTime @default(now()) // 기록된 시간
 
-  // 서버별, 시간별 빠른 조회를 위해 인덱스 생성
   @@index([serverId, createdAt])
 }
 
-/// 시스템 전역 환경설정 및 점검 모드 플래그 관리 테이블
 model cfg_system_config {
   config_key   String   @id @db.VarChar(50)
   config_value String   @db.VarChar(255)
