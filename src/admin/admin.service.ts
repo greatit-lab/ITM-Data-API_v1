@@ -466,10 +466,54 @@ export class AdminService {
   async updateAccessCode(deptid: string, data: any) { return this.prisma.refAccessCode.update({ where: { deptid }, data: { compid: data.compid, compName: data.compName, deptName: data.deptName, description: data.description, isActive: data.isActive, updatedAt: this.getKstDate() } }); }
   async deleteAccessCode(deptid: string) { return this.prisma.refAccessCode.delete({ where: { deptid } }); }
   async getAllGuests() { return this.prisma.cfgGuestAccess.findMany({ orderBy: { createdAt: 'desc' } }); }
-  async addGuest(data: any) { return this.prisma.cfgGuestAccess.create({ data: { loginId: data.loginId, deptCode: data.deptCode, deptName: data.deptName, reason: data.reason, validUntil: new Date(data.validUntil), grantedRole: 'GUEST', createdAt: this.getKstDate() } }); }
+  
+  // 🌟 [수정된 부분] 수동 등록 시 프론트엔드에서 전달된 grantedRole 파라미터를 동적으로 받도록 수정
+  async addGuest(data: any) { 
+      return this.prisma.cfgGuestAccess.create({ 
+          data: { 
+              loginId: data.loginId, 
+              deptCode: data.deptCode, 
+              deptName: data.deptName, 
+              reason: data.reason, 
+              validUntil: new Date(data.validUntil), 
+              grantedRole: data.grantedRole || 'GUEST', // 'GUEST' 하드코딩 제거, 동적 맵핑
+              createdAt: this.getKstDate() 
+          } 
+      }); 
+  }
+  
   async deleteGuest(loginId: string) { return this.prisma.cfgGuestAccess.delete({ where: { loginId } }); }
   async getGuestRequests() { return this.prisma.cfgGuestRequest.findMany({ orderBy: { createdAt: 'desc' } }); }
-  async approveGuestRequest(reqId: number, approverId: string) { const request = await this.prisma.cfgGuestRequest.findUnique({ where: { reqId } }); if (!request) throw new NotFoundException('Request not found'); const kstNow = this.getKstDate(); const validUntil = new Date(kstNow.getTime()); validUntil.setDate(validUntil.getDate() + 30); return this.prisma.$transaction(async (tx) => { await tx.cfgGuestRequest.update({ where: { reqId }, data: { status: 'APPROVED', processedBy: approverId, processedAt: kstNow } }); return tx.cfgGuestAccess.upsert({ where: { loginId: request.loginId }, update: { validUntil: validUntil, reason: request.reason, grantedRole: 'GUEST' }, create: { loginId: request.loginId, deptCode: request.deptCode, deptName: request.deptName, reason: request.reason, grantedRole: 'GUEST', validUntil: validUntil, createdAt: kstNow }, }); }); }
+  
+  // 🌟 [수정된 부분] 게스트 승인 시 Controller에서 전달되는 Body 페이로드 객체 구조에 맞춰 grantedRole 파싱 및 수정
+  async approveGuestRequest(reqId: number, payload: any) { 
+      const request = await this.prisma.cfgGuestRequest.findUnique({ where: { reqId } }); 
+      if (!request) throw new NotFoundException('Request not found'); 
+      
+      const approverId = typeof payload === 'string' ? payload : payload?.approverId;
+      const grantedRole = payload?.grantedRole || 'GUEST'; // 'GUEST' 하드코딩 제거
+      
+      const kstNow = this.getKstDate(); 
+      let validUntil = new Date(kstNow.getTime());
+      if (payload?.validUntil) {
+          validUntil = new Date(payload.validUntil);
+      } else {
+          validUntil.setDate(validUntil.getDate() + 30);
+      }
+
+      return this.prisma.$transaction(async (tx) => { 
+          await tx.cfgGuestRequest.update({ 
+              where: { reqId }, 
+              data: { status: 'APPROVED', processedBy: approverId, processedAt: kstNow } 
+          }); 
+          return tx.cfgGuestAccess.upsert({ 
+              where: { loginId: request.loginId }, 
+              update: { validUntil: validUntil, reason: request.reason, grantedRole: grantedRole }, // 하드코딩 제거
+              create: { loginId: request.loginId, deptCode: request.deptCode, deptName: request.deptName, reason: request.reason, grantedRole: grantedRole, validUntil: validUntil, createdAt: kstNow }, // 하드코딩 제거
+          }); 
+      }); 
+  }
+
   async rejectGuestRequest(reqId: number, rejectorId: string) { return this.prisma.cfgGuestRequest.update({ where: { reqId }, data: { status: 'REJECTED', processedBy: rejectorId, processedAt: this.getKstDate() } }); }
   async getSeverities() { return this.prisma.errSeverityMap.findMany(); }
   async addSeverity(data: any) { return this.prisma.errSeverityMap.create({ data: { errorId: data.errorId, severity: data.severity } }); }
