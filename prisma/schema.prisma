@@ -2,7 +2,7 @@
 
 generator client {
   provider = "prisma-client-js"
-  binaryTargets = ["native", "windows"]
+  binaryTargets = ["native", "windows"] // Windows 환경 명시
 }
 
 datasource db {
@@ -253,12 +253,9 @@ model CfgUserException {
   loginId      String   @id @map("login_id") @db.VarChar(50)
   deptCode     String?  @map("dept_code") @db.VarChar(50)
   deptName     String?  @map("dept_name") @db.VarChar(100)
-  
-  // [신규 추가] 예외 사용자도 VIEWER/USER 구분을 위해 부여 권한 저장
-  grantedRole  String   @default("USER") @map("granted_role") @db.VarChar(20)
-  
   isActive     String   @default("Y") @map("is_active") @db.Char(1)
   registeredBy String?  @map("registered_by") @db.VarChar(50)
+  
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamp(0)
 
   @@map("cfg_user_exception")
@@ -307,6 +304,7 @@ model CfgGuestAccess {
   deptCode     String?   @map("dept_code") @db.VarChar(50)
   deptName     String?   @map("dept_name") @db.VarChar(100)
   
+  // NOTE: GUEST 외에 VIEWER 등 제한권한이 문자열로 들어갈 수 있습니다.
   grantedRole String    @default("GUEST") @map("granted_role") @db.VarChar(20)
   reason      String?   @db.VarChar(100)
 
