@@ -392,7 +392,7 @@ export class AdminService {
       const SERVER_SPECS: Record<string, { name: string; cpu: number; memory: number; disk: number; order: number }> = {
         'web-server': { name: 'Web Server', cpu: 8, memory: 32, disk: 100, order: 1 },
         'api-server': { name: 'API Server', cpu: 8, memory: 32, disk: 100, order: 2 },
-        'dbaas_db_server': { name: 'DBaaS DB Server', cpu: 12, memory: 64, disk: 4000, order: 3 },
+        'dbaas_db_server': { name: 'DBaaS DB Server', cpu: 4, memory: 8, disk: 4000, order: 3 },
         'db-storage-server': { name: 'DB & Storage Server', cpu: 12, memory: 64, disk: 4000, order: 4 },
         'default': { name: 'Unknown Server', cpu: 4, memory: 16, disk: 200, order: 99 }
       };
