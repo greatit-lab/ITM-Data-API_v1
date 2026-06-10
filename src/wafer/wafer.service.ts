@@ -358,7 +358,7 @@ export class WaferService {
         startDate,
         endDate: end.isBefore(liveCutoff) ? end.toDate() : liveCutoff.toDate(),
       });
-
+    }
 
     if (end.isAfter(liveCutoff)) {
       const liveStart = start.isAfter(liveCutoff) ? start : liveCutoff;
@@ -855,7 +855,7 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      const tableName = await this.resolveSpectrumTableName({ ts }, dbClient);
+      const tableName = await this.resolveSpectrumTableName({ ...params, ts }, dbClient);
 
       const results = (await dbClient.$queryRawUnsafe(
         `SELECT "wavelengths", "values" 
@@ -1241,7 +1241,7 @@ export class WaferService {
 
     try {
       const targetDate = this.parseSafeDate(ts);
-      const tableName = await this.resolveSpectrumTableName({ ts }, dbClient);
+      const tableName = await this.resolveSpectrumTableName({ ...params, ts }, dbClient);
 
       const results = (await dbClient.$queryRawUnsafe(
         `SELECT "class", "wavelengths", "values" 
@@ -1617,7 +1617,7 @@ export class WaferService {
       const targetWaferId = bestData[0].waferid;
       const targetTs = bestData[0].datetime;
 
-      const tableName = await this.resolveSpectrumTableName({ ts: targetTs }, dbClient);
+      const tableName = await this.resolveSpectrumTableName({ ...params, ts: targetTs }, dbClient);
 
       const spectrumSql = `
             SELECT wavelengths, "values" 
