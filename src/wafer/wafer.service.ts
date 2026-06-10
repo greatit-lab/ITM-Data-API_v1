@@ -112,6 +112,13 @@ interface OpticalTrendRawResult {
   values: number[];
 }
 
+interface WaferFlatQuerySource {
+  schemaName: 'public' | 'archive_fdw';
+  tableName: string;
+  startDate: Date;
+  endDate: Date;
+}
+
 @Injectable()
 export class WaferService {
   private readonly logger = new Logger(WaferService.name);
@@ -122,9 +129,9 @@ export class WaferService {
   ) {}
 
   // =========================================================================
-  // DB 연결 클라이언트(VM vs DBaaS)와 대상 테이블(월별 UNION) 동시 결정 라우터
+  // [기존 유지] 스마트 라우팅 및 3단계 검증 로직
   // =========================================================================
-  private getRouteAndTableExpr(params: WaferQueryParams): { client: any; tableExpr: string; isArchive: boolean } {
+  private determineDatabaseRoute(params: WaferQueryParams): { client: any, isArchive: boolean } {
     const thresholdMonths = Number(process.env.ARCHIVE_MONTHS_THRESHOLD || 2);
     const maxArchiveDays = Number(process.env.ARCHIVE_MAX_SEARCH_DAYS || 31);
     const now = dayjs();
@@ -146,55 +153,40 @@ export class WaferService {
     const isStartInArchive = start.isBefore(boundaryDate);
     const isEndInArchive = end.isBefore(boundaryDate);
 
-    // [Zone C] 라이브와 아카이브 구간 교차 조회 제한
     if (isStartInArchive && !isEndInArchive && !params.lotId) {
       throw new BadRequestException(
         `라이브 데이터와 아카이브 데이터 구간을 교차하여 조회할 수 없습니다. (아카이브 기준일: ${boundaryDate.format('YYYY-MM-DD')})`
       );
     }
 
-    // [Zone B] DBaaS 아카이브 DB 라우팅 및 월별 파티션 동적 생성
     if (isStartInArchive && isEndInArchive) {
       const diffDays = end.diff(start, 'day');
+
       if (diffDays > maxArchiveDays && !params.lotId && !params.ts && !params.dateTime && !params.servTs) {
         throw new BadRequestException(
           `아카이브 데이터는 DB 리소스 보호를 위해 최대 ${maxArchiveDays}일까지만 동시 조회가 가능합니다.`
         );
       }
 
-      let tables: string[] = [];
-      let currentMonth = start.startOf('month');
-      const endMonth = end.startOf('month');
-
-      while (currentMonth.toDate() <= endMonth.toDate()) {
-        const yyyy = currentMonth.format('YYYY');
-        const mm = currentMonth.format('MM');
-        tables.push(`SELECT * FROM public.plg_wf_flat_y${yyyy}m${mm}`);
-        currentMonth = currentMonth.add(1, 'month');
-      }
-
-      let tableExpr = tables.length > 0 ? `(${tables.join(' UNION ALL ')})` : 'public.plg_wf_flat';
-
-      return { client: this.archivePrisma, tableExpr, isArchive: true };
+      return { client: this.archivePrisma, isArchive: true };
     }
 
-    // [Zone A] VM 라이브 DB 라우팅
-    return { client: this.prisma, tableExpr: 'public.plg_wf_flat', isArchive: false };
+    return { client: this.prisma, isArchive: false };
   }
 
   private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
     const now = new Date();
-    
+
     let startDate = start ? new Date(start) : new Date();
     if (isNaN(startDate.getTime()) || !start) {
-        startDate = new Date();
-        startDate.setDate(startDate.getDate() - 7);
+      startDate = new Date();
+      startDate.setDate(startDate.getDate() - 7);
     }
     startDate.setHours(0, 0, 0, 0);
 
     let endDate = end ? new Date(end) : now;
     if (isNaN(endDate.getTime())) {
-        endDate = now;
+      endDate = now;
     }
     endDate.setHours(23, 59, 59, 999);
 
@@ -204,11 +196,210 @@ export class WaferService {
   private parseSafeDate(dateVal: string | Date | undefined): Date {
     if (!dateVal) return new Date();
     if (dateVal instanceof Date) return dateVal;
-    
+
     const cleanStr = String(dateVal).replace(/\+/g, ' ');
     return new Date(cleanStr);
   }
 
+  // =========================================================================
+  // [추가] Wafer Flat Data Live + archive_fdw 조회용 Helper
+  // =========================================================================
+  private quoteIdentifier(value: string): string {
+    return `"${value.replace(/"/g, '""')}"`;
+  }
+
+  private buildPlgWfFlatMonthTableName(date: dayjs.Dayjs): string {
+    return `plg_wf_flat_y${date.format('YYYY')}m${date.format('MM')}`;
+  }
+
+  private addSqlParam(params: unknown[], value: unknown): string {
+    params.push(value);
+    return `$${params.length}`;
+  }
+
+  private getWaferFlatLiveCutoff(): dayjs.Dayjs {
+    /*
+      오늘 + 어제 데이터는 VM DB public.plg_wf_flat에서 조회.
+      그 이전 데이터는 VM DB archive_fdw.plg_wf_flat_yYYYYmMM에서 조회.
+    */
+    return dayjs().startOf('day').subtract(1, 'day');
+  }
+
+  private buildWaferFlatMonthRanges(
+    start: dayjs.Dayjs,
+    end: dayjs.Dayjs,
+  ): Array<{ start: dayjs.Dayjs; end: dayjs.Dayjs }> {
+    const ranges: Array<{ start: dayjs.Dayjs; end: dayjs.Dayjs }> = [];
+
+    let cursor = start.startOf('month');
+
+    while (cursor.isBefore(end)) {
+      const monthStart = cursor;
+      const monthEnd = cursor.add(1, 'month');
+
+      const rangeStart = monthStart.isBefore(start) ? start : monthStart;
+      const rangeEnd = monthEnd.isAfter(end) ? end : monthEnd;
+
+      if (rangeStart.isBefore(rangeEnd)) {
+        ranges.push({
+          start: rangeStart,
+          end: rangeEnd,
+        });
+      }
+
+      cursor = cursor.add(1, 'month');
+    }
+
+    return ranges;
+  }
+
+  private buildWaferFlatQuerySources(
+    startDate: Date,
+    endDate: Date,
+  ): WaferFlatQuerySource[] {
+    const start = dayjs(startDate);
+    const end = dayjs(endDate);
+    const liveCutoff = this.getWaferFlatLiveCutoff();
+
+    const sources: WaferFlatQuerySource[] = [];
+
+    if (start.isBefore(liveCutoff)) {
+      const archiveStart = start;
+      const archiveEnd = end.isBefore(liveCutoff) ? end : liveCutoff;
+      const monthRanges = this.buildWaferFlatMonthRanges(archiveStart, archiveEnd);
+
+      for (const range of monthRanges) {
+        sources.push({
+          schemaName: 'archive_fdw',
+          tableName: this.buildPlgWfFlatMonthTableName(range.start),
+          startDate: range.start.toDate(),
+          endDate: range.end.toDate(),
+        });
+      }
+    }
+
+    if (end.isAfter(liveCutoff)) {
+      const liveStart = start.isAfter(liveCutoff) ? start : liveCutoff;
+
+      sources.push({
+        schemaName: 'public',
+        tableName: 'plg_wf_flat',
+        startDate: liveStart.toDate(),
+        endDate: end.toDate(),
+      });
+    }
+
+    return sources;
+  }
+
+  private buildWaferFlatFilterSql(
+    queryParams: unknown[],
+    filters: {
+      eqpId?: string;
+      lotId?: string;
+      waferId?: string | number;
+      cassetteRcp?: string;
+      stageRcp?: string;
+      stageGroup?: string;
+      film?: string;
+    },
+  ): string {
+    const conditions: string[] = [];
+
+    if (filters.eqpId) {
+      conditions.push(`eqpid = ${this.addSqlParam(queryParams, filters.eqpId)}`);
+    }
+
+    if (filters.lotId) {
+      conditions.push(`lotid ILIKE ${this.addSqlParam(queryParams, `%${filters.lotId}%`)}`);
+    }
+
+    if (filters.waferId !== undefined && filters.waferId !== null && String(filters.waferId).trim() !== '') {
+      conditions.push(`waferid = ${this.addSqlParam(queryParams, Number(filters.waferId))}`);
+    }
+
+    if (filters.cassetteRcp) {
+      conditions.push(`cassettercp = ${this.addSqlParam(queryParams, filters.cassetteRcp)}`);
+    }
+
+    if (filters.stageRcp) {
+      conditions.push(`stagercp = ${this.addSqlParam(queryParams, filters.stageRcp)}`);
+    }
+
+    if (filters.stageGroup) {
+      conditions.push(`stagegroup = ${this.addSqlParam(queryParams, filters.stageGroup)}`);
+    }
+
+    if (filters.film) {
+      conditions.push(`film = ${this.addSqlParam(queryParams, filters.film)}`);
+    }
+
+    if (conditions.length === 0) {
+      return '';
+    }
+
+    return ` AND ${conditions.join(' AND ')}`;
+  }
+
+  private buildWaferFlatUnionSql(
+    sources: WaferFlatQuerySource[],
+    queryParams: unknown[],
+    filters: {
+      eqpId?: string;
+      lotId?: string;
+      waferId?: string | number;
+      cassetteRcp?: string;
+      stageRcp?: string;
+      stageGroup?: string;
+      film?: string;
+    },
+  ): string {
+    if (sources.length === 0) {
+      return `
+        SELECT
+          eqpid,
+          lotid,
+          waferid,
+          cassettercp,
+          stagercp,
+          stagegroup,
+          film,
+          serv_ts,
+          datetime
+        FROM public.plg_wf_flat
+        WHERE 1 = 0
+      `;
+    }
+
+    return sources
+      .map((source) => {
+        const schemaName = this.quoteIdentifier(source.schemaName);
+        const tableName = this.quoteIdentifier(source.tableName);
+
+        const startParam = this.addSqlParam(queryParams, source.startDate);
+        const endParam = this.addSqlParam(queryParams, source.endDate);
+        const filterSql = this.buildWaferFlatFilterSql(queryParams, filters);
+
+        return `
+          SELECT
+            eqpid,
+            lotid,
+            waferid,
+            cassettercp,
+            stagercp,
+            stagegroup,
+            film,
+            serv_ts,
+            datetime
+          FROM ${schemaName}.${tableName}
+          WHERE serv_ts >= ${startParam}
+            AND serv_ts <  ${endParam}
+            ${filterSql}
+        `;
+      })
+      .join('\nUNION ALL\n');
+  }
+  
   private async resolveSpectrumTableName(params: { eqpId?: string, lotId?: string, endDate?: string | Date, ts?: string | Date }, dbClient: any): Promise<string> {
     let targetDate = new Date();
     
