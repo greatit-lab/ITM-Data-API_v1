@@ -16,13 +16,12 @@ dayjs.extend(utc);
 
 @Injectable()
 export class PerformanceService implements OnModuleInit, OnModuleDestroy {
-  // [변경] 외부 pg 모듈 대신 이미 검증된 PrismaClient를 재활용하여 DBaaS 전용 인스턴스 생성
+  // DBaaS 아카이브 전용 독립 커넥션 풀
   private archivePrisma: PrismaClient;
 
   constructor(private prisma: PrismaService) {}
 
   onModuleInit() {
-    // 환경변수(.env)의 DBaaS 접속 정보를 사용하여 독립적인 커넥션 풀 생성
     this.archivePrisma = new PrismaClient({
       datasources: {
         db: {
@@ -42,6 +41,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
     return dayjs.utc(dateStr).toDate();
   }
 
+  // 오늘, 전일 뺀 나머지 = 어제 자정 이전
   private getCutoffDate(): Date {
     return dayjs().startOf('day').subtract(1, 'day').toDate();
   }
@@ -78,7 +78,6 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
 
     const eqpIdList = eqpids ? eqpids.split(',') : [];
 
-    // [최적화] 통합 쿼리 생성기 (Prisma $queryRawUnsafe 파라미터 매핑 지원)
     const buildQuery = (tableName: string, tStart: Date, tEnd: Date) => {
       let params: any[] = [tStart, tEnd];
       let eqpFilterSql = '';
@@ -110,6 +109,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
     
     let archivePromise = Promise.resolve([] as any[]);
 
+    // [라우팅 1] DBaaS 직접 조회 (eqp_perf_archive)
     if (startDt < cutoffDate) {
       const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
       const { sql, params } = buildQuery('public.eqp_perf_archive', startDt, endPastDt);
@@ -120,6 +120,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    // [라우팅 2] 최신 데이터 로컬 조회 (eqp_perf)
     if (endDt >= cutoffDate) {
       const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
       const { sql, params } = buildQuery('public.eqp_perf', recentStartDt, endDt);
@@ -150,7 +151,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
 
 
   // =========================================================================
-  // 2. 프로세스 메모리 내역 (Process History)
+  // 2. 프로세스 메모리 내역 (Process History) - DBaaS 연결 개선
   // =========================================================================
   async getProcessHistory(
     startDate: string,
@@ -184,6 +185,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
 
     let archivePromise = Promise.resolve([] as any[]);
 
+    // [라우팅 1] DBaaS 직접 조회 (eqp_proc_perf_archive)
     if (startDt < cutoffDate) {
       const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
       const { sql, params } = buildQuery('public.eqp_proc_perf_archive', startDt, endPastDt);
@@ -194,6 +196,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    // [라우팅 2] 최신 데이터 로컬 조회 (eqp_proc_perf)
     if (endDt >= cutoffDate) {
       const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
       const { sql, params } = buildQuery('public.eqp_proc_perf', recentStartDt, endDt);
@@ -219,7 +222,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
 
 
   // =========================================================================
-  // 3. ITM Agent 트렌드
+  // 3. ITM Agent 트렌드 - DBaaS 연결 개선
   // =========================================================================
   async getItmAgentTrend(
     site: string,
@@ -282,6 +285,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
 
     let archivePromise = Promise.resolve([] as any[]);
 
+    // [라우팅 1] DBaaS 직접 조회 (eqp_proc_perf_archive)
     if (startDt < cutoffDate) {
       const endPastDt = endDt < cutoffDate ? endDt : new Date(cutoffDate.getTime() - 1);
       const { sql, params } = buildQuery('public.eqp_proc_perf_archive', startDt, endPastDt);
@@ -292,6 +296,7 @@ export class PerformanceService implements OnModuleInit, OnModuleDestroy {
       });
     }
 
+    // [라우팅 2] 최신 데이터 로컬 조회 (eqp_proc_perf)
     if (endDt >= cutoffDate) {
       const recentStartDt = startDt > cutoffDate ? startDt : cutoffDate;
       const { sql, params } = buildQuery('public.eqp_proc_perf', recentStartDt, endDt);
