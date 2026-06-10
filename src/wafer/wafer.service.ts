@@ -399,21 +399,20 @@ export class WaferService {
       })
       .join('\nUNION ALL\n');
   }
-  
+
   private async resolveSpectrumTableName(params: { eqpId?: string, lotId?: string, endDate?: string | Date, ts?: string | Date }, dbClient: any): Promise<string> {
     let targetDate = new Date();
-    
+
     if (params.ts) {
       targetDate = this.parseSafeDate(params.ts);
-    } 
+    }
     else if (params.lotId && params.eqpId) {
       try {
-        const res = (await dbClient.$queryRawUnsafe(
+        const res = await dbClient.$queryRawUnsafe(
           `SELECT MAX(serv_ts) as max_ts FROM public.plg_wf_flat WHERE TRIM(eqpid) = TRIM($1) AND TRIM(lotid) = TRIM($2)`,
           params.eqpId, params.lotId
-        )) as any[];
-        
-        if (res && res.length > 0 && res[0]?.max_ts) {
+        );
+        if (res[0]?.max_ts) {
           targetDate = new Date(res[0].max_ts);
         } else if (params.endDate) {
           targetDate = this.parseSafeDate(params.endDate);
@@ -421,7 +420,7 @@ export class WaferService {
       } catch(e) {
         if (params.endDate) targetDate = this.parseSafeDate(params.endDate);
       }
-    } 
+    }
     else if (params.endDate) {
       targetDate = this.parseSafeDate(params.endDate);
     }
@@ -434,23 +433,22 @@ export class WaferService {
     const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
 
     try {
-      const tableExists = (await dbClient.$queryRawUnsafe(
+      const tableExists = await dbClient.$queryRawUnsafe(
         `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
         partTable
-      )) as any[];
-      
-      if (tableExists && tableExists.length > 0 && (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true')) {
+      );
+      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
         return `public.${partTable}`;
       }
     } catch(e) {}
-    
+
     return 'public.plg_onto_spectrum';
   }
 
   private async checkSpectrumExists(
-    eqpId: string, 
-    lotId: string, 
-    waferId: string | number, 
+    eqpId: string,
+    lotId: string,
+    waferId: string | number,
     dateVal: string | Date,
     dbClient: any
   ): Promise<boolean> {
@@ -469,23 +467,23 @@ export class WaferService {
             AND "waferid"::integer = $3
         ) as "exists"
       `;
-      const mainResult = (await dbClient.$queryRawUnsafe(mainSql, safeEqp, safeLot, safeWafer)) as any[];
-      if (mainResult && mainResult.length > 0 && (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true')) return true;
+      const mainResult = await dbClient.$queryRawUnsafe(mainSql, safeEqp, safeLot, safeWafer);
+      if (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true') return true;
 
       if (!dateVal) return false;
-      const targetDate = this.parseSafeDate(dateVal); 
+      const targetDate = this.parseSafeDate(dateVal);
       if (isNaN(targetDate.getTime())) return false;
 
       const yy = dayjs(targetDate).format('YYYY');
       const mm = dayjs(targetDate).format('MM');
       const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
-      
-      const tableExists = (await dbClient.$queryRawUnsafe(
+
+      const tableExists = await dbClient.$queryRawUnsafe(
         `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
         partTable
-      )) as any[];
+      );
 
-      if (tableExists && tableExists.length > 0 && (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true')) {
+      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
         const partSql = `
           SELECT EXISTS(
             SELECT 1 FROM public.${partTable}
@@ -494,12 +492,12 @@ export class WaferService {
               AND "waferid"::integer = $3
           ) as "exists"
         `;
-        const partResult = (await dbClient.$queryRawUnsafe(partSql, safeEqp, safeLot, safeWafer)) as any[];
-        return partResult && partResult.length > 0 && (partResult[0]?.exists === true || partResult[0]?.exists === 'true');
+        const partResult = await dbClient.$queryRawUnsafe(partSql, safeEqp, safeLot, safeWafer);
+        return partResult[0]?.exists === true || partResult[0]?.exists === 'true';
       }
 
       return false;
-      
+
     } catch (error) {
       this.logger.warn(`Spectrum check failed for ${eqpId}-${lotId}:`, error);
       return false;
@@ -510,8 +508,25 @@ export class WaferService {
     column: string,
     params: WaferQueryParams,
   ): Promise<string[]> {
-    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
-    const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } = params;
+    /*
+      개선 사항:
+      - Wafer Flat Data 필터 옵션 조회도 VM DB 기준으로 실행
+      - 오늘/어제: public.plg_wf_flat
+      - 그 이전: archive_fdw.plg_wf_flat_yYYYYmMM
+      - determineDatabaseRoute()를 사용하지 않아 Archive 31일 제한에 걸리지 않음
+    */
+    const dbClient = this.prisma;
+
+    const {
+      eqpId,
+      lotId,
+      cassetteRcp,
+      stageRcp,
+      stageGroup,
+      film,
+      startDate,
+      endDate,
+    } = params;
 
     let colName = column;
 
@@ -522,48 +537,106 @@ export class WaferService {
     if (column === 'films') colName = 'film';
     if (column === 'waferids') colName = 'waferid';
 
-    let whereClause = `WHERE 1=1`;
-    const queryParams: (string | number | Date)[] = [];
-
-    if (eqpId) {
-      whereClause += ` AND eqpid = $${queryParams.length + 1}`;
-      queryParams.push(eqpId);
-    }
-    if (lotId && colName !== 'lotid') {
-      whereClause += ` AND lotid = $${queryParams.length + 1}`;
-      queryParams.push(lotId);
-    }
-    if (cassetteRcp && colName !== 'cassettercp') {
-      whereClause += ` AND cassettercp = $${queryParams.length + 1}`;
-      queryParams.push(cassetteRcp);
-    }
-    if (stageGroup && colName !== 'stagegroup') {
-      whereClause += ` AND stagegroup = $${queryParams.length + 1}`;
-      queryParams.push(stageGroup);
-    }
-    if (film && colName !== 'film') {
-      whereClause += ` AND film = $${queryParams.length + 1}`;
-      queryParams.push(film);
+    const allowedColumns = new Set([
+      'eqpid',
+      'lotid',
+      'waferid',
+      'cassettercp',
+      'stagercp',
+      'stagegroup',
+      'film',
+      'point',
+    ]);
+    
+     if (!allowedColumns.has(colName)) {
+      this.logger.warn(`[WaferFlatData] Invalid distinct column requested: ${column}`);
+      return [];
     }
 
-    if (!lotId && startDate && endDate) {
-      const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
-      whereClause += ` AND serv_ts >= $${queryParams.length + 1} AND serv_ts <= $${queryParams.length + 2}`;
-      queryParams.push(s, e);
+    const safeStartDate = startDate
+      ? dayjs(startDate).startOf('day').toDate()
+      : dayjs().subtract(7, 'day').startOf('day').toDate();
+
+    const exclusiveEndDate = endDate
+      ? dayjs(endDate).add(1, 'day').startOf('day').toDate()
+      : dayjs().add(1, 'day').startOf('day').toDate();
+
+    const sources = this.buildWaferFlatQuerySources(safeStartDate, exclusiveEndDate);
+
+    const queryParams: unknown[] = [];
+
+    const unionParts = sources.map((source) => {
+      const schemaName = this.quoteIdentifier(source.schemaName);
+      const tableName = this.quoteIdentifier(source.tableName);
+
+      const startParam = this.addSqlParam(queryParams, source.startDate);
+      const endParam = this.addSqlParam(queryParams, source.endDate);
+
+      const conditions: string[] = [
+        `serv_ts >= ${startParam}`,
+        `serv_ts < ${endParam}`,
+      ];
+
+      if (eqpId) {
+        conditions.push(`eqpid = ${this.addSqlParam(queryParams, eqpId)}`);
+      }
+
+      if (lotId && colName !== 'lotid') {
+        conditions.push(`lotid ILIKE ${this.addSqlParam(queryParams, `%${lotId}%`)}`);
+      }
+
+      if (cassetteRcp && colName !== 'cassettercp') {
+        conditions.push(`cassettercp = ${this.addSqlParam(queryParams, cassetteRcp)}`);
+      }
+
+      if (stageRcp && colName !== 'stagercp') {
+        conditions.push(`stagercp = ${this.addSqlParam(queryParams, stageRcp)}`);
+      }
+
+      if (stageGroup && colName !== 'stagegroup') {
+        conditions.push(`stagegroup = ${this.addSqlParam(queryParams, stageGroup)}`);
+      }
+
+      if (film && colName !== 'film') {
+        conditions.push(`film = ${this.addSqlParam(queryParams, film)}`);
+      }
+
+      return `
+        SELECT ${this.quoteIdentifier(colName)} AS val
+        FROM ${schemaName}.${tableName}
+        WHERE ${conditions.join(' AND ')}
+          AND ${this.quoteIdentifier(colName)} IS NOT NULL
+      `;
+    });
+
+    if (unionParts.length === 0) {
+      return [];
     }
 
-    const sql = `SELECT DISTINCT "${colName}" as val FROM ${tableExpr} as base_table ${whereClause} ORDER BY "${colName}" DESC LIMIT 5000`;
+    const sql = `
+      WITH UnionData AS (
+        ${unionParts.join('\nUNION ALL\n')}
+      )
+      SELECT DISTINCT val
+      FROM UnionData
+      WHERE val IS NOT NULL
+      ORDER BY val DESC
+      LIMIT 5000
+    `;
 
     try {
-      const result = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
-      if (!result) return [];
+      const result = await dbClient.$queryRawUnsafe(
+        sql,
+        ...queryParams,
+      ) as Array<{ val: unknown }>;
+
       return result
-        .map((r: any) => {
+        .map((r) => {
           if (r.val === null || r.val === undefined) return '';
           if (typeof r.val === 'object') return JSON.stringify(r.val);
           return String(r.val);
         })
-        .filter((v: string) => v !== '');
+        .filter((v) => v !== '');
     } catch (e) {
       this.logger.warn(`Error fetching distinct ${column}:`, e);
       return [];
@@ -571,12 +644,12 @@ export class WaferService {
   }
 
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
-    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
+    const dbClient = this.determineDatabaseRoute(params).client;
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
     let sql = `
       SELECT DISTINCT point
-      FROM ${tableExpr} as base_table
+      FROM public.plg_wf_flat
       WHERE 1=1
     `;
 
