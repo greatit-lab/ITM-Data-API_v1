@@ -119,6 +119,13 @@ interface WaferFlatQuerySource {
   endDate: Date;
 }
 
+interface WaferFlatRoute {
+  client: any;
+  isArchive: boolean;
+  tableExpr: string;
+  spectrumTableExpr: string;
+}
+
 @Injectable()
 export class WaferService {
   private readonly logger = new Logger(WaferService.name);
@@ -129,7 +136,7 @@ export class WaferService {
   ) {}
 
   // =========================================================================
-  // [기존 유지] 스마트 라우팅 및 3단계 검증 로직
+  // 공통 라우팅
   // =========================================================================
   private determineDatabaseRoute(params: WaferQueryParams): { client: any, isArchive: boolean } {
     const thresholdMonths = Number(process.env.ARCHIVE_MONTHS_THRESHOLD || 2);
@@ -202,7 +209,7 @@ export class WaferService {
   }
 
   // =========================================================================
-  // [추가] Wafer Flat Data Live + archive_fdw 조회용 Helper
+  // Wafer Flat Data LIVE / ARCHIVE View Helper
   // =========================================================================
   private quoteIdentifier(value: string): string {
     return `"${value.replace(/"/g, '""')}"`;
@@ -219,10 +226,91 @@ export class WaferService {
 
   private getWaferFlatLiveCutoff(): dayjs.Dayjs {
     /*
-      오늘 + 어제 데이터는 VM DB public.plg_wf_flat에서 조회.
-      그 이전 데이터는 VM DB archive_fdw.plg_wf_flat_yYYYYmMM에서 조회.
+      오늘 + 전일 데이터는 VM DB public.plg_wf_flat에서 조회합니다.
+      전전일 이전 데이터는 DBaaS DB public.v_plg_wf_flat_archive에서 조회합니다.
+
+      예:
+      현재일이 2026-06-10이면
+      - VM 조회 구간: 2026-06-09 00:00:00 이상
+      - DBaaS Archive 조회 구간: 2026-06-09 00:00:00 미만
     */
     return dayjs().startOf('day').subtract(1, 'day');
+  }
+
+  private getWaferFlatRoute(params: WaferQueryParams): WaferFlatRoute {
+    const maxArchiveDays = Number(process.env.ARCHIVE_MAX_SEARCH_DAYS || 31);
+    const liveCutoff = this.getWaferFlatLiveCutoff();
+
+    let start = dayjs().subtract(7, 'day').startOf('day');
+    let end = dayjs().endOf('day');
+
+    if (params.startDate) {
+      start = dayjs(params.startDate);
+    } else if (params.ts) {
+      start = dayjs(params.ts);
+    } else if (params.dateTime) {
+      start = dayjs(params.dateTime);
+    } else if (params.servTs) {
+      start = dayjs(params.servTs);
+    }
+
+    if (params.endDate) {
+      end = dayjs(params.endDate);
+    } else if (params.ts) {
+      end = dayjs(params.ts);
+    } else if (params.dateTime) {
+      end = dayjs(params.dateTime);
+    } else if (params.servTs) {
+      end = dayjs(params.servTs);
+    }
+
+    const isStartArchive = start.isBefore(liveCutoff);
+    const isEndArchive = end.isBefore(liveCutoff);
+
+    if (isStartArchive && !isEndArchive && !params.lotId) {
+      throw new BadRequestException(
+        `라이브 데이터와 아카이브 데이터 구간을 교차하여 조회할 수 없습니다. (Live 기준일: ${liveCutoff.format('YYYY-MM-DD')})`,
+      );
+    }
+
+    if (isStartArchive && isEndArchive) {
+      const diffDays = end.diff(start, 'day');
+
+      if (
+        diffDays > maxArchiveDays &&
+        !params.lotId &&
+        !params.ts &&
+        !params.dateTime &&
+        !params.servTs
+      ) {
+        throw new BadRequestException(
+          `아카이브 데이터는 DB 리소스 보호를 위해 최대 ${maxArchiveDays}일까지만 동시 조회가 가능합니다.`,
+        );
+      }
+
+      return {
+        client: this.archivePrisma,
+        isArchive: true,
+        tableExpr: 'public.v_plg_wf_flat_archive',
+        spectrumTableExpr: 'public.plg_onto_spectrum_archive',
+      };
+    }
+
+    return {
+      client: this.prisma,
+      isArchive: false,
+      tableExpr: 'public.plg_wf_flat',
+      spectrumTableExpr: 'public.plg_onto_spectrum',
+    };
+  }
+
+  private getRouteAndTableExpr(params: WaferQueryParams): {
+    client: any;
+    isArchive: boolean;
+    tableExpr: string;
+    spectrumTableExpr: string;
+  } {
+    return this.getWaferFlatRoute(params);
   }
 
   private buildWaferFlatMonthRanges(
@@ -264,19 +352,13 @@ export class WaferService {
     const sources: WaferFlatQuerySource[] = [];
 
     if (start.isBefore(liveCutoff)) {
-      const archiveStart = start;
-      const archiveEnd = end.isBefore(liveCutoff) ? end : liveCutoff;
-      const monthRanges = this.buildWaferFlatMonthRanges(archiveStart, archiveEnd);
+      sources.push({
+        schemaName: 'public',
+        tableName: 'v_plg_wf_flat_archive',
+        startDate,
+        endDate: end.isBefore(liveCutoff) ? end.toDate() : liveCutoff.toDate(),
+      });
 
-      for (const range of monthRanges) {
-        sources.push({
-          schemaName: 'archive_fdw',
-          tableName: this.buildPlgWfFlatMonthTableName(range.start),
-          startDate: range.start.toDate(),
-          endDate: range.end.toDate(),
-        });
-      }
-    }
 
     if (end.isAfter(liveCutoff)) {
       const liveStart = start.isAfter(liveCutoff) ? start : liveCutoff;
@@ -400,49 +482,12 @@ export class WaferService {
       .join('\nUNION ALL\n');
   }
 
-  private async resolveSpectrumTableName(params: { eqpId?: string, lotId?: string, endDate?: string | Date, ts?: string | Date }, dbClient: any): Promise<string> {
-    let targetDate = new Date();
-
-    if (params.ts) {
-      targetDate = this.parseSafeDate(params.ts);
-    }
-    else if (params.lotId && params.eqpId) {
-      try {
-        const res = await dbClient.$queryRawUnsafe(
-          `SELECT MAX(serv_ts) as max_ts FROM public.plg_wf_flat WHERE TRIM(eqpid) = TRIM($1) AND TRIM(lotid) = TRIM($2)`,
-          params.eqpId, params.lotId
-        );
-        if (res[0]?.max_ts) {
-          targetDate = new Date(res[0].max_ts);
-        } else if (params.endDate) {
-          targetDate = this.parseSafeDate(params.endDate);
-        }
-      } catch(e) {
-        if (params.endDate) targetDate = this.parseSafeDate(params.endDate);
-      }
-    }
-    else if (params.endDate) {
-      targetDate = this.parseSafeDate(params.endDate);
-    }
-
-    const isToday = dayjs(targetDate).isSame(dayjs(), 'day');
-    if (isToday) return 'public.plg_onto_spectrum';
-
-    const yy = dayjs(targetDate).format('YYYY');
-    const mm = dayjs(targetDate).format('MM');
-    const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
-
-    try {
-      const tableExists = await dbClient.$queryRawUnsafe(
-        `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
-        partTable
-      );
-      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
-        return `public.${partTable}`;
-      }
-    } catch(e) {}
-
-    return 'public.plg_onto_spectrum';
+  private async resolveSpectrumTableName(
+    params: WaferQueryParams,
+    dbClient: any,
+  ): Promise<string> {
+    const route = this.getWaferFlatRoute(params);
+    return route.spectrumTableExpr;
   }
 
   private async checkSpectrumExists(
@@ -459,45 +504,34 @@ export class WaferService {
       const safeLot = String(lotId).trim();
       const safeWafer = Number(waferId);
 
-      const mainSql = `
+      const route = this.getWaferFlatRoute({
+        eqpId,
+        lotId,
+        waferId,
+        dateTime: dateVal,
+      });
+
+      const targetClient = route.client;
+      const spectrumTableExpr = route.spectrumTableExpr;
+
+      const sql = `
         SELECT EXISTS(
-          SELECT 1 FROM public.plg_onto_spectrum
-          WHERE TRIM("eqpid") = $1
-            AND TRIM("lotid") = $2
-            AND "waferid"::integer = $3
-        ) as "exists"
+          SELECT 1
+          FROM ${spectrumTableExpr}
+          WHERE TRIM(eqpid) = $1
+            AND TRIM(lotid) = $2
+            AND waferid::integer = $3
+        ) AS "exists"
       `;
-      const mainResult = await dbClient.$queryRawUnsafe(mainSql, safeEqp, safeLot, safeWafer);
-      if (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true') return true;
 
-      if (!dateVal) return false;
-      const targetDate = this.parseSafeDate(dateVal);
-      if (isNaN(targetDate.getTime())) return false;
-
-      const yy = dayjs(targetDate).format('YYYY');
-      const mm = dayjs(targetDate).format('MM');
-      const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
-
-      const tableExists = await dbClient.$queryRawUnsafe(
-        `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
-        partTable
+      const result = await targetClient.$queryRawUnsafe(
+        sql,
+        safeEqp,
+        safeLot,
+        safeWafer,
       );
 
-      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
-        const partSql = `
-          SELECT EXISTS(
-            SELECT 1 FROM public.${partTable}
-            WHERE TRIM("eqpid") = $1
-              AND TRIM("lotid") = $2
-              AND "waferid"::integer = $3
-          ) as "exists"
-        `;
-        const partResult = await dbClient.$queryRawUnsafe(partSql, safeEqp, safeLot, safeWafer);
-        return partResult[0]?.exists === true || partResult[0]?.exists === 'true';
-      }
-
-      return false;
-
+      return result[0]?.exists === true || result[0]?.exists === 'true';
     } catch (error) {
       this.logger.warn(`Spectrum check failed for ${eqpId}-${lotId}:`, error);
       return false;
@@ -509,13 +543,11 @@ export class WaferService {
     params: WaferQueryParams,
   ): Promise<string[]> {
     /*
-      개선 사항:
-      - Wafer Flat Data 필터 옵션 조회도 VM DB 기준으로 실행
-      - 오늘/어제: public.plg_wf_flat
-      - 그 이전: archive_fdw.plg_wf_flat_yYYYYmMM
-      - determineDatabaseRoute()를 사용하지 않아 Archive 31일 제한에 걸리지 않음
+      Wafer Flat Data 필터 옵션 조회
+      - 오늘/전일: VM DB public.plg_wf_flat
+      - 전전일 이전: DBaaS DB public.v_plg_wf_flat_archive
+      - Web 조회 경로에서는 VM DB archive_fdw를 사용하지 않습니다.
     */
-    const dbClient = this.prisma;
 
     const {
       eqpId,
@@ -547,8 +579,8 @@ export class WaferService {
       'film',
       'point',
     ]);
-    
-     if (!allowedColumns.has(colName)) {
+
+    if (!allowedColumns.has(colName)) {
       this.logger.warn(`[WaferFlatData] Invalid distinct column requested: ${column}`);
       return [];
     }
@@ -561,65 +593,51 @@ export class WaferService {
       ? dayjs(endDate).add(1, 'day').startOf('day').toDate()
       : dayjs().add(1, 'day').startOf('day').toDate();
 
-    const sources = this.buildWaferFlatQuerySources(safeStartDate, exclusiveEndDate);
+    const route = this.getWaferFlatRoute({
+      ...params,
+      startDate: safeStartDate,
+      endDate: exclusiveEndDate,
+    });
+
+    const dbClient = route.client;
+    const tableExpr = route.tableExpr;
 
     const queryParams: unknown[] = [];
 
-    const unionParts = sources.map((source) => {
-      const schemaName = this.quoteIdentifier(source.schemaName);
-      const tableName = this.quoteIdentifier(source.tableName);
+    const conditions: string[] = [
+      `serv_ts >= ${this.addSqlParam(queryParams, safeStartDate)}`,
+      `serv_ts < ${this.addSqlParam(queryParams, exclusiveEndDate)}`,
+    ];
 
-      const startParam = this.addSqlParam(queryParams, source.startDate);
-      const endParam = this.addSqlParam(queryParams, source.endDate);
+    if (eqpId) {
+      conditions.push(`eqpid = ${this.addSqlParam(queryParams, eqpId)}`);
+    }
 
-      const conditions: string[] = [
-        `serv_ts >= ${startParam}`,
-        `serv_ts < ${endParam}`,
-      ];
+    if (lotId && colName !== 'lotid') {
+      conditions.push(`lotid ILIKE ${this.addSqlParam(queryParams, `%${lotId}%`)}`);
+    }
 
-      if (eqpId) {
-        conditions.push(`eqpid = ${this.addSqlParam(queryParams, eqpId)}`);
-      }
+    if (cassetteRcp && colName !== 'cassettercp') {
+      conditions.push(`cassettercp = ${this.addSqlParam(queryParams, cassetteRcp)}`);
+    }
 
-      if (lotId && colName !== 'lotid') {
-        conditions.push(`lotid ILIKE ${this.addSqlParam(queryParams, `%${lotId}%`)}`);
-      }
+    if (stageRcp && colName !== 'stagercp') {
+      conditions.push(`stagercp = ${this.addSqlParam(queryParams, stageRcp)}`);
+    }
 
-      if (cassetteRcp && colName !== 'cassettercp') {
-        conditions.push(`cassettercp = ${this.addSqlParam(queryParams, cassetteRcp)}`);
-      }
+    if (stageGroup && colName !== 'stagegroup') {
+      conditions.push(`stagegroup = ${this.addSqlParam(queryParams, stageGroup)}`);
+    }
 
-      if (stageRcp && colName !== 'stagercp') {
-        conditions.push(`stagercp = ${this.addSqlParam(queryParams, stageRcp)}`);
-      }
-
-      if (stageGroup && colName !== 'stagegroup') {
-        conditions.push(`stagegroup = ${this.addSqlParam(queryParams, stageGroup)}`);
-      }
-
-      if (film && colName !== 'film') {
-        conditions.push(`film = ${this.addSqlParam(queryParams, film)}`);
-      }
-
-      return `
-        SELECT ${this.quoteIdentifier(colName)} AS val
-        FROM ${schemaName}.${tableName}
-        WHERE ${conditions.join(' AND ')}
-          AND ${this.quoteIdentifier(colName)} IS NOT NULL
-      `;
-    });
-
-    if (unionParts.length === 0) {
-      return [];
+    if (film && colName !== 'film') {
+      conditions.push(`film = ${this.addSqlParam(queryParams, film)}`);
     }
 
     const sql = `
-      WITH UnionData AS (
-        ${unionParts.join('\nUNION ALL\n')}
-      )
-      SELECT DISTINCT val
-      FROM UnionData
-      WHERE val IS NOT NULL
+      SELECT DISTINCT ${this.quoteIdentifier(colName)} AS val
+      FROM ${tableExpr}
+      WHERE ${conditions.join(' AND ')}
+        AND ${this.quoteIdentifier(colName)} IS NOT NULL
       ORDER BY val DESC
       LIMIT 5000
     `;
@@ -644,13 +662,16 @@ export class WaferService {
   }
 
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const route = this.getWaferFlatRoute(params);
+    const dbClient = route.client;
+    const tableExpr = route.tableExpr;
+
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
     let sql = `
       SELECT DISTINCT point
-      FROM public.plg_wf_flat
-      WHERE 1=1
+      FROM ${tableExpr}
+      WHERE 1 = 1
     `;
 
     const queryParams: (string | number | Date)[] = [];
