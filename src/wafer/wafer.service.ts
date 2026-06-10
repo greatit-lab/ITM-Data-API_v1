@@ -122,9 +122,9 @@ export class WaferService {
   ) {}
 
   // =========================================================================
-  // [추가됨] 스마트 라우팅 및 3단계 검증 로직
+  // DB 연결 클라이언트(VM vs DBaaS)와 대상 테이블(월별 UNION) 동시 결정 라우터
   // =========================================================================
-  private determineDatabaseRoute(params: WaferQueryParams): { client: any, isArchive: boolean } {
+  private getRouteAndTableExpr(params: WaferQueryParams): { client: any; tableExpr: string; isArchive: boolean } {
     const thresholdMonths = Number(process.env.ARCHIVE_MONTHS_THRESHOLD || 2);
     const maxArchiveDays = Number(process.env.ARCHIVE_MAX_SEARCH_DAYS || 31);
     const now = dayjs();
@@ -146,29 +146,41 @@ export class WaferService {
     const isStartInArchive = start.isBefore(boundaryDate);
     const isEndInArchive = end.isBefore(boundaryDate);
 
-    // [Zone C] 경계선 교차 에러
+    // [Zone C] 라이브와 아카이브 구간 교차 조회 제한
     if (isStartInArchive && !isEndInArchive && !params.lotId) {
       throw new BadRequestException(
         `라이브 데이터와 아카이브 데이터 구간을 교차하여 조회할 수 없습니다. (아카이브 기준일: ${boundaryDate.format('YYYY-MM-DD')})`
       );
     }
 
-    // [Zone B] 아카이브 DB 라우팅
+    // [Zone B] DBaaS 아카이브 DB 라우팅 및 월별 파티션 동적 생성
     if (isStartInArchive && isEndInArchive) {
       const diffDays = end.diff(start, 'day');
-      // lotId 단건 조회일 경우는 기간 제한(Max Days)을 검증하지 않음
       if (diffDays > maxArchiveDays && !params.lotId && !params.ts && !params.dateTime && !params.servTs) {
         throw new BadRequestException(
           `아카이브 데이터는 DB 리소스 보호를 위해 최대 ${maxArchiveDays}일까지만 동시 조회가 가능합니다.`
         );
       }
-      return { client: this.archivePrisma, isArchive: true };
+
+      let tables: string[] = [];
+      let currentMonth = start.startOf('month');
+      const endMonth = end.startOf('month');
+
+      while (currentMonth.toDate() <= endMonth.toDate()) {
+        const yyyy = currentMonth.format('YYYY');
+        const mm = currentMonth.format('MM');
+        tables.push(`SELECT * FROM public.plg_wf_flat_y${yyyy}m${mm}`);
+        currentMonth = currentMonth.add(1, 'month');
+      }
+
+      let tableExpr = tables.length > 0 ? `(${tables.join(' UNION ALL ')})` : 'public.plg_wf_flat';
+
+      return { client: this.archivePrisma, tableExpr, isArchive: true };
     }
 
-    // [Zone A] 라이브 DB 라우팅
-    return { client: this.prisma, isArchive: false };
+    // [Zone A] VM 라이브 DB 라우팅
+    return { client: this.prisma, tableExpr: 'public.plg_wf_flat', isArchive: false };
   }
-  // =========================================================================
 
   private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
     const now = new Date();
@@ -205,11 +217,12 @@ export class WaferService {
     } 
     else if (params.lotId && params.eqpId) {
       try {
-        const res = await dbClient.$queryRawUnsafe(
+        const res = (await dbClient.$queryRawUnsafe(
           `SELECT MAX(serv_ts) as max_ts FROM public.plg_wf_flat WHERE TRIM(eqpid) = TRIM($1) AND TRIM(lotid) = TRIM($2)`,
           params.eqpId, params.lotId
-        );
-        if (res[0]?.max_ts) {
+        )) as any[];
+        
+        if (res && res.length > 0 && res[0]?.max_ts) {
           targetDate = new Date(res[0].max_ts);
         } else if (params.endDate) {
           targetDate = this.parseSafeDate(params.endDate);
@@ -230,11 +243,12 @@ export class WaferService {
     const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
 
     try {
-      const tableExists = await dbClient.$queryRawUnsafe(
+      const tableExists = (await dbClient.$queryRawUnsafe(
         `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
         partTable
-      );
-      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
+      )) as any[];
+      
+      if (tableExists && tableExists.length > 0 && (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true')) {
         return `public.${partTable}`;
       }
     } catch(e) {}
@@ -264,8 +278,8 @@ export class WaferService {
             AND "waferid"::integer = $3
         ) as "exists"
       `;
-      const mainResult = await dbClient.$queryRawUnsafe(mainSql, safeEqp, safeLot, safeWafer);
-      if (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true') return true;
+      const mainResult = (await dbClient.$queryRawUnsafe(mainSql, safeEqp, safeLot, safeWafer)) as any[];
+      if (mainResult && mainResult.length > 0 && (mainResult[0]?.exists === true || mainResult[0]?.exists === 'true')) return true;
 
       if (!dateVal) return false;
       const targetDate = this.parseSafeDate(dateVal); 
@@ -275,12 +289,12 @@ export class WaferService {
       const mm = dayjs(targetDate).format('MM');
       const partTable = `plg_onto_spectrum_y${yy}m${mm}`;
       
-      const tableExists = await dbClient.$queryRawUnsafe(
+      const tableExists = (await dbClient.$queryRawUnsafe(
         `SELECT EXISTS (SELECT FROM pg_tables WHERE schemaname = 'public' AND tablename = $1) as "exists"`,
         partTable
-      );
+      )) as any[];
 
-      if (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true') {
+      if (tableExists && tableExists.length > 0 && (tableExists[0]?.exists === true || tableExists[0]?.exists === 'true')) {
         const partSql = `
           SELECT EXISTS(
             SELECT 1 FROM public.${partTable}
@@ -289,8 +303,8 @@ export class WaferService {
               AND "waferid"::integer = $3
           ) as "exists"
         `;
-        const partResult = await dbClient.$queryRawUnsafe(partSql, safeEqp, safeLot, safeWafer);
-        return partResult[0]?.exists === true || partResult[0]?.exists === 'true';
+        const partResult = (await dbClient.$queryRawUnsafe(partSql, safeEqp, safeLot, safeWafer)) as any[];
+        return partResult && partResult.length > 0 && (partResult[0]?.exists === true || partResult[0]?.exists === 'true');
       }
 
       return false;
@@ -305,10 +319,9 @@ export class WaferService {
     column: string,
     params: WaferQueryParams,
   ): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } = params;
 
-    const table = 'public.plg_wf_flat';
     let colName = column;
 
     if (column === 'lotids') colName = 'lotid';
@@ -348,13 +361,11 @@ export class WaferService {
       queryParams.push(s, e);
     }
 
-    const sql = `SELECT DISTINCT "${colName}" as val FROM ${table} ${whereClause} ORDER BY "${colName}" DESC LIMIT 5000`;
+    const sql = `SELECT DISTINCT "${colName}" as val FROM ${tableExpr} as base_table ${whereClause} ORDER BY "${colName}" DESC LIMIT 5000`;
 
     try {
-      const result = await dbClient.$queryRawUnsafe(
-        sql,
-        ...queryParams,
-      );
+      const result = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      if (!result) return [];
       return result
         .map((r: any) => {
           if (r.val === null || r.val === undefined) return '';
@@ -369,12 +380,12 @@ export class WaferService {
   }
 
   async getDistinctPoints(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { eqpId, lotId, cassetteRcp, stageRcp, stageGroup, film, startDate, endDate } = params;
 
     let sql = `
       SELECT DISTINCT point
-      FROM public.plg_wf_flat
+      FROM ${tableExpr} as base_table
       WHERE 1=1
     `;
 
@@ -414,10 +425,8 @@ export class WaferService {
     sql += ` ORDER BY point ASC`;
 
     try {
-      const results = await dbClient.$queryRawUnsafe(
-        sql,
-        ...queryParams,
-      );
+      const results = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      if (!results) return [];
       return results.map((r: any) => String(r.point));
     } catch (e) {
       this.logger.error('Error fetching distinct points:', e);
@@ -426,19 +435,8 @@ export class WaferService {
   }
 
   async getSpectrumTrend(params: WaferQueryParams): Promise<any[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
-    const {
-      eqpId,
-      lotId,
-      pointId,
-      waferIds,
-      startDate,
-      endDate,
-      cassetteRcp,
-      stageRcp,
-      stageGroup,
-      film,
-    } = params;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
+    const { eqpId, lotId, pointId, waferIds, startDate, endDate, cassetteRcp, stageRcp, stageGroup, film } = params;
 
     if (!lotId || !pointId || !waferIds) {
       return [];
@@ -449,11 +447,8 @@ export class WaferService {
 
     let dynamicColumns: string[] = ['t1', 'gof', 'mse'];
     try {
-      // 설정은 항상 메인(Live) DB에서 조회
-      const configMetrics = await this.prisma.$queryRaw<
-        { metric_name: string }[]
-      >`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`;
-      if (configMetrics.length > 0) {
+      const configMetrics = (await this.prisma.$queryRaw`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`) as { metric_name: string }[];
+      if (configMetrics && configMetrics.length > 0) {
         dynamicColumns = configMetrics.map((r) => r.metric_name);
       }
     } catch (e) { /* ignore */ }
@@ -472,7 +467,7 @@ export class WaferService {
         f."serv_ts", f."lotid",
         ${selectColumns}
       FROM ${tableName} s
-      JOIN public.plg_wf_flat f 
+      JOIN ${tableExpr} as f 
         ON TRIM(s.eqpid) = TRIM(f.eqpid) 
         AND TRIM(s.lotid) = TRIM(f.lotid) 
         AND s.waferid::integer = f."waferid"
@@ -525,7 +520,8 @@ export class WaferService {
     sql += ` ORDER BY s."waferid" ASC, s."ts" DESC, f."serv_ts" DESC`;
 
     try {
-      const results = await dbClient.$queryRawUnsafe(sql, ...queryParams);
+      const results = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      if (!results) return [];
 
       const series = results.map((row: any) => {
         const dataPoints: number[][] = [];
@@ -568,7 +564,7 @@ export class WaferService {
   }
 
   async getSpectrumGen(params: WaferQueryParams) {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient } = this.getRouteAndTableExpr(params);
     const { lotId, waferId, pointId, eqpId, ts } = params;
     if (!lotId || !waferId || !pointId || !eqpId || !ts) return null;
 
@@ -576,7 +572,7 @@ export class WaferService {
       const targetDate = this.parseSafeDate(ts);
       const tableName = await this.resolveSpectrumTableName({ ts }, dbClient);
 
-      const results = await dbClient.$queryRawUnsafe(
+      const results = (await dbClient.$queryRawUnsafe(
         `SELECT "wavelengths", "values" 
          FROM ${tableName}
          WHERE TRIM("lotid") = TRIM($1) 
@@ -592,7 +588,7 @@ export class WaferService {
         Number(pointId),
         eqpId,
         targetDate,
-      );
+      )) as any[];
 
       if (!results || results.length === 0) return null;
 
@@ -618,22 +614,9 @@ export class WaferService {
   }
 
   async getFlatData(params: WaferQueryParams) {
-    const {
-      eqpId,
-      lotId,
-      waferId,
-      startDate,
-      endDate,
-      cassetteRcp,
-      stageRcp,
-      stageGroup,
-      film,
-      page = 0,
-      pageSize = 20,
-    } = params;
-
-    const route = this.determineDatabaseRoute(params);
-    const dbClient = route.client;
+    const { eqpId, lotId, waferId, startDate, endDate, cassetteRcp, stageRcp, stageGroup, film, page = 0, pageSize = 20 } = params;
+    
+    const { client: dbClient, tableExpr, isArchive } = this.getRouteAndTableExpr(params);
 
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
@@ -678,19 +661,19 @@ export class WaferService {
       WITH RankedData AS (
         SELECT eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film,
                ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film ORDER BY serv_ts DESC) as rn
-        FROM public.plg_wf_flat
+        FROM ${tableExpr} as base_table
         ${whereClause}
       )
       SELECT COUNT(*)::int as total FROM RankedData WHERE rn = 1
     `;
-    const countResult = await dbClient.$queryRawUnsafe(countSql, ...queryParams);
-    const total = Number(countResult[0]?.total || 0);
+    const countResult = (await dbClient.$queryRawUnsafe(countSql, ...queryParams)) as any[];
+    const total = Number(countResult && countResult[0] ? countResult[0].total : 0);
 
     const dataSql = `
       WITH RankedData AS (
         SELECT eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film, serv_ts as "servTs", datetime,
                ROW_NUMBER() OVER(PARTITION BY eqpid, lotid, waferid, cassettercp, stagercp, stagegroup, film ORDER BY serv_ts DESC) as rn
-        FROM public.plg_wf_flat
+        FROM ${tableExpr} as base_table
         ${whereClause}
       )
       SELECT * FROM RankedData
@@ -699,16 +682,16 @@ export class WaferService {
       LIMIT $${pIdx++} OFFSET $${pIdx++}
     `;
     const dataParams = [...queryParams, Number(pageSize), Number(page) * Number(pageSize)];
-    const items = await dbClient.$queryRawUnsafe(dataSql, ...dataParams);
+    const items = (await dbClient.$queryRawUnsafe(dataSql, ...dataParams)) as any[];
 
     const mapLookup = new Set<string>();
 
-    if (items.length > 0) {
-      const eqpIds = [...new Set(items.map((i: any) => i.eqpid))];
-      const datetimes = items.map((i: any) => i.datetime).filter((d: any) => d !== null);
+    if (items && items.length > 0) {
+      const eqpIds = [...new Set(items.map((i: any) => String(i.eqpid)))] as string[];
+      const datetimes = items.map((i: any) => i.datetime).filter((d: any) => d !== null) as Date[];
       
       if (datetimes.length > 0) {
-        const maps = await dbClient.plgWfMap.findMany({
+        const maps = await this.prisma.plgWfMap.findMany({
           where: {
             eqpid: { in: eqpIds },
             datetime: { in: datetimes }
@@ -719,7 +702,8 @@ export class WaferService {
       }
     }
 
-    const updatedItems = await Promise.all(items.map(async (i: any) => {
+    const validItems = items || [];
+    const updatedItems = await Promise.all(validItems.map(async (i: any) => {
       const checkDate = i.datetime || i.servTs;
       let hasSpec = false;
       
@@ -745,7 +729,7 @@ export class WaferService {
     return {
       totalItems: total,
       items: updatedItems,
-      isArchiveMode: route.isArchive
+      isArchiveMode: isArchive
     };
   }
 
@@ -901,7 +885,7 @@ export class WaferService {
   async checkPdf(
     params: WaferQueryParams,
   ): Promise<{ exists: boolean; url: string | null }> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient } = this.getRouteAndTableExpr(params);
     const { eqpId, lotId, waferId, servTs, dateTime } = params;
 
     const targetTimeVal = dateTime || servTs;
@@ -920,14 +904,14 @@ export class WaferService {
 
       const cleanDateStr = dayjs(targetDate).format('YYYY-MM-DD HH:mm:ss');
 
-      const results = await dbClient.$queryRawUnsafe(
+      const results = (await dbClient.$queryRawUnsafe(
         `SELECT file_uri, datetime FROM public.plg_wf_map 
          WHERE TRIM(eqpid) = TRIM($1)
            AND date_trunc('second', datetime) = date_trunc('second', $2::timestamp)
          ORDER BY datetime DESC`,
         eqpId,
         cleanDateStr
-      );
+      )) as any[];
 
       if (!results || results.length === 0) {
         return { exists: false, url: null };
@@ -966,7 +950,7 @@ export class WaferService {
   }
 
   async getSpectrum(params: WaferQueryParams) {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient } = this.getRouteAndTableExpr(params);
     const { eqpId, lotId, waferId, pointNumber, ts } = params;
     if (!eqpId || !lotId || !waferId || pointNumber === undefined || !ts) return [];
 
@@ -974,7 +958,7 @@ export class WaferService {
       const targetDate = this.parseSafeDate(ts);
       const tableName = await this.resolveSpectrumTableName({ ts }, dbClient);
 
-      const results = await dbClient.$queryRawUnsafe(
+      const results = (await dbClient.$queryRawUnsafe(
         `SELECT "class", "wavelengths", "values" 
          FROM ${tableName}
          WHERE TRIM("eqpid") = TRIM($1) 
@@ -988,7 +972,7 @@ export class WaferService {
         lotId,
         Number(waferId),
         Number(pointNumber),
-      );
+      )) as any[];
 
       if (!results || results.length === 0) return [];
 
@@ -1060,28 +1044,26 @@ export class WaferService {
   }
 
   async getStatistics(params: WaferQueryParams) {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const where = this.buildUniqueWhereParams(params);
     if (!where) return {};
 
     try {
-      const validColumnsResult = await dbClient.$queryRawUnsafe(
+      const validColumnsResult = (await this.prisma.$queryRawUnsafe(
         `SELECT column_name 
          FROM information_schema.columns 
          WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`,
-      );
+      )) as any[];
 
       const validColumnSet = new Set(
-        validColumnsResult.map((r: any) => r.column_name.toLowerCase()),
+        validColumnsResult ? validColumnsResult.map((r: any) => r.column_name.toLowerCase()) : []
       );
 
       let targetColumns = ['t1', 'gof', 'z', 'srvisz', 'mse', 'thickness'];
 
       try {
-        const configMetrics = await this.prisma.$queryRaw<
-          { metric_name: string }[]
-        >`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`;
-        if (configMetrics.length > 0) {
+        const configMetrics = (await this.prisma.$queryRaw`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`) as { metric_name: string }[];
+        if (configMetrics && configMetrics.length > 0) {
           const configNames = configMetrics.map((c) => c.metric_name.toLowerCase());
           targetColumns = [...new Set([...targetColumns, ...configNames])];
         }
@@ -1100,9 +1082,9 @@ export class WaferService {
         .map((col) => `MAX("${col}") as "${col}_max", MIN("${col}") as "${col}_min", AVG("${col}") as "${col}_mean", STDDEV_SAMP("${col}") as "${col}_std"`)
         .join(', ');
 
-      const sql = `SELECT ${selectParts} FROM public.plg_wf_flat ${where.sql} LIMIT 1`;
-      const result = await dbClient.$queryRawUnsafe(sql, ...where.params);
-      const row = result[0] || {};
+      const sql = `SELECT ${selectParts} FROM ${tableExpr} as wf_flat ${where.sql} LIMIT 1`;
+      const result = (await dbClient.$queryRawUnsafe(sql, ...where.params)) as any[];
+      const row = result && result[0] ? result[0] : {};
       const statsResult: Record<string, any> = {};
 
       for (const col of targetColumns) {
@@ -1124,20 +1106,24 @@ export class WaferService {
       return {};
     }
   }
-
+  
+  // [수정] Point 데이터 조회 시에도 동적 라우터 적용
   async getPointData(
     params: WaferQueryParams,
   ): Promise<{ headers: string[]; data: unknown[][] }> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    // 1. 여기서 params.startDate/endDate가 정확해야 라우터가 아카이브 모드를 잡습니다.
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const where = this.buildUniqueWhereParams(params);
     if (!where) return { headers: [], data: [] };
 
     try {
-      const sql = `SELECT * FROM public.plg_wf_flat ${where.sql} ORDER BY point`;
-      const rawData = await dbClient.$queryRawUnsafe(sql, ...where.params);
+      // 2. 동적으로 식별된 tableExpr을 사용하여 쿼리 실행
+      const sql = `SELECT * FROM ${tableExpr} as base_table ${where.sql} ORDER BY point`;
+      const rawData = (await dbClient.$queryRawUnsafe(sql, ...where.params)) as any[];
 
       if (!rawData || rawData.length === 0) return { headers: [], data: [] };
 
+      // ... 이하 헤더 및 데이터 처리 로직 동일 ...
       const excludeCols = new Set(['eqpid', 'lotid', 'waferid', 'serv_ts', 'cassettercp', 'stagercp', 'stagegroup', 'film', 'datetime']);
       const allKeys = new Set<string>();
       rawData.forEach((row: any) => {
@@ -1167,14 +1153,14 @@ export class WaferService {
   }
 
   async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { site, sdwt, startDate, endDate, cassetteRcp, stageGroup, film } = params;
     if (!startDate || !endDate || !cassetteRcp) return [];
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
     let sql = `
       SELECT DISTINCT t1.eqpid
-      FROM public.plg_wf_flat t1
+      FROM ${tableExpr} t1
       JOIN public.ref_equipment t2 ON t1.eqpid = t2.eqpid
       JOIN public.ref_sdwt t3 ON t2.sdwt = t3.sdwt
       WHERE t1.serv_ts >= $1 AND t1.serv_ts <= $2
@@ -1190,7 +1176,8 @@ export class WaferService {
 
     sql += ` ORDER BY t1.eqpid`;
     try {
-      const res = await dbClient.$queryRawUnsafe(sql, ...queryParams);
+      const res = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      if (!res) return [];
       return res.map((r: any) => r.eqpid);
     } catch (e) {
       this.logger.error('Error fetching matching equipments:', e);
@@ -1199,15 +1186,15 @@ export class WaferService {
   }
 
   async getComparisonData(params: WaferQueryParams): Promise<ComparisonRawResult[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { startDate, endDate, cassetteRcp, stageGroup, film, targetEqps } = params;
     if (!targetEqps || !startDate || !endDate || !cassetteRcp) return [];
     const eqpList = targetEqps.split(',').map((e) => e.trim());
 
     let metrics: string[] = ['t1', 'gof', 'mse', 'thickness'];
     try {
-      const conf = await this.prisma.$queryRaw<{ metric_name: string }[]>`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`;
-      if (conf.length > 0) metrics = conf.map((c) => c.metric_name);
+      const conf = (await this.prisma.$queryRaw`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`) as { metric_name: string }[];
+      if (conf && conf.length > 0) metrics = conf.map((c) => c.metric_name);
     } catch (e) { /* ignore */ }
 
     const selectCols = metrics.map((m) => `"${m}"`).join(', ');
@@ -1215,7 +1202,7 @@ export class WaferService {
 
     let sql = `
       SELECT eqpid, lotid, waferid, point, ${selectCols}
-      FROM public.plg_wf_flat
+      FROM ${tableExpr} as wf_flat
       WHERE serv_ts >= $1 AND serv_ts <= $2
         AND cassettercp = $3
         AND eqpid IN (${eqpList.map((e) => `'${e}'`).join(',')})
@@ -1228,7 +1215,8 @@ export class WaferService {
 
     sql += ` ORDER BY serv_ts DESC LIMIT 5000`;
     try {
-      return await dbClient.$queryRawUnsafe(sql, ...queryParams);
+      const res = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      return res || [];
     } catch (e) {
       this.logger.error('Error fetching comparison data:', e);
       return [];
@@ -1236,7 +1224,7 @@ export class WaferService {
   }
 
   async getOpticalTrend(params: WaferQueryParams) {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { eqpId, startDate, endDate, cassetteRcp, stageGroup, film } = params;
     if (!eqpId || !startDate || !endDate) return [];
 
@@ -1253,7 +1241,7 @@ export class WaferService {
       const sql = `
         SELECT s.ts, s.lotid, s.waferid, s.point, s.wavelengths, s."values"
         FROM ${tableName} s
-        JOIN public.plg_wf_flat f 
+        JOIN ${tableExpr} as f 
           ON TRIM(s.eqpid) = TRIM(f.eqpid) 
           AND TRIM(s.lotid) = TRIM(f.lotid) 
           AND s.waferid::integer = f.waferid
@@ -1267,7 +1255,9 @@ export class WaferService {
         LIMIT 2000
       `;
 
-      const rawData = await dbClient.$queryRawUnsafe(sql, ...queryParams);
+      const rawData = (await dbClient.$queryRawUnsafe(sql, ...queryParams)) as any[];
+      if (!rawData) return [];
+      
       return rawData.map((d: any) => {
         const values = d.values || [];
         const wavelengths = d.wavelengths || [];
@@ -1300,16 +1290,17 @@ export class WaferService {
   }
 
   async getResidualMap(params: WaferQueryParams): Promise<ResidualMapItem[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const where = this.buildUniqueWhereParams(params);
     if (!where) return [];
     const metric = params.metric || 't1';
 
     try {
-      const data = await dbClient.$queryRawUnsafe(
-        `SELECT point, x, y, "${metric}" as val FROM public.plg_wf_flat ${where.sql}`, ...where.params
-      );
-      if (!data.length) return [];
+      const data = (await dbClient.$queryRawUnsafe(
+        `SELECT point, x, y, "${metric}" as val FROM ${tableExpr} as wf_flat ${where.sql}`, ...where.params
+      )) as any[];
+
+      if (!data || !data.length) return [];
       const validData = data.filter((d: any) => d.val !== null);
       if (!validData.length) return [];
       const mean = validData.reduce((acc: number, cur: any) => acc + cur.val, 0) / validData.length;
@@ -1321,21 +1312,21 @@ export class WaferService {
   }
 
   async getGoldenSpectrum(params: WaferQueryParams): Promise<GoldenSpectrumResponse | null> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { eqpId, lotId, pointId } = params;
     
     if (!eqpId || !lotId || !pointId) return null;
 
     try {
       const bestGofSql = `
-            SELECT waferid, datetime FROM public.plg_wf_flat
+            SELECT waferid, datetime FROM ${tableExpr} as wf_flat
             WHERE eqpid = $1 AND lotid = $2 AND point = $3
               AND gof IS NOT NULL
             ORDER BY gof DESC LIMIT 1
         `;
       const queryParams: any[] = [eqpId, lotId, Number(pointId)];
 
-      const bestData = await dbClient.$queryRawUnsafe(bestGofSql, ...queryParams);
+      const bestData = (await dbClient.$queryRawUnsafe(bestGofSql, ...queryParams)) as any[];
       if (!bestData || bestData.length === 0) return null;
 
       const targetWaferId = bestData[0].waferid;
@@ -1354,13 +1345,13 @@ export class WaferService {
             ORDER BY ts DESC 
             LIMIT 1
         `;
-      const spectrum = await dbClient.$queryRawUnsafe(
+      const spectrum = (await dbClient.$queryRawUnsafe(
         spectrumSql, 
         eqpId, 
         lotId, 
         Number(targetWaferId), 
         Number(pointId)
-      );
+      )) as any[];
 
       if (!spectrum || spectrum.length === 0) return null;
       return { wavelengths: spectrum[0].wavelengths, values: spectrum[0].values };
@@ -1371,16 +1362,17 @@ export class WaferService {
   }
 
   async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     try {
-      const configMetrics = await this.prisma.$queryRaw<{ metric_name: string }[]>`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name`;
-      let candidates = configMetrics.map((m) => m.metric_name);
+      const configMetrics = (await this.prisma.$queryRaw`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name`) as { metric_name: string }[];
+      let candidates = configMetrics ? configMetrics.map((m) => m.metric_name) : [];
       if (candidates.length === 0) return [];
 
-      const tableColumns = await dbClient.$queryRawUnsafe(
+      const tableColumns = (await this.prisma.$queryRawUnsafe(
         `SELECT column_name FROM information_schema.columns WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
-      );
-      const validColumnSet = new Set(tableColumns.map((c: any) => c.column_name.toLowerCase()));
+      )) as any[];
+
+      const validColumnSet = new Set(tableColumns ? tableColumns.map((c: any) => c.column_name.toLowerCase()) : []);
       candidates = candidates.filter((metric) => validColumnSet.has(metric.toLowerCase()));
       if (candidates.length === 0) return [];
 
@@ -1388,9 +1380,10 @@ export class WaferService {
       if (!where) return candidates;
 
       const countSelects = candidates.map((col) => `COUNT("${col}") as "${col}"`).join(', ');
-      const countResults = await dbClient.$queryRawUnsafe(
-        `SELECT ${countSelects} FROM public.plg_wf_flat ${where.sql}`, ...where.params
-      );
+      const countResults = (await dbClient.$queryRawUnsafe(
+        `SELECT ${countSelects} FROM ${tableExpr} as wf_flat ${where.sql}`, ...where.params
+      )) as any[];
+
       if (!countResults || countResults.length === 0) return [];
 
       const counts = countResults[0];
@@ -1402,18 +1395,21 @@ export class WaferService {
   }
 
   async getLotUniformityTrend(params: WaferQueryParams & { metric: string }): Promise<any[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const { client: dbClient, tableExpr } = this.getRouteAndTableExpr(params);
     const { metric, ...rest } = params;
     const targetMetric = metric || 't1';
     const where = this.buildUniqueWhereParams({ ...rest, waferId: undefined });
     if (!where) return [];
 
     try {
-      const results = await dbClient.$queryRawUnsafe(
+      const results = (await dbClient.$queryRawUnsafe(
         `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
-             FROM public.plg_wf_flat ${where.sql} 
+             FROM ${tableExpr} as wf_flat ${where.sql} 
              ORDER BY waferid, point`, ...where.params
-      );
+      )) as any[];
+      
+      if (!results) return [];
+
       const grouped: Record<string, any[]> = {};
       results.forEach((row: any) => {
         const wid = String(row.waferid);
