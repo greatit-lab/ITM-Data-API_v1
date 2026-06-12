@@ -41,6 +41,7 @@ export class WaferQueryParams {
   site?: string;
   sdwt?: string;
   targetEqps?: string;
+  crossDb?: string | boolean; // [추가됨] Process Matching 전용 병합 플래그
 }
 
 interface StatsRawResult {
@@ -121,9 +122,6 @@ export class WaferService {
     private archivePrisma: ArchivePrismaService
   ) {}
 
-  // =========================================================================
-  // [추가됨] 스마트 라우팅 및 3단계 검증 로직
-  // =========================================================================
   private determineDatabaseRoute(params: WaferQueryParams): { client: any, isArchive: boolean } {
     const thresholdMonths = Number(process.env.ARCHIVE_MONTHS_THRESHOLD || 2);
     const maxArchiveDays = Number(process.env.ARCHIVE_MAX_SEARCH_DAYS || 31);
@@ -146,17 +144,14 @@ export class WaferService {
     const isStartInArchive = start.isBefore(boundaryDate);
     const isEndInArchive = end.isBefore(boundaryDate);
 
-    // [Zone C] 경계선 교차 에러
     if (isStartInArchive && !isEndInArchive && !params.lotId) {
       throw new BadRequestException(
         `라이브 데이터와 아카이브 데이터 구간을 교차하여 조회할 수 없습니다. (아카이브 기준일: ${boundaryDate.format('YYYY-MM-DD')})`
       );
     }
 
-    // [Zone B] 아카이브 DB 라우팅
     if (isStartInArchive && isEndInArchive) {
       const diffDays = end.diff(start, 'day');
-      // lotId 단건 조회일 경우는 기간 제한(Max Days)을 검증하지 않음
       if (diffDays > maxArchiveDays && !params.lotId && !params.ts && !params.dateTime && !params.servTs) {
         throw new BadRequestException(
           `아카이브 데이터는 DB 리소스 보호를 위해 최대 ${maxArchiveDays}일까지만 동시 조회가 가능합니다.`
@@ -165,10 +160,8 @@ export class WaferService {
       return { client: this.archivePrisma, isArchive: true };
     }
 
-    // [Zone A] 라이브 DB 라우팅
     return { client: this.prisma, isArchive: false };
   }
-  // =========================================================================
 
   private getSafeDates(start?: string | Date, end?: string | Date): { startDate: Date, endDate: Date } {
     const now = new Date();
@@ -202,15 +195,6 @@ export class WaferService {
     isArchive: boolean;
     tableExpr: string;
   } {
-    /*
-      Wafer Flat Data 조회 기준
-      - 오늘 + 전일: VM DB public.plg_wf_flat
-      - 전전일 이전: DBaaS DB public.v_plg_wf_flat_archive
-
-      주의:
-      - Wafer Map 이미지는 Archive 여부와 무관하게 VM DB public.plg_wf_map 기준입니다.
-      - Spectrum 차트 조회는 기존 getSpectrum() 흐름을 유지합니다.
-    */
     const liveCutoff = dayjs().startOf('day').subtract(1, 'day');
 
     let start = dayjs().subtract(1, 'day').startOf('day');
@@ -347,13 +331,12 @@ export class WaferService {
     }
   }
 
+  // [수정됨] Process Matching 페이지를 위한 Data Federation (crossDb 지원)
   async getDistinctValues(
     column: string,
     params: WaferQueryParams,
   ): Promise<string[]> {
-    const route = this.getWaferFlatRoute(params);
-    const dbClient = route.client;
-    const table = route.tableExpr;
+    const isCrossDb = params.crossDb === 'true' || params.crossDb === true;
     const { eqpId, lotId, cassetteRcp, stageGroup, film, startDate, endDate } = params;
 
     let colName = column;
@@ -395,23 +378,43 @@ export class WaferService {
       queryParams.push(s, e);
     }
 
-    const sql = `SELECT DISTINCT "${colName}" as val FROM ${table} ${whereClause} ORDER BY "${colName}" DESC LIMIT 5000`;
+    const sqlTemplate = `SELECT DISTINCT "${colName}" as val FROM __TABLE_NAME__ ${whereClause} ORDER BY "${colName}" DESC LIMIT 5000`;
 
-    try {
-      const result = await dbClient.$queryRawUnsafe(
-        sql,
-        ...queryParams,
-      );
-      return result
-        .map((r: any) => {
-          if (r.val === null || r.val === undefined) return '';
-          if (typeof r.val === 'object') return JSON.stringify(r.val);
-          return String(r.val);
-        })
-        .filter((v: string) => v !== '');
-    } catch (e) {
-      this.logger.warn(`Error fetching distinct ${column}:`, e);
-      return [];
+    if (isCrossDb) {
+      const liveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.plg_wf_flat');
+      const archiveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.v_plg_wf_flat_archive');
+      try {
+        const [liveRes, archiveRes] = await Promise.all([
+          this.prisma.$queryRawUnsafe(liveSql, ...queryParams),
+          this.archivePrisma.$queryRawUnsafe(archiveSql, ...queryParams).catch(()=>[])
+        ]);
+        const combined = [...(liveRes as any[]), ...(archiveRes as any[])];
+        const vals = combined
+          .map(r => r.val)
+          .filter(v => v !== null && v !== undefined)
+          .map(v => typeof v === 'object' ? JSON.stringify(v) : String(v))
+          .filter(v => v !== '');
+        return Array.from(new Set(vals)).sort((a, b) => b.localeCompare(a));
+      } catch(e) {
+        this.logger.warn(`Error fetching crossDb distinct ${column}:`, e);
+        return [];
+      }
+    } else {
+      const route = this.getWaferFlatRoute(params);
+      const sql = sqlTemplate.replace(/__TABLE_NAME__/g, route.tableExpr);
+      try {
+        const result = await route.client.$queryRawUnsafe(sql, ...queryParams);
+        return result
+          .map((r: any) => {
+            if (r.val === null || r.val === undefined) return '';
+            if (typeof r.val === 'object') return JSON.stringify(r.val);
+            return String(r.val);
+          })
+          .filter((v: string) => v !== '');
+      } catch (e) {
+        this.logger.warn(`Error fetching distinct ${column}:`, e);
+        return [];
+      }
     }
   }
 
@@ -498,7 +501,6 @@ export class WaferService {
 
     let dynamicColumns: string[] = ['t1', 'gof', 'mse'];
     try {
-      // 설정은 항상 메인(Live) DB에서 조회
       const configMetrics = await this.prisma.$queryRaw<
         { metric_name: string }[]
       >`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N'`;
@@ -1226,15 +1228,15 @@ export class WaferService {
     }
   }
 
+  // [수정됨] Process Matching 페이지를 위한 Data Federation (crossDb 자동 적용)
   async getMatchingEquipments(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
     const { site, sdwt, startDate, endDate, cassetteRcp, stageGroup, film } = params;
     if (!startDate || !endDate || !cassetteRcp) return [];
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
-    let sql = `
+    let sqlTemplate = `
       SELECT DISTINCT t1.eqpid
-      FROM public.plg_wf_flat t1
+      FROM __TABLE_NAME__ t1
       JOIN public.ref_equipment t2 ON t1.eqpid = t2.eqpid
       JOIN public.ref_sdwt t3 ON t2.sdwt = t3.sdwt
       WHERE t1.serv_ts >= $1 AND t1.serv_ts <= $2
@@ -1243,23 +1245,30 @@ export class WaferService {
 
     const queryParams: (string | Date | number)[] = [s, e, cassetteRcp];
     let pIdx = 4;
-    if (site) { sql += ` AND t3.site = $${pIdx++}`; queryParams.push(site); }
-    if (sdwt) { sql += ` AND t3.sdwt = $${pIdx++}`; queryParams.push(sdwt); }
-    if (stageGroup) { sql += ` AND t1.stagegroup = $${pIdx++}`; queryParams.push(stageGroup); }
-    if (film) { sql += ` AND t1.film = $${pIdx++}`; queryParams.push(film); }
+    if (site) { sqlTemplate += ` AND t3.site = $${pIdx++}`; queryParams.push(site); }
+    if (sdwt) { sqlTemplate += ` AND t3.sdwt = $${pIdx++}`; queryParams.push(sdwt); }
+    if (stageGroup) { sqlTemplate += ` AND t1.stagegroup = $${pIdx++}`; queryParams.push(stageGroup); }
+    if (film) { sqlTemplate += ` AND t1.film = $${pIdx++}`; queryParams.push(film); }
 
-    sql += ` ORDER BY t1.eqpid`;
+    const liveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.plg_wf_flat');
+    const archiveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.v_plg_wf_flat_archive');
+
     try {
-      const res = await dbClient.$queryRawUnsafe(sql, ...queryParams);
-      return res.map((r: any) => r.eqpid);
+      const [liveRes, archiveRes] = await Promise.all([
+        this.prisma.$queryRawUnsafe(liveSql, ...queryParams),
+        this.archivePrisma.$queryRawUnsafe(archiveSql, ...queryParams).catch(()=>[])
+      ]);
+      const combined = [...(liveRes as any[]), ...(archiveRes as any[])];
+      const eqps = Array.from(new Set(combined.map(r => r.eqpid)));
+      return eqps.sort();
     } catch (e) {
       this.logger.error('Error fetching matching equipments:', e);
       return [];
     }
   }
 
+  // [수정됨] Process Matching 페이지를 위한 Data Federation (crossDb 자동 적용)
   async getComparisonData(params: WaferQueryParams): Promise<ComparisonRawResult[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
     const { startDate, endDate, cassetteRcp, stageGroup, film, targetEqps } = params;
     if (!targetEqps || !startDate || !endDate || !cassetteRcp) return [];
     const eqpList = targetEqps.split(',').map((e) => e.trim());
@@ -1273,22 +1282,28 @@ export class WaferService {
     const selectCols = metrics.map((m) => `"${m}"`).join(', ');
     const { startDate: s, endDate: e } = this.getSafeDates(startDate, endDate);
 
-    let sql = `
+    let sqlTemplate = `
       SELECT eqpid, lotid, waferid, point, ${selectCols}
-      FROM public.plg_wf_flat
+      FROM __TABLE_NAME__
       WHERE serv_ts >= $1 AND serv_ts <= $2
         AND cassettercp = $3
-        AND eqpid IN (${eqpList.map((e) => `'${e}'`).join(',')})
+        AND eqpid IN (${eqpList.map((eq) => `'${eq}'`).join(',')})
     `;
 
     const queryParams: (string | Date | number)[] = [s, e, cassetteRcp];
     let pIdx = 4;
-    if (stageGroup) { sql += ` AND stagegroup = $${pIdx++}`; queryParams.push(stageGroup); }
-    if (film) { sql += ` AND film = $${pIdx++}`; queryParams.push(film); }
+    if (stageGroup) { sqlTemplate += ` AND stagegroup = $${pIdx++}`; queryParams.push(stageGroup); }
+    if (film) { sqlTemplate += ` AND film = $${pIdx++}`; queryParams.push(film); }
 
-    sql += ` ORDER BY serv_ts DESC LIMIT 5000`;
+    const liveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.plg_wf_flat');
+    const archiveSql = sqlTemplate.replace(/__TABLE_NAME__/g, 'public.v_plg_wf_flat_archive');
+
     try {
-      return await dbClient.$queryRawUnsafe(sql, ...queryParams);
+      const [liveRes, archiveRes] = await Promise.all([
+        this.prisma.$queryRawUnsafe(liveSql, ...queryParams),
+        this.archivePrisma.$queryRawUnsafe(archiveSql, ...queryParams).catch(()=>[])
+      ]);
+      return [...(liveRes as any[]), ...(archiveRes as any[])];
     } catch (e) {
       this.logger.error('Error fetching comparison data:', e);
       return [];
@@ -1431,14 +1446,19 @@ export class WaferService {
   }
 
   async getAvailableMetrics(params: WaferQueryParams): Promise<string[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const route = this.getWaferFlatRoute(params);
+    const dbClient = route.client;
+    const tableExpr = route.tableExpr;
+    const columnTableName = route.isArchive ? 'v_plg_wf_flat_archive' : 'plg_wf_flat';
+
     try {
       const configMetrics = await this.prisma.$queryRaw<{ metric_name: string }[]>`SELECT metric_name FROM public.cfg_lot_uniformity_metrics WHERE is_excluded = 'N' ORDER BY metric_name`;
       let candidates = configMetrics.map((m) => m.metric_name);
       if (candidates.length === 0) return [];
 
       const tableColumns = await dbClient.$queryRawUnsafe(
-        `SELECT column_name FROM information_schema.columns WHERE table_name = 'plg_wf_flat' AND table_schema = 'public'`
+        `SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND table_schema = 'public'`,
+        columnTableName
       );
       const validColumnSet = new Set(tableColumns.map((c: any) => c.column_name.toLowerCase()));
       candidates = candidates.filter((metric) => validColumnSet.has(metric.toLowerCase()));
@@ -1449,7 +1469,7 @@ export class WaferService {
 
       const countSelects = candidates.map((col) => `COUNT("${col}") as "${col}"`).join(', ');
       const countResults = await dbClient.$queryRawUnsafe(
-        `SELECT ${countSelects} FROM public.plg_wf_flat ${where.sql}`, ...where.params
+        `SELECT ${countSelects} FROM ${tableExpr} ${where.sql}`, ...where.params
       );
       if (!countResults || countResults.length === 0) return [];
 
@@ -1462,7 +1482,10 @@ export class WaferService {
   }
 
   async getLotUniformityTrend(params: WaferQueryParams & { metric: string }): Promise<any[]> {
-    const dbClient = this.determineDatabaseRoute(params).client;
+    const route = this.getWaferFlatRoute(params);
+    const dbClient = route.client;
+    const tableExpr = route.tableExpr;
+    
     const { metric, ...rest } = params;
     const targetMetric = metric || 't1';
     const where = this.buildUniqueWhereParams({ ...rest, waferId: undefined });
@@ -1471,7 +1494,7 @@ export class WaferService {
     try {
       const results = await dbClient.$queryRawUnsafe(
         `SELECT waferid, point, x, y, dierow, diecol, "${targetMetric}" as value 
-             FROM public.plg_wf_flat ${where.sql} 
+             FROM ${tableExpr} ${where.sql} 
              ORDER BY waferid, point`, ...where.params
       );
       const grouped: Record<string, any[]> = {};
