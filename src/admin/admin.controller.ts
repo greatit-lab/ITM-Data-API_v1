@@ -33,7 +33,7 @@ export class AdminController {
     @Param('reqId') reqId: string,
     @Body() body: { approverId: string; grantedRole?: string; validUntil?: string }
   ) {
-    return this.adminService.approveGuestRequest(parseInt(reqId), body.approverId);
+    return this.adminService.approveGuestRequest(parseInt(reqId), body);
   }
   
   @Put('guest/request/:reqId/reject') async rejectGuestRequest(@Param('reqId') reqId: string, @Body() body: { rejectorId: string }) { return this.adminService.rejectGuestRequest(parseInt(reqId), body.rejectorId); }
