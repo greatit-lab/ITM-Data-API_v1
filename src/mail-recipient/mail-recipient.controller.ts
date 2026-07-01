@@ -19,6 +19,7 @@ interface RequestWithUser extends Request {
     [key: string]: any;
   };
 }
+
 @Controller('mail-recipient')
 export class MailRecipientController {
   constructor(private readonly mailRecipientService: MailRecipientService) {}
