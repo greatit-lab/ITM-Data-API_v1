@@ -559,3 +559,20 @@ model cfg_system_config {
 
   @@map("cfg_system_config")
 }
+
+// ==========================================
+// [Mail Notification] 메일 알림 수신자 관리
+// ==========================================
+
+model CfgMailRecipient {
+  id             Int      @id @default(autoincrement()) @map("id")
+  loginId        String   @map("login_id") @db.VarChar(50)
+  recipientEmail String   @map("recipient_email") @db.VarChar(200)
+  recipientName  String?  @map("recipient_name") @db.VarChar(100)
+  recipientType  String   @default("USER") @map("recipient_type") @db.VarChar(20)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @default(now()) @updatedAt @map("updated_at")
+
+  @@map("cfg_mail_recipient")
+}
