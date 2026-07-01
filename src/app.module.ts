@@ -29,6 +29,7 @@ import { EquipmentModule } from './equipment/equipment.module';
 import { ManualModule } from './manual/manual.module';
 
 import { AgentModule } from './agent/agent.module';
+import { MailRecipientModule } from './mail-recipient/mail-recipient.module';
 
 @Module({
   imports: [
@@ -62,6 +63,7 @@ import { AgentModule } from './agent/agent.module';
     EquipmentModule,
     ManualModule,
     AgentModule,
+    MailRecipientModule,  // [추가] 메일 알림 수신자 관리
   ],
   controllers: [],
   providers: [PrismaService],
